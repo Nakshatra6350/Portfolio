@@ -6,10 +6,10 @@ $to = "nakshatragarg678@gmail.com";
 
 if($_POST) {
 
-   $name = trim(stripslashes($_POST['contactName']));
-   $email = trim(stripslashes($_POST['contactEmail']));
-   $subject = trim(stripslashes($_POST['contactSubject']));
-   $contact_message = trim(stripslashes($_POST['contactMessage']));
+   $name = $_POST['contactName'];
+   $email = $_POST['contactEmail'];
+   $subject = $_POST['contactSubject'];
+   $contact_message = $_POST['contactMessage'];
 
    // Check Name
 	if (strlen($name) < 2) {
@@ -29,7 +29,7 @@ if($_POST) {
 
    // Set Message
    $message .= "Email from: " . $name . "<br />";
-	$message .= "Email address: " . $email . "<br />";
+   $message .= "Email address: " . $email . "<br />";
    $message .= "Message: <br />";
    $message .= $contact_message;
    $message .= "<br /> ----- <br /> This email was sent from your site's contact form. <br />";
@@ -38,13 +38,11 @@ if($_POST) {
    $from =  $name . " <" . $email . ">";
 
    // Email Headers
-	$headers = "From: " . $from . "\r\n";
-	$headers .= "Reply-To: ". $email . "\r\n";
- 	$headers .= "MIME-Version: 1.0\r\n";
-	$headers .= "Content-Type: text/html; charset=ISO-8859-1\r\n";
+	$headers = "From: " . $from . "\r\n". "Reply-To: ". $email . "\r\n";
+	\
 
 
-   if (!$error) {
+   if ($email!=NULL) {
 
       //ini_set("sendmail_from", $siteOwnersEmail); // for windows server
       $mail = mail($to, $subject, $message, $headers);
