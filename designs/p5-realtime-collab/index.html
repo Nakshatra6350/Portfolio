@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Real-time Collaborative Engine &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <strong>Real-time Collaborative Engine</strong></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Real-time Collaborative Engine</h1>
+<p class="lede">A multi-user collaborative text editor&rsquo;s backend, built so that several server
+instances behind one Redis 8 backplane behave like one server. Concurrent edits merge without a
+lock, a leader or a central transform, because the document is an RGA CRDT in which every insert
+and delete commutes; a per-document Redis Stream is the durable, sequence-numbered op log that
+reconnecting clients resume from; pub/sub carries edits between instances; and a presence hash with
+heartbeat TTLs answers who is here. Around 4,800 lines of dependency-light ESM &mdash;
+<code>ws</code> and <code>redis</code>, no framework, no build step, no bundler.</p>
+
+<div class="meta">
+  <span class="tag v">Node 22</span>
+  <span class="tag v">WebSocket</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">project 5</span>
+  <span class="tag">3 documents</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The one hard problem this project exists to teach</span>
+  <p>Two people typing into the same document have <strong>already diverged by the time either
+  message arrives</strong>. Every hard thing in this codebase follows from that one sentence.</p>
+  <p>The obvious wire format is &ldquo;insert <code>x</code> at index 5&rdquo;, and it is wrong the
+  moment two replicas differ by a single character &mdash; which is always, because the entire point
+  of optimistic local editing is that a client applies its own keystroke <em>before</em> the server
+  has seen it. Operational transformation rescues indexes by rewriting every operation against every
+  concurrent operation it did not see; that is a correct answer, and it needs a central authority to
+  define what &ldquo;concurrent&rdquo; means. A CRDT takes the other road: change the operations
+  until order stops mattering. An insert names the <em>identity</em> of the character it follows
+  (<code>{s: 'alice', c: 7}</code>), never a position. A delete unlinks nothing, it sets a flag. Both
+  are idempotent and commutative, so any two replicas that have seen the same <em>set</em> of
+  operations hold byte-identical documents, in whatever order those operations arrived, with nobody
+  arbitrating.</p>
+  <p>Be precise about what that buys: <strong>freedom from ordering, not freedom from loss</strong>.
+  Convergence is conditional on every replica eventually seeing every operation, and Redis pub/sub
+  is fire-and-forget &mdash; it drops messages when a subscriber is slow or a connection blips.
+  Sequence numbers, gap detection, a durable Stream to repair from, snapshots for when the repair
+  would be too large, presence sweeps for clients that never said goodbye: all of it exists only to
+  make &ldquo;eventually sees every operation&rdquo; true. The CRDT is 565 lines. The delivery
+  machinery around it is the other four thousand, and that ratio is the lesson.</p>
+</div>
+
+<h2>What you will build</h2>
+
+<p>One Node process, one port. The HTTP server serves the editor page, <code>/healthz</code> with
+live per-document statistics, <code>/metrics</code> with counters, and <code>/rga.js</code> &mdash;
+which is <code>src/crdt/rga.js</code> streamed straight to the browser, so client and server run the
+same merge code rather than two hand-written implementations of one comparator. The same server
+handles the WebSocket upgrade on <code>/ws</code>. Run two copies of it against one Redis and they
+behave as a single server; that is the whole claim, and <code>docker-compose.yml</code> exists to
+let you disprove it.</p>
+
+<p>Follow one keystroke. The client turns it into one RGA op per character, applies it to its own
+replica immediately, and sends it. The receiving instance appends it to the Redis Stream &mdash;
+which is where its sequence number comes from &mdash; applies it to the in-memory document, writes
+it to every local socket except the author&rsquo;s (who gets an <code>ack</code> carrying the
+sequence), and publishes it. The other instance receives the publish, compares the sequence against
+its own watermark, repairs from the Stream if it finds a gap, applies, and writes to <em>its</em>
+sockets. Nothing in that path blocks on a lock, and no step needs to know which instance a client is
+attached to.</p>
+
+<figure>
+<svg viewBox="0 0 820 424" role="img" aria-label="Two browser tabs, each an RGA replica, connected to two separate Node instances on ports 58080 and 58081; both instances hold an in-memory CRDT and talk to one Redis 8 holding a Stream op log, a sequence allocator, a pub/sub channel, a presence hash and a snapshot hash. One edit travels from tab A to instance app1, into Redis via an atomic Lua append, out over pub/sub to app2, and down to tab B.">
+  <rect class="node" x="30" y="32" width="180" height="46" rx="7"/>
+  <text class="lbl-b" x="120" y="52" text-anchor="middle">browser tab A</text>
+  <text class="lbl-s" x="120" y="68" text-anchor="middle">RGA replica &middot; optimistic</text>
+
+  <text class="lbl-b" x="415" y="50" text-anchor="middle">1 &middot; one keystroke = one op per character</text>
+  <text class="lbl-s" x="415" y="68" text-anchor="middle">an insert names its predecessor, never an index</text>
+
+  <rect class="node" x="610" y="32" width="180" height="46" rx="7"/>
+  <text class="lbl-b" x="700" y="52" text-anchor="middle">browser tab B</text>
+  <text class="lbl-s" x="700" y="68" text-anchor="middle">same rga.js, same merge</text>
+
+  <rect class="node" x="14" y="118" width="300" height="140" rx="8"/>
+  <text class="lbl-b" x="28" y="138">instance app1</text>
+  <text class="mono"  x="302" y="138" text-anchor="end">:58080</text>
+  <rect class="node" x="26" y="148" width="134" height="40" rx="5"/>
+  <text class="lbl-b" x="93" y="166" text-anchor="middle">transport</text>
+  <text class="mono"  x="93" y="181" text-anchor="middle">wsServer &middot; protocol</text>
+  <rect class="node-i" x="168" y="148" width="134" height="40" rx="5"/>
+  <text class="lbl-b" x="235" y="166" text-anchor="middle">doc layer</text>
+  <text class="mono"  x="235" y="181" text-anchor="middle">registry &middot; document</text>
+  <rect class="node-a" x="26" y="196" width="276" height="36" rx="5"/>
+  <text class="mono"  x="164" y="212" text-anchor="middle">src/crdt/rga.js</text>
+  <text class="lbl-s" x="164" y="226" text-anchor="middle">the merge logic, byte-identical in both</text>
+  <text class="lbl-s" x="28" y="250">in-memory RGA + seq watermark per open doc</text>
+
+  <rect class="node" x="506" y="118" width="300" height="140" rx="8"/>
+  <text class="lbl-b" x="520" y="138">instance app2</text>
+  <text class="mono"  x="794" y="138" text-anchor="end">:58081</text>
+  <rect class="node" x="518" y="148" width="134" height="40" rx="5"/>
+  <text class="lbl-b" x="585" y="166" text-anchor="middle">transport</text>
+  <text class="mono"  x="585" y="181" text-anchor="middle">wsServer &middot; protocol</text>
+  <rect class="node-i" x="660" y="148" width="134" height="40" rx="5"/>
+  <text class="lbl-b" x="727" y="166" text-anchor="middle">doc layer</text>
+  <text class="mono"  x="727" y="181" text-anchor="middle">registry &middot; document</text>
+  <rect class="node-a" x="518" y="196" width="276" height="36" rx="5"/>
+  <text class="mono"  x="656" y="212" text-anchor="middle">src/crdt/rga.js</text>
+  <text class="lbl-s" x="656" y="226" text-anchor="middle">shares no memory with app1</text>
+  <text class="lbl-s" x="520" y="250">learns about the edit only through Redis</text>
+
+  <rect class="node-i" x="200" y="290" width="420" height="104" rx="8"/>
+  <text class="lbl-b" x="410" y="312" text-anchor="middle">Redis 8 &mdash; the only shared state</text>
+  <text class="mono" x="214" y="332">Stream</text><text class="mono" x="272" y="332">:oplog</text>
+  <text class="lbl-s" x="352" y="332">durable, sequence-addressed replay</text>
+  <text class="mono" x="214" y="346">String</text><text class="mono" x="272" y="346">:seq</text>
+  <text class="lbl-s" x="352" y="346">allocated by INCR inside that Lua</text>
+  <text class="mono" x="214" y="360">PubSub</text><text class="mono" x="272" y="360">:events</text>
+  <text class="lbl-s" x="352" y="360">fanout, fire-and-forget, may drop</text>
+  <text class="mono" x="214" y="374">Hash</text><text class="mono" x="272" y="374">:presence</text>
+  <text class="lbl-s" x="352" y="374">cursors and names, swept on TTL</text>
+  <text class="mono" x="214" y="388">Hash</text><text class="mono" x="272" y="388">:snapshot</text>
+  <text class="lbl-s" x="352" y="388">bounded catch-up for stale clients</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="120" y1="80" x2="120" y2="114" marker-end="url(#rtc-ar1)"/>
+    <line class="edge" x1="700" y1="116" x2="700" y2="82" marker-end="url(#rtc-ar1)"/>
+    <path class="edge dash" d="M 520 286 L 520 274 L 670 274 L 670 262" marker-end="url(#rtc-ar1)"/>
+  </g>
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 150 260 L 150 274 L 300 274 L 300 286" marker-end="url(#rtc-ar1)"/>
+  </g>
+
+  <text class="mono"  x="128" y="96">ws://:58080/ws</text>
+  <text class="lbl-s" x="128" y="110">2 &middot; op frame, validated</text>
+  <text class="mono"  x="692" y="96" text-anchor="end">ws://:58081/ws</text>
+  <text class="lbl-s" x="692" y="110" text-anchor="end">5 &middot; fan out to local sockets</text>
+  <text class="lbl-s" x="158" y="270">3 &middot; INCR + XADD in one Lua script</text>
+  <text class="lbl-s" x="662" y="270" text-anchor="end">4 &middot; publish &rarr; app2</text>
+
+  <text class="lbl-s" x="8" y="412">app2 compares the published sequence with its watermark first: a gap is repaired by reading the Stream, never by asking app1 &mdash; instances hold no opinion about each other.</text>
+
+  <defs>
+    <marker id="rtc-ar1" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The two instances never speak to each other. Every cross-instance fact &mdash; the edit,
+its sequence number, who is present, what the document looked like at sequence N &mdash; travels
+through Redis, which is why adding a third instance costs nothing and why a broken backplane is
+invisible until you open the second port.</figcaption>
+</figure>
+
+<h2>The mechanisms</h2>
+
+<p>Each row is a piece of the codebase that exists to make one idea concrete. The right-hand column
+is where that idea was taught in the abstract &mdash; read the module page first if the mechanism
+does not land, or read the file first and use the module page to check your understanding.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Lives in</th><th>The concept it demonstrates</th><th>Where it was taught</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>RGA: insert-after-id, delete-as-tombstone</strong></td>
+  <td><code>src/crdt/rga.js</code></td>
+  <td>Operations with an algebra &mdash; commutative and idempotent &mdash; so replicas converge on the same state with no coordinator and no transform</td>
+  <td><span class="xref">08 &middot; CRDTs</span></td>
+</tr>
+<tr>
+  <td><strong>Lamport counter plus a site-id tie-break</strong></td>
+  <td><code>src/crdt/rga.js</code> &mdash; <code>compareIds</code></td>
+  <td>Logical time, and turning the partial order of causality into the <em>total</em> order that concurrent inserts at one position need</td>
+  <td><span class="xref">08 &middot; Time, clocks &amp; ordering</span></td>
+</tr>
+<tr>
+  <td><strong>Causal buffering of ops whose predecessor is missing</strong></td>
+  <td><code>src/crdt/rga.js</code> &mdash; <code>#pending</code></td>
+  <td>Causal delivery reconstructed by the receiver instead of demanded from the network</td>
+  <td><span class="xref">08 &middot; Consistency models</span></td>
+</tr>
+<tr>
+  <td><strong>Op log as a Redis Stream, read with <code>XRANGE (N +</code></strong></td>
+  <td><code>src/backplane/oplog.js</code></td>
+  <td>Why a Stream and not a List: entries are <em>addressable</em>, so &ldquo;everything after sequence N&rdquo; is O(log n) and survives trimming</td>
+  <td><span class="xref">07 &middot; Pub/sub &amp; Streams</span></td>
+</tr>
+<tr>
+  <td><strong><code>INCR</code> and <code>XADD</code> inside one Lua script</strong></td>
+  <td><code>src/backplane/oplog.js</code></td>
+  <td>Atomicity bought with Redis&rsquo;s single-threaded execution: allocate-then-use is a race, and two instances interleaving it make <code>XADD</code> reject the lower id forever</td>
+  <td><span class="xref">07 &middot; Transactions &amp; scripting</span></td>
+</tr>
+<tr>
+  <td><strong>The same lost update, seen in a database</strong></td>
+  <td><code>src/backplane/oplog.js</code> &mdash; the script comment</td>
+  <td>Why <code>SELECT &hellip; FOR UPDATE</code> and a Lua script are two answers to one question</td>
+  <td><span class="xref">05 &middot; Concurrency patterns in Postgres</span></td>
+</tr>
+<tr>
+  <td><strong>Pub/sub fanout with self-echo filtering by instance id</strong></td>
+  <td><code>src/backplane/redisBus.js</code></td>
+  <td>A broadcast channel delivers to the publisher too; the sender must be able to recognise its own message or it applies every edit twice</td>
+  <td><span class="xref">08 &middot; Messaging patterns</span></td>
+</tr>
+<tr>
+  <td><strong>Sequence watermark and gap repair</strong></td>
+  <td><code>src/doc/registry.js</code>, <code>src/doc/document.js</code></td>
+  <td>Detecting loss on an at-most-once channel and healing from the durable log &mdash; the same shape as a replica catching up from a WAL</td>
+  <td><span class="xref">08 &middot; Replication</span></td>
+</tr>
+<tr>
+  <td><strong>Re-applying an op already integrated is a no-op</strong></td>
+  <td><code>src/crdt/rga.js</code>, <code>src/doc/registry.js</code></td>
+  <td>Exactly-once <em>effect</em> from at-least-once delivery, which is what makes replay-after-reconnect safe</td>
+  <td><span class="xref">08 &middot; Idempotency</span></td>
+</tr>
+<tr>
+  <td><strong>Presence hash, heartbeat TTL, per-instance sweeper</strong></td>
+  <td><code>src/backplane/presence.js</code></td>
+  <td>There is no such thing as a clean disconnect &mdash; a slept laptop never sends a goodbye, so liveness is a timeout and the <code>HDEL</code> return value is the arbiter of who broadcasts the leave</td>
+  <td><span class="xref">08 &middot; Failure models</span></td>
+</tr>
+<tr>
+  <td><strong>Snapshots, <code>MAXLEN ~</code> trimming, <code>OPLOG_KEEP</code></strong></td>
+  <td><code>src/backplane/snapshot.js</code></td>
+  <td>A checkpoint is what makes a log trimmable; the <code>state</code>&hArr;<code>seq</code> invariant is what stops a guarded write from going backwards</td>
+  <td><span class="xref">07 &middot; Persistence</span></td>
+</tr>
+<tr>
+  <td><strong>Bounded outbound queue, <code>bufferedAmount</code>, close 4002</strong></td>
+  <td><code>src/transport/wsServer.js</code></td>
+  <td>Flow control: a consumer slower than the producer must eventually be dropped, because the alternative is unbounded server memory</td>
+  <td><span class="xref">01 &middot; Streams &amp; backpressure</span></td>
+</tr>
+<tr>
+  <td><strong>Heartbeat ping/pong and deliberate close codes</strong></td>
+  <td><code>src/transport/wsServer.js</code></td>
+  <td>A TCP connection to a dead peer stays open for a long time; liveness has to be asserted at the application layer</td>
+  <td><span class="xref">01 &middot; Networking</span></td>
+</tr>
+<tr>
+  <td><strong>Every frame shape-checked and rebuilt, token-bucket rate limit</strong></td>
+  <td><code>src/transport/protocol.js</code></td>
+  <td>Inbound JSON is untrusted input: validate, then construct a new object rather than passing the parsed one inwards</td>
+  <td><span class="xref">01 &middot; Security</span></td>
+</tr>
+<tr>
+  <td><strong>Two stateless instances, one backplane, no sticky sessions</strong></td>
+  <td><code>src/index.js</code>, <code>docker-compose.yml</code></td>
+  <td>Horizontally scaling long-lived connections by keeping every cross-connection fact outside the process</td>
+  <td><span class="xref">01 &middot; Cluster &amp; scaling</span></td>
+</tr>
+<tr>
+  <td><strong>Optimistic local apply, textarea diffing, reconnect with backoff</strong></td>
+  <td><code>client/client.js</code></td>
+  <td>The latency budget of a real-time UI: never wait for a round trip, and resume with &ldquo;I last saw sequence N&rdquo;</td>
+  <td><span class="xref">09 &middot; Real-time system design</span></td>
+</tr>
+<tr>
+  <td><strong>Counters, <code>tombstoneRatio</code>, gap-repair and drop metrics</strong></td>
+  <td><code>src/lib/metrics.js</code>, <code>src/index.js</code></td>
+  <td>Choosing in advance the handful of numbers that would tell you the backplane is quietly failing</td>
+  <td><span class="xref">08 &middot; Distributed observability</span></td>
+</tr>
+<tr>
+  <td><strong>Same ops, dozens of orders, byte-identical documents</strong></td>
+  <td><code>src/crdt/rga.test.js</code>, <code>test/integration.test.js</code></td>
+  <td>The property assertion a correct implementation passes and a plausible one fails &mdash; and the reordering that makes it fail</td>
+  <td><span class="xref">08 &middot; Testing distributed systems</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2>Repository layout</h2>
+
+<p>Everything lives under <code>code/</code>. It is pure ESM (<code>"type": "module"</code>), nothing
+is transpiled, and there are exactly two runtime dependencies. The browser client is served by the
+same process and imports <code>/rga.js</code>, which is the server&rsquo;s own CRDT file.</p>
+
+<div class="codewrap">
+<div class="codehead">10-projects/p5-realtime-collab/code<span class="lang">text</span></div>
+<pre><code class="lang-text">code/
+├── src/
+│   ├── index.js                bootstrap: HTTP + WS on one port, /healthz, /metrics,
+│   │                           and /rga.js served straight from src/crdt/rga.js
+│   ├── config.js               every env var, read once, validated, frozen; key layout
+│   ├── crdt/
+│   │   ├── rga.js              THE file -- ids, compareIds, integration, causal
+│   │   │                       buffering, snapshot encode/decode, tombstone GC
+│   │   └── rga.test.js         convergence under reordering: the central assertion
+│   ├── doc/
+│   │   ├── document.js         per-document state: the CRDT + a seq watermark,
+│   │   │                       and why those two are not the same number
+│   │   ├── document.test.js
+│   │   └── registry.js         load/unload, submitOps, gap repair, catch-up
+│   │                           (delta vs snapshot) -- where everything meets
+│   ├── backplane/
+│   │   ├── oplog.js            Redis Stream op log; INCR+XADD in one Lua script
+│   │   ├── redisBus.js         pub/sub fanout, self-echo filtered by instanceId
+│   │   ├── presence.js         heartbeats, the sweeper, the HDEL-as-arbiter race
+│   │   └── snapshot.js         guarded writes, the state &lt;-&gt; seq invariant
+│   ├── transport/
+│   │   ├── wsServer.js         lifecycle, heartbeat, backpressure, rate limiting
+│   │   ├── protocol.js         every inbound frame shape-checked and rebuilt
+│   │   └── protocol.test.js
+│   └── lib/
+│       ├── logger.js           structured JSON logs, LOG_LEVEL / LOG_PRETTY
+│       └── metrics.js          counters and gauges rendered at /metrics
+├── client/
+│   ├── index.html              the editor page: textarea, presence sidebar,
+│   │                           sync mode, and a "simulate network drop" button
+│   └── client.js               optimistic apply, textarea diffing, caret repair,
+│                               reconnect with backoff and `since`
+├── test/
+│   └── integration.test.js     two instances, one Redis, two real sockets
+├── docker-compose.yml          redis:8-alpine + app1 (:58080) + app2 (:58081)
+├── Makefile                    install / up / down / logs / dev / dev2 /
+│                               test / test-unit / test-integration / cov / clean
+├── package.json                type: module, engines.node &gt;= 22, deps: ws + redis
+├── package-lock.json
+└── README.md                   the tour: five files to read, in order</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">No Dockerfile, and that is deliberate</span>
+  <p>Compose runs the stock <code>node:22-alpine</code> image with the repository bind-mounted at
+  <code>/app</code> and <code>node src/index.js</code> as the command. Both dependencies
+  (<code>ws</code>, <code>redis</code>) are pure JavaScript with no native addon, so a
+  <code>node_modules</code> installed on your host &mdash; Windows included &mdash; is portable
+  straight into the container; the <code>[ -d node_modules ] || npm install --omit=dev</code> guard
+  in the command only exists so a clean checkout also works. There is no build step to containerise,
+  and skipping the image build keeps <code>make up</code> to a few seconds.</p>
+</div>
+
+<h2>Quick start</h2>
+
+<p>Node 22 or newer, and a Redis 8 you can reach &mdash; Docker for both, or Docker for Redis and
+Node on your machine. The unit tests need neither.</p>
+
+<div class="codewrap">
+<div class="codehead">everything in containers: Redis 8 and two instances<span class="lang">bash</span></div>
+<pre><code class="lang-bash">cd 10-projects/p5-realtime-collab/code
+npm install                      # ws and redis, nothing else
+
+make up                          # docker compose up -d, waits for the redis healthcheck
+                                 # app1 -&gt; http://localhost:58080
+                                 # app2 -&gt; http://localhost:58081
+
+make logs                        # tail both instances
+make down                        # stop the stack and delete the Redis volume</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">Redis in Docker, both servers on your machine, hot reload<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker run -d --name p5-redis -p 56379:6379 redis:8-alpine
+
+make dev                         # instance A on :58080, INSTANCE_ID=dev-a, node --watch
+make dev2                        # instance B on :58081, INSTANCE_ID=dev-b, second terminal</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">tests -- the built-in node:test runner, nothing installed<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test                        # everything; integration self-skips with no Redis
+make test-unit                   # RGA + Document + protocol, no Redis needed
+make test-integration            # two instances, one Redis, real sockets
+make cov                         # node --test --experimental-test-coverage</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">see it actually converge<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># 1. open BOTH ports side by side -- :58080 in one window, :58081 in the other
+# 2. type in both at once: the text merges character by character, and the
+#    sidebar shows the other tab's name, colour, cursor and server instance
+# 3. press "simulate network drop" in one tab, keep typing in the other, and
+#    watch sync mode flip to `delta` (or `snapshot` if you went far enough)
+
+curl -s localhost:58080/healthz | jq    # docs open, clients, seq, tombstoneRatio
+curl -s localhost:58080/metrics         # ops applied, gap repairs, sockets dropped</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Two tabs on the same port prove nothing</span>
+  <p>Open <code>localhost:58080</code> twice and the edits merge perfectly &mdash; and you have tested
+  nothing beyond an in-process broadcast loop. Both sockets live in one <code>registry.js</code>,
+  which writes to every local socket before it ever touches Redis, so you can delete the entire
+  <code>redisBus.js</code> publish and the demo still looks correct. That is exactly why
+  <code>docker-compose.yml</code> brings up <em>two</em> app containers on two host ports. The
+  interesting assertion is always &ldquo;a client on :58080 sees an edit made on :58081&rdquo;, and
+  every worthwhile manual test has one tab on each.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A green <code>make test</code> can mean the backplane was never exercised</span>
+  <p><code>test/integration.test.js</code> checks whether Redis is reachable and <em>skips</em> if it
+  is not, so <code>make test</code> exits 0 on a machine with no Redis running while never having
+  started a second instance, never having published anything, and never having repaired a gap. Read
+  the summary line, not just the exit code: if the skip count is not zero you ran the CRDT unit
+  tests and called it a pass. <code>make test-integration</code> does not change that &mdash; the
+  skip is decided at import time by a Redis probe, whichever script invoked the file &mdash; but it
+  runs <em>only</em> that file, so a missing Redis shows up as <code># pass 0</code> beside
+  <code># skipped 1</code> with nothing green to hide behind. In CI, assert the skip count is zero
+  or gate the job on a Redis service container.</p>
+</div>
+
+<div class="box note">
+  <span class="bt">Windows: the Makefile recipes are shell one-liners</span>
+  <p>Every target is one command, so a machine without <code>make</code> loses nothing &mdash; read
+  the recipe and run it. The one thing that does not translate is the inline environment prefix:
+  <code>PORT=58081 node src/index.js</code> is a syntax error in PowerShell, where you want
+  <code>$env:PORT=58081; $env:INSTANCE_ID='dev-b'; node src/index.js</code>. Git Bash and WSL run the
+  <code>Makefile</code> unchanged.</p>
+</div>
+
+<h2>Documentation</h2>
+
+<p>Read them in order. Finish the design document before you open the code &mdash; the
+implementation walkthrough assumes you already know why an insert names its predecessor and why the
+comparator must be a total order.</p>
+
+<div class="grid">
+  <a class="card" href="01-design.html"><span class="n">01</span>
+    <div class="t">CRDTs &amp; the convergence problem</div>
+    <p class="d">Why indexes cannot survive concurrency, OT against CRDTs and what each one costs,
+    the RGA model &mdash; character identity, insert-after, tombstones &mdash; the proof sketch that
+    the operations commute, the total order that concurrent inserts depend on, and the tombstone
+    problem nobody advertises.</p></a>
+
+  <a class="card" href="02-implementation.html"><span class="n">02</span>
+    <div class="t">The realtime layer</div>
+    <p class="d">The Lua append script and the INCR/XADD race it closes, the ordering of append,
+    apply, broadcast and publish in <code>submitOps</code>, self-echo filtering, gap detection and
+    repair, delta against snapshot catch-up, the presence sweeper&rsquo;s <code>HDEL</code> arbiter,
+    and the bounded outbound queue that hangs up on a slow client.</p></a>
+
+  <a class="card" href="03-running.html"><span class="n">03</span>
+    <div class="t">Running, testing &amp; exercises</div>
+    <p class="d">The full configuration surface, the convergence test and how to make it fail on
+    purpose, the two-instance integration test, reading <code>/healthz</code> and
+    <code>/metrics</code> while you break things, and ten exercises from block-wise tombstones to
+    consumer-group fanout and authorisation on the join frame.</p></a>
+</div>
+
+<div class="nav-bottom">
+  <a href="../../index.html#work"><span class="lb">Back to</span>Portfolio &middot; Projects</a>
+  <a href="01-design.html"><span class="lb">Next</span>CRDTs &amp; the convergence problem</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

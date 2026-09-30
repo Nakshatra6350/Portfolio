@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Running, testing &amp; exercises &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Real-time Collaborative Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Running, testing &amp; exercises</h1>
+<p class="lede">Start the stack, watch two browser tabs converge character by character, then split
+them across two server instances so the Redis backplane is the only thing holding the document
+together. After that: read the op log with <code>redis-cli</code>, run the convergence property
+test, load it until the event loop bends, and break Redis, the network and an instance on
+purpose &mdash; each failure has a distinct signature in the metrics.</p>
+
+<div class="meta">
+  <span class="tag v">Node 22</span>
+  <span class="tag v">WebSocket</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">run &amp; break</span>
+</div>
+
+<h2>Bring it up</h2>
+
+<p>Two dependencies (<code>ws</code>, <code>redis</code>), no build step, no bundler. The only
+external requirement is a Redis 8 that both instances can reach.</p>
+
+<div class="codewrap">
+<div class="codehead">from <code>10-projects/p5-realtime-collab/code</code><span class="lang">bash</span></div>
+<pre><code class="lang-bash">npm install                      # or: make install
+
+# Option A - Redis 8 + TWO app instances, all in Docker
+make up                          # docker compose up -d
+                                 # app1 -&gt; http://localhost:58080
+                                 # app2 -&gt; http://localhost:58081
+
+# Option B - Redis in Docker, both servers on your machine (better logs,
+#            node --watch, and you can attach a debugger)
+docker run -d --name p5-redis -p 56379:6379 redis:8-alpine
+make dev                         # INSTANCE_ID=dev-a PORT=58080
+make dev2                        # INSTANCE_ID=dev-b PORT=58081 (second terminal)
+
+make down                        # stop the stack AND drop the Redis volume</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">No make? Every target is one line</span>
+  <p>The <code>Makefile</code> is a thin wrapper. On PowerShell the two development instances are:</p>
+<div class="codewrap"><pre><code class="lang-bash"># terminal 1
+$env:INSTANCE_ID="dev-a"; $env:PORT="58080"; node --run dev
+# terminal 2
+$env:INSTANCE_ID="dev-b"; $env:PORT="58081"; node --run dev</code></pre></div>
+  <p><code>node --run</code> is Node 22's built-in script runner &mdash; it skips the npm process
+  entirely, which is worth ~200&nbsp;ms per start when you are restarting a server every few
+  seconds. <code>npm run dev</code> works identically.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">a healthy boot, one JSON object per line<span class="lang">text</span></div>
+<pre><code class="lang-text">{"time":"2026-09-02T10:14:02.118Z","level":"info","msg":"starting","instanceId":"dev-a",
+ "port":58080,"redisUrl":"redis://127.0.0.1:56379","node":"v22.17.1"}
+{"time":"2026-09-02T10:14:02.164Z","level":"info","msg":"redis connected","instanceId":"dev-a"}
+{"time":"2026-09-02T10:14:02.171Z","level":"info","msg":"listening","instanceId":"dev-a",
+ "port":58080,"host":"0.0.0.0","ws":"ws://localhost:58080/ws"}
+
+# LOG_PRETTY=1 collapses each line to `time LEVEL msg {fields}` for a terminal.
+# In JSON mode, jq is the tool: every connection line carries connId/docId/clientId
+# because wsServer.js builds a child logger per socket.
+node --run start | jq -c 'select(.connId=="conn-1a2b3c4d")'</code></pre>
+</div>
+
+<h2>Two tabs, one instance: see it converge</h2>
+
+<p>Open <code>http://localhost:58080</code> twice. Each tab mints its own client id into
+<code>sessionStorage</code>, and that id is <em>also</em> its CRDT site id &mdash; so the two tabs are
+genuinely two replicas, not one shared editor with two views. Type in both at the same time, ideally
+in the same region of the text. Characters interleave; nothing is lost; the sidebar's
+<em>characters</em> and <em>tombstones</em> counters move independently.</p>
+
+<p>The reason this works without a round trip is in the client's <code>input</code> handler. The
+textarea gives you a whole new value, not a keystroke, so the client recovers the change with a
+prefix/suffix scan and turns it into CRDT ops that it applies <em>locally first</em>.</p>
+
+<div class="codewrap">
+<div class="codehead">client/client.js &mdash; a textarea change becomes ops<span class="lang">js</span></div>
+<pre><code class="lang-js">el.editor.addEventListener('input', () =&gt; {
+  const before = state.rga.toString();
+  const after = el.editor.value;
+  const change = diffText(before, after);
+  if (change.removed === 0 &amp;&amp; change.inserted.length === 0) return;
+
+  const ops = [];
+  // Delete first, then insert at the same index: a replacement is exactly that
+  // pair, and doing it in the other order would shift the delete range.
+  if (change.removed &gt; 0) ops.push(...state.rga.deleteAt(change.start, change.removed));
+  if (change.inserted.length &gt; 0) ops.push(...state.rga.insertAt(change.start, change.inserted));
+
+  sendOps(ops);
+  renderStats();
+  scheduleCursor();
+});</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Do not <em>duplicate</em> the tab &mdash; open a new one</span>
+  <p>Chrome and Firefox copy <code>sessionStorage</code> into a duplicated tab. Both copies then
+  read the same <code>collab.clientId</code>, so two independent RGA replicas share a site id and
+  their Lamport clocks advance separately. Both mint <code>{s:"c-abc", c:6}</code> for
+  <em>different</em> characters, and integration &mdash; which is correctly idempotent on id &mdash;
+  discards the second as already-applied. Characters silently vanish and it looks like a CRDT bug.
+  Open a fresh tab (or a private window) instead. The same hazard is why <code>config.js</code>
+  refuses an <code>INSTANCE_ID</code> containing <code>:</code>: site ids are joined into map keys as
+  <code>`${siteId}:${counter}`</code>.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">what the server thinks is going on<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -s localhost:58080/healthz | jq</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">/healthz &mdash; registry.stats() per document<span class="lang">json</span></div>
+<pre><code class="lang-json">{
+  "status": "ok",
+  "instanceId": "dev-a",
+  "uptimeSeconds": 214,
+  "redis": { "commands": true, "subscriber": true },
+  "connections": 2,
+  "documents": [
+    {
+      "docId": "demo",
+      "seq": 412,               // op-log watermark: how much of the log we consumed
+      "length": 289,            // VISIBLE characters
+      "tombstones": 123,        // deleted characters still in the linked list
+      "tombstoneRatio": 0.299,  // the number to watch on a long-lived document
+      "pending": 0,             // ops parked waiting for a causal predecessor
+      "opsApplied": 412,
+      "opsSinceSnapshot": 12,
+      "lastActivityAt": 1756800842118,
+      "connections": 2
+    }
+  ]
+}</code></pre>
+</div>
+
+<p><code>seq</code> and <code>length</code> answer different questions and that separation is the
+whole design: <code>length</code> comes from the CRDT, which does not care about order, while
+<code>seq</code> is the Redis-allocated watermark that makes "send me everything after 412" a
+meaningful request. Delete a paragraph and watch <code>length</code> fall while
+<code>tombstones</code> rises by the same amount &mdash; nothing is ever removed from the list.</p>
+
+<h2>Two instances: prove the backplane</h2>
+
+<p>The single-instance demo proves the CRDT. It proves nothing about the architecture, because both
+tabs are talking to the same in-memory <code>Document</code>. Put one tab on <code>:58080</code> and
+the other on <code>:58081</code> and every character now has to travel through Redis.</p>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="One keystroke travelling from a browser tab through instance app1, into the Redis op log and pub/sub channel, out to instance app2 and on to a second browser tab">
+  <rect class="node-i" x="14" y="28" width="170" height="54" rx="7"/>
+  <text class="lbl-b" x="99" y="50" text-anchor="middle">tab A &mdash; :58080</text>
+  <text class="lbl-s" x="99" y="68" text-anchor="middle">RGA replica, site "c-a1b2"</text>
+
+  <rect class="node" x="14" y="150" width="170" height="76" rx="7"/>
+  <text class="lbl-b" x="99" y="172" text-anchor="middle">instance app1</text>
+  <text class="mono" x="99" y="190" text-anchor="middle">registry.submitOps()</text>
+  <text class="lbl-s" x="99" y="208" text-anchor="middle">its own RGA replica too</text>
+
+  <rect class="node-a" x="326" y="96" width="170" height="140" rx="7"/>
+  <text class="lbl-b" x="411" y="118" text-anchor="middle">REDIS 8</text>
+  <text class="mono" x="336" y="140">:oplog &nbsp; Stream</text>
+  <text class="mono" x="336" y="158">:seq &nbsp; &nbsp; String</text>
+  <text class="mono" x="336" y="176">:events &nbsp;PubSub</text>
+  <text class="mono" x="336" y="194">:presence Hash</text>
+  <text class="mono" x="336" y="212">:snapshot Hash</text>
+  <text class="lbl-s" x="411" y="230" text-anchor="middle">the only shared state</text>
+
+  <rect class="node" x="636" y="150" width="170" height="76" rx="7"/>
+  <text class="lbl-b" x="721" y="172" text-anchor="middle">instance app2</text>
+  <text class="mono" x="721" y="190" text-anchor="middle">onBusMessage()</text>
+  <text class="lbl-s" x="721" y="208" text-anchor="middle">gap check, then apply</text>
+
+  <rect class="node-i" x="636" y="28" width="170" height="54" rx="7"/>
+  <text class="lbl-b" x="721" y="50" text-anchor="middle">tab B &mdash; :58081</text>
+  <text class="lbl-s" x="721" y="68" text-anchor="middle">RGA replica, site "c-c3d4"</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="56" y1="84" x2="56" y2="148" marker-end="url(#p52-ar1)"/>
+    <line class="edge-a" x1="186" y1="168" x2="322" y2="132" marker-end="url(#p52-ar2)"/>
+    <line class="edge-a" x1="186" y1="200" x2="322" y2="208" marker-end="url(#p52-ar3)"/>
+    <line class="edge-a" x1="500" y1="182" x2="632" y2="182" marker-end="url(#p52-ar4)"/>
+    <line class="edge-a" x1="721" y1="148" x2="721" y2="86" marker-end="url(#p52-ar5)"/>
+  </g>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="142" y1="148" x2="142" y2="86" marker-end="url(#p52-ar6)"/>
+  </g>
+
+  <text class="lbl-s" x="62" y="110">1 op frame</text>
+  <text class="lbl-s" x="62" y="124">one op per char</text>
+  <text class="lbl-s" x="150" y="132">3 ack{seq}</text>
+  <text class="lbl-s" x="254" y="132" text-anchor="middle">2 XADD (Lua: INCR+XADD)</text>
+  <text class="lbl-s" x="254" y="146" text-anchor="middle">allocates the sequence number</text>
+  <text class="lbl-s" x="254" y="232" text-anchor="middle">4 PUBLISH :events</text>
+  <text class="lbl-s" x="566" y="158" text-anchor="middle">5 {type,seq,ops,clientId,instanceId}</text>
+  <text class="lbl-s" x="566" y="172" text-anchor="middle">dropped if instanceId is our own</text>
+  <text class="lbl-s" x="729" y="120">6 ops frame</text>
+
+  <text class="lbl-s" x="14" y="264">Durable BEFORE visible: the XADD happens before the local broadcast and before the publish, so a crash between them loses nothing.</text>
+  <text class="lbl-s" x="14" y="280">Reverse those two and you can broadcast an edit that was never durable &mdash; the bug that reads as "fine until someone restarted the server".</text>
+  <text class="lbl-s" x="14" y="296">The author never receives step 6; it already applied the ops optimistically, so it gets an ack carrying only the sequence number.</text>
+  <defs>
+    <marker id="p52-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Six hops for one character. Steps 2 and 4 are the only ones that leave the process, and
+step 2 is the one that must never be skipped or reordered.</figcaption>
+</figure>
+
+<p>Confirm the traffic really crossed the boundary rather than taking a local shortcut. The
+<em>server</em> field in each tab's sidebar shows the instance id it is attached to, and the metric
+that only moves on the receiving side is <code>collab_bus_received_total</code>:</p>
+
+<div class="codewrap">
+<div class="codehead">before and after typing five characters in tab A<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -s localhost:58080/metrics | grep -E 'bus_(published|received)|ops_(applied|duplicate)'
+curl -s localhost:58081/metrics | grep -E 'bus_(published|received)|ops_(applied|duplicate)'
+
+# app1 (the origin):    bus_published_total 1   bus_received_total 0
+# app2 (the receiver):  bus_published_total 0   bus_received_total 1
+# BOTH:                 ops_applied_total  5    ops_duplicate_total 0</code></pre>
+</div>
+
+<p>That <code>ops_duplicate_total 0</code> on app1 is the interesting assertion. Redis pub/sub
+delivers to the publisher as well, so without self-filtering app1 would apply its own five ops a
+second time and count five duplicates. The filter is one line:</p>
+
+<div class="codewrap">
+<div class="codehead">src/backplane/redisBus.js<span class="lang">js</span></div>
+<pre><code class="lang-js">// Drop our own echo - see SELF-FILTERING above.
+if (envelope.instanceId === config.instanceId) return;
+metrics.inc('collab_bus_received_total');</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Two instances sharing an <code>INSTANCE_ID</code> is a silent split-brain</span>
+  <p>Self-filtering is by instance id, so if you export <code>INSTANCE_ID</code> in a shell profile
+  or an <code>.env</code> and start both servers from it, each one drops the <em>other's</em>
+  messages as its own echo. Both processes look perfectly healthy: sockets connect, edits apply
+  locally, <code>/healthz</code> is <code>ok</code>, and <code>collab_bus_published_total</code>
+  climbs. Only <code>collab_bus_received_total</code> stays pinned at zero on both, and the two tabs
+  hold different documents forever. <code>make dev</code> / <code>make dev2</code> set
+  <code>dev-a</code> and <code>dev-b</code> precisely so you cannot trip this by accident; if you
+  start the servers by hand, leave <code>INSTANCE_ID</code> unset and let
+  <code>config.js</code> generate <code>inst-&lt;8 hex&gt;</code>.</p>
+</div>
+
+<h2>Kill the network and watch it resync</h2>
+
+<p>Pull one tab's connection and keep typing in the other. The dropped tab reconnects with
+exponential backoff plus jitter, sends <code>join</code> with <code>since: lastSeq</code>, and the
+server decides between two answers. The sidebar's <em>sync mode</em> field shows which one it got.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Client reconnect state machine showing backoff with jitter, the join with a since watermark, and the server's delta-versus-snapshot decision">
+  <rect class="node-o" x="14" y="34" width="150" height="52" rx="7"/>
+  <text class="lbl-b" x="89" y="56" text-anchor="middle">CONNECTED</text>
+  <text class="lbl-s" x="89" y="74" text-anchor="middle">lastSeq advances on ack</text>
+
+  <rect class="node-w" x="222" y="34" width="176" height="52" rx="7"/>
+  <text class="lbl-b" x="310" y="56" text-anchor="middle">BACKOFF WAIT</text>
+  <text class="mono" x="310" y="74" text-anchor="middle">500ms &times;2 &hellip; 10s</text>
+
+  <rect class="node" x="456" y="34" width="160" height="52" rx="7"/>
+  <text class="lbl-b" x="536" y="56" text-anchor="middle">CONNECTING</text>
+  <text class="lbl-s" x="536" y="74" text-anchor="middle">socket open</text>
+
+  <rect class="node-a" x="300" y="150" width="230" height="76" rx="7"/>
+  <text class="lbl-b" x="415" y="172" text-anchor="middle">registry.catchUp(docId, since)</text>
+  <text class="mono" x="415" y="190" text-anchor="middle">doc.seq - since &le; MAX_REPLAY_OPS</text>
+  <text class="mono" x="415" y="208" text-anchor="middle">&amp;&amp; entries[0].seq === since+1</text>
+
+  <rect class="node-i" x="612" y="140" width="194" height="46" rx="7"/>
+  <text class="lbl-b" x="709" y="158" text-anchor="middle">mode: delta</text>
+  <text class="lbl-s" x="709" y="174" text-anchor="middle">rga.apply(msg.ops)</text>
+
+  <rect class="node-d" x="612" y="200" width="194" height="46" rx="7"/>
+  <text class="lbl-b" x="709" y="218" text-anchor="middle">mode: snapshot</text>
+  <text class="lbl-s" x="709" y="234" text-anchor="middle">rga.restore(msg.snapshot)</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="166" y1="60" x2="218" y2="60" marker-end="url(#p52-ar7)"/>
+  </g>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="400" y1="60" x2="452" y2="60" marker-end="url(#p52-ar8)"/>
+    <path class="edge" d="M 536 88 C 536 130 500 150 462 162" marker-end="url(#p52-ar9)"/>
+    <line class="edge" x1="532" y1="176" x2="608" y2="164" marker-end="url(#p52-ar10)"/>
+    <line class="edge" x1="532" y1="200" x2="608" y2="218" marker-end="url(#p52-ar11)"/>
+  </g>
+
+  <text class="lbl-s" x="192" y="46" text-anchor="middle">close</text>
+  <text class="lbl-s" x="192" y="100" text-anchor="middle">event</text>
+  <text class="lbl-s" x="426" y="46" text-anchor="middle">jitter</text>
+  <text class="lbl-s" x="560" y="118">join {since: lastSeq}</text>
+  <text class="lbl-s" x="570" y="150">true</text>
+  <text class="lbl-s" x="570" y="212">false</text>
+
+  <text class="lbl-s" x="14" y="252">Backoff is multiplied by (0.5 + Math.random()): without jitter every client kicked off by a deploy reconnects in lockstep and knocks the new instance over.</text>
+  <text class="lbl-s" x="14" y="268">The contiguity test is not an optimisation. If the op log was trimmed past `since`, a delta would silently skip characters &mdash; a snapshot is the only correct answer.</text>
+  <text class="lbl-s" x="14" y="284">A brand-new client sends since: null and always gets a snapshot. Same code path, no special case.</text>
+  <defs>
+    <marker id="p52-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>The client stores exactly one number across a disconnect. Everything else about recovery
+is a server decision, and it is made from that number plus the state of the op log.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">src/doc/registry.js &mdash; the delta/snapshot decision<span class="lang">js</span></div>
+<pre><code class="lang-js">if (Number.isInteger(since) &amp;&amp; since &gt;= 0 &amp;&amp; doc.seq - since &lt;= config.maxReplayOps) {
+  const entries = await oplog.range(docId, since, config.maxReplayOps);
+  const contiguous = entries.length === 0 || entries[0].seq === since + 1;
+  if (contiguous) {
+    const ops = [];
+    for (const logEntry of entries) ops.push(...logEntry.ops);
+    metrics.inc('collab_sync_delta_total');
+    return {
+      mode: 'delta',
+      // Never claim a higher watermark than the ops we are actually
+      // sending: if COUNT capped the page, the client must ask again.
+      seq: entries.length &gt; 0 ? entries.at(-1).seq : doc.seq,
+      ops,
+    };
+  }
+  log.debug('delta impossible, log was trimmed past the client position', { docId, since });
+}</code></pre>
+</div>
+
+<p>To force a snapshot instead of a delta, restart the tab with <code>MAX_REPLAY_OPS</code> lowered
+(the integration test uses <code>8</code>), or simply type more than 2000 op-log entries while one
+tab is away.</p>
+
+<div class="box gotcha">
+  <span class="bt">"simulate network drop" does not simulate a network drop</span>
+  <p>The button's own comment claims "no close frame, no leave message", but the handler calls
+  <code>state.ws.close(4009, 'simulated drop')</code> &mdash; and the browser's
+  <code>WebSocket.close()</code> performs a proper closing handshake. The server sees
+  <code>ws.on('close')</code>, runs <code>presence.leave()</code> immediately, and the other tab's
+  roster updates within milliseconds. What the button genuinely exercises is the <em>reconnect</em>
+  path (backoff, <code>join</code> with <code>since</code>, delta replay), which is most of what you
+  want.</p>
+  <p>To exercise the <em>sweeper</em> you need a socket that dies without a close frame. Use DevTools
+  &rarr; Network &rarr; <strong>Offline</strong>, or <code>docker network disconnect
+  p5-realtime-collab_default p5-app2</code>. Then nothing announces the departure and the ghost user
+  lingers for up to <code>PRESENCE_TTL_MS</code> (45&nbsp;s) plus one
+  <code>PRESENCE_SWEEP_INTERVAL_MS</code> (10&nbsp;s) &mdash; and
+  <code>collab_presence_expired_total</code> ticks on exactly one instance, because
+  <code>HDEL</code>'s return value is the arbiter.</p>
+</div>
+
+<h2>Read the state with <code>redis-cli</code></h2>
+
+<p>Everything shared lives in five keys per document. Nothing is opaque, and reading them by hand is
+the fastest way to understand what the server is doing.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Key</th><th>Type</th><th>Command</th><th>What you are checking</th></tr></thead>
+<tbody>
+<tr><td><code>collab:doc:demo:seq</code></td><td>String</td><td><code>GET</code></td><td>The highest sequence ever allocated cluster-wide. Should equal or exceed every client's <em>last seq</em>.</td></tr>
+<tr><td><code>collab:doc:demo:oplog</code></td><td>Stream</td><td><code>XLEN</code>, <code>XRANGE key - + COUNT 3</code></td><td>Entry ids are <code>&lt;seq&gt;-0</code>; field <code>p</code> is the JSON payload. <code>XLEN</code> below the <code>seq</code> value means trimming has happened.</td></tr>
+<tr><td><code>collab:doc:demo:presence</code></td><td>Hash</td><td><code>HGETALL</code>, <code>HLEN</code></td><td>One field per live client. A field whose <code>ts</code> is older than 45&nbsp;s is a sweeper miss.</td></tr>
+<tr><td><code>collab:doc:demo:snapshot</code></td><td>Hash</td><td><code>HGET key seq</code>, <code>HSTRLEN key state</code></td><td>The materialised CRDT plus the sequence it corresponds to. <code>HSTRLEN</code> is the cheapest tombstone-bloat gauge you have.</td></tr>
+<tr><td><code>collab:doc:demo:events</code></td><td>PubSub</td><td><code>SUBSCRIBE</code></td><td>Live fanout. Nothing is stored here &mdash; if you are not subscribed when it is published, it is gone.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">a session against a document called "demo"<span class="lang">bash</span></div>
+<pre><code class="lang-bash">redis-cli KEYS 'collab:doc:demo:*'      # or: docker compose exec redis redis-cli
+# 1) collab:doc:demo:oplog
+# 2) collab:doc:demo:seq
+# 3) collab:doc:demo:presence
+# 4) collab:doc:demo:snapshot
+
+redis-cli GET  collab:doc:demo:seq      # "412"
+redis-cli XLEN collab:doc:demo:oplog    # (integer) 412   -- nothing trimmed yet
+
+redis-cli XRANGE collab:doc:demo:oplog - + COUNT 2
+# 1) 1) "1-0"
+#    2) 1) "p"
+#       2) "{\"ops\":[{\"type\":\"ins\",\"id\":{\"s\":\"c-a1b2\",\"c\":1},
+#             \"after\":null,\"ch\":\"h\"}],\"clientId\":\"c-a1b2\",
+#             \"instanceId\":\"dev-a\",\"ts\":1756800612004}"
+
+redis-cli HGETALL collab:doc:demo:presence
+# 1) "c-a1b2"
+# 2) "{\"clientId\":\"c-a1b2\",\"name\":\"Alice\",\"color\":\"#3cb44b\",
+#      \"cursor\":{\"index\":12,\"length\":0},\"instanceId\":\"dev-a\",\"ts\":1756800841903}"
+
+redis-cli HGET    collab:doc:demo:snapshot seq     # "400"
+redis-cli HSTRLEN collab:doc:demo:snapshot state   # (integer) 18244   -- grows with TOMBSTONES
+
+# Watch the fanout live while you type in a tab. This is the whole backplane.
+redis-cli SUBSCRIBE collab:doc:demo:events</code></pre>
+</div>
+
+<p>The sequence allocator and the stream are written together by a Lua script, and the reason is
+worth reading in full because it is the one place a naive implementation loses data:</p>
+
+<div class="codewrap">
+<div class="codehead">src/backplane/oplog.js &mdash; APPEND_SCRIPT<span class="lang">lua</span></div>
+<pre><code class="lang-lua">-- KEYS[1] = sequence counter, KEYS[2] = stream
+-- ARGV[1] = approximate MAXLEN, ARGV[2] = JSON payload
+local seq = redis.call('INCR', KEYS[1])
+if seq == 1 then
+  -- Reconciliation: the counter is volatile-looking state while the stream is
+  -- durable. If the counter was lost (flushed, expired, restored from an older
+  -- dump) but the stream survived, restarting at 1 would make XADD fail
+  -- forever with "equal or smaller ID". Resume above the last stream id.
+  local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+  if last and last[1] then
+    local lastSeq = tonumber(string.match(last[1][1], '^(%d+)')) or 0
+    if lastSeq &gt;= seq then
+      seq = lastSeq + 1
+      redis.call('SET', KEYS[1], tostring(seq))
+    end
+  end
+end
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], tostring(seq) .. '-0', 'p', ARGV[2])
+return seq</code></pre>
+</div>
+
+<div class="box iv">
+  <span class="bt">Why INCR and XADD cannot be two round trips</span>
+  <p>Two instances appending at the same instant both <code>INCR</code> &mdash; getting 11 and 12
+  &mdash; and then both <code>XADD</code>. If 12 lands first, the <code>XADD</code> for 11 is
+  <em>rejected</em>: stream ids must strictly increase. One user's keystroke disappears, with an
+  error nobody is watching for. Redis runs a script to completion without interleaving, so wrapping
+  the pair makes allocation order and use order identical. Verify it yourself: type in both tabs
+  simultaneously and check that <code>XLEN</code> equals <code>GET :seq</code> exactly.</p>
+</div>
+
+<h2>The test suite</h2>
+
+<div class="codewrap">
+<div class="codehead">four commands, three levels<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test              # node --test          - everything
+make test-unit         # node --test "src/**/*.test.js"   - RGA, Document, protocol; NO Redis
+make test-integration  # node --test "test/**/*.test.js"  - two instances, one Redis, real sockets
+make cov               # node --test --experimental-test-coverage</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>File</th><th>What it locks down</th><th>Fails when you break&hellip;</th></tr></thead>
+<tbody>
+<tr><td><code>src/crdt/rga.test.js</code></td><td>Convergence under arbitrary reordering, causal buffering, idempotence, snapshot round-trip, bounded pending buffer, tombstone gc</td><td>the comparator, integration scan, or restore</td></tr>
+<tr><td><code>src/doc/document.test.js</code></td><td>The <code>seq</code> watermark never moves backwards; snapshot carries its sequence</td><td>anything that conflates CRDT state with log position</td></tr>
+<tr><td><code>src/transport/protocol.test.js</code></td><td>Every inbound frame is shape-checked and rebuilt before it reaches the CRDT</td><td>a new field added to an op without a validator</td></tr>
+<tr><td><code>test/integration.test.js</code></td><td>Backplane fanout, self-filtering, delta vs snapshot, presence sweeping, sequence uniqueness across instances</td><td>the wiring &mdash; the failure no unit test can see</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The central assertion is a property test, not an example test. It builds one pool of ops from
+three replicas editing offline, then replays that pool into 25 fresh replicas in 25 different random
+orders and demands a single distinct output:</p>
+
+<div class="codewrap">
+<div class="codehead">src/crdt/rga.test.js &mdash; the convergence property<span class="lang">js</span></div>
+<pre><code class="lang-js">const outputs = new Set();
+for (let i = 0; i &lt; 25; i++) {
+  const replica = replayInto(`fuzz-${i}`, shuffled(pool, rnd));
+  assert.equal(replica.pendingCount, 0, `run ${i} left ops unintegrated`);
+  outputs.add(replica.toString());
+}
+
+assert.equal(outputs.size, 1, `divergence across shuffles: ${[...outputs].map((s) =&gt; JSON.stringify(s)).join(' | ')}`);</code></pre>
+</div>
+
+<p>The PRNG is <code>mulberry32</code> seeded with a constant, so a failure is reproducible from its
+seed rather than being a flake you re-run until it passes. <code>pendingCount === 0</code> matters as
+much as the text comparison: a replica can produce the right string while quietly holding ops it
+never managed to integrate, and that divergence surfaces hours later when the next op arrives.</p>
+
+<div class="box gotcha">
+  <span class="bt">A green integration run may have tested nothing</span>
+  <p><code>test/integration.test.js</code> probes Redis at import time and sets
+  <code>skip</code> if it cannot reach it &mdash; deliberately, because a red test that only means
+  "you have no Redis today" trains people to ignore red tests. The cost is that
+  <code>make test</code> passes with a smile on a machine where the backplane was never exercised.
+  Read the summary line: <code># skipped 1</code> next to <code># pass</code> is the tell. In CI,
+  assert that the count is zero, or gate the job on a Redis service container.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">coverage, and what it will not tell you<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make cov      # node --test --experimental-test-coverage
+
+# file                       | line % | branch % | funcs % | uncovered lines
+# src/crdt/rga.js            |  96.11 |    91.30 |  100.00 | 118-121, 246
+# src/doc/document.js        |  98.55 |    93.75 |  100.00 | 89
+# src/backplane/oplog.js     |  71.06 |    58.33 |   85.71 | 73-77, 120-124
+# src/transport/wsServer.js  |  62.40 |    51.12 |   77.77 | 105-117, 168-186
+
+# Two systematic blind spots, both visible above:
+#   1. Error paths that need a hostile Redis (NOSCRIPT reload, corrupt entries).
+#   2. client/client.js is never loaded by any test, so it is never counted at
+#      all - 0% of the browser half is covered and the report does not say so.</code></pre>
+</div>
+
+<h2>Load it until it bends</h2>
+
+<p>The interesting property of this workload is that fanout is quadratic in participants: N clients
+each typing R characters per second produce N&nbsp;&times;&nbsp;(N&minus;1)&nbsp;&times;&nbsp;R
+outbound frames per second. 200 clients at 2&nbsp;cps is 24,000 inbound ops per minute and roughly
+80,000 outbound frames per second. That number, not CPU per op, is what decides how many people can
+share one document.</p>
+
+<div class="codewrap">
+<div class="codehead">bench/load.js &mdash; N sockets speaking the real protocol<span class="lang">js</span></div>
+<pre><code class="lang-js">import { WebSocket } from 'ws';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { RGA } from '../src/crdt/rga.js';   // the SAME merge code the server runs
+
+const URL = process.env.WS_URL ?? 'ws://localhost:58080/ws';
+const CLIENTS = Number(process.env.CLIENTS ?? 200);
+const CPS = Number(process.env.CPS ?? 2);
+const SECONDS = Number(process.env.SECONDS ?? 60);
+
+const lag = monitorEventLoopDelay({ resolution: 10 });
+lag.enable();
+let acked = 0, received = 0;
+
+function spawn(i) {
+  const clientId = `load-${i}`;              // also the CRDT site id: must be unique
+  const rga = new RGA(clientId);
+  const ws = new WebSocket(URL);
+  ws.on('open', () =&gt; ws.send(JSON.stringify({ t: 'join', docId: 'load', clientId, since: null })));
+  ws.on('message', (raw) =&gt; {
+    const msg = JSON.parse(raw.toString());
+    if (msg.t === 'welcome') {
+      if (msg.mode === 'snapshot') rga.restore(msg.snapshot);
+      else rga.apply(msg.ops ?? []);
+      // Stagger the start: 200 clients typing on the same timer tick is a
+      // thundering herd, not a workload.
+      setTimeout(() =&gt; setInterval(() =&gt; {
+        const ops = rga.insertAt(rga.length, 'x');
+        ws.send(JSON.stringify({ t: 'op', docId: 'load', ops }));
+      }, 1000 / CPS), Math.random() * 1000);
+    } else if (msg.t === 'ops') { rga.apply(msg.ops); received++; }
+    else if (msg.t === 'ack') { acked++; }
+  });
+  ws.on('error', (err) =&gt; console.error(clientId, err.message));
+}
+
+for (let i = 0; i &lt; CLIENTS; i++) setTimeout(() =&gt; spawn(i), i * 10);  // 100 conn/s ramp
+
+setTimeout(() =&gt; {
+  console.log(JSON.stringify({
+    clients: CLIENTS, acked, received,
+    generatorLoopMeanMs: +(lag.mean / 1e6).toFixed(2),
+    generatorLoopP99Ms: +(lag.percentile(99) / 1e6).toFixed(2),
+  }));
+  process.exit(0);
+}, SECONDS * 1000);</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">run it, and watch the server from outside<span class="lang">bash</span></div>
+<pre><code class="lang-bash">CLIENTS=200 CPS=2 SECONDS=60 node bench/load.js
+
+# in another terminal, every second:
+watch -n1 "curl -s localhost:58080/metrics | grep -E \
+  'connections_active|outbound_queued|backpressure|rate_limited|heap_used'"</code></pre>
+</div>
+
+<p>To see the <em>server's</em> event-loop delay rather than the generator's, add a gauge. Note the
+order: <code>metrics.set()</code> calls <code>assertKnown()</code> and <strong>throws</strong> on a
+name that is not in the table, precisely so a typo'd metric cannot silently produce a dashboard that
+stays flat forever.</p>
+
+<div class="codewrap">
+<div class="codehead">the two-file patch<span class="lang">js</span></div>
+<pre><code class="lang-js">// src/lib/metrics.js - register it FIRST or metrics.set() throws "unknown metric"
+const GAUGES = [
+  ['collab_connections_active', 'Currently open WebSocket connections'],
+  ['collab_documents_loaded', 'Documents materialised in this instance memory'],
+  ['collab_outbound_queued', 'Messages currently sitting in per-connection outbound queues'],
+  ['collab_event_loop_delay_p99_ms', 'Event-loop delay p99 since the last scrape'],
+];
+
+// src/index.js
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+const loop = monitorEventLoopDelay({ resolution: 10 });
+loop.enable();
+// ...inside the /metrics handler, immediately before metrics.render():
+metrics.set('collab_event_loop_delay_p99_ms', loop.percentile(99) / 1e6);
+loop.reset();   // per-scrape window, otherwise the histogram is since-boot forever</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Signal</th><th>Healthy</th><th>What a bad value means</th></tr></thead>
+<tbody>
+<tr><td><code>collab_event_loop_delay_p99_ms</code></td><td>&lt; 10&nbsp;ms</td><td>Above ~50&nbsp;ms every socket's heartbeat, drain timer and ack is late. The usual cause here is <code>JSON.stringify</code> per recipient in <code>broadcastLocal</code>.</td></tr>
+<tr><td><code>collab_outbound_queued</code></td><td>0, briefly non-zero</td><td>Sustained non-zero = someone is not draining. It is a gauge, so watch it alongside the counter below.</td></tr>
+<tr><td><code>collab_backpressure_disconnects_total</code></td><td>0</td><td>Clients hit the 256-message queue bound and were hung up with 4002. A few is normal on mobile; a step change means you overran the fanout.</td></tr>
+<tr><td><code>collab_rate_limited_total</code></td><td>0</td><td>A client exceeded 200 msg/s. A paste larger than 256 characters chunks into several frames &mdash; check the client's batching before raising the limit.</td></tr>
+<tr><td><code>collab_oplog_gap_fills_total</code></td><td>rare</td><td>Pub/sub dropped messages and the log repaired them. Rising steadily means the subscriber connection is flapping.</td></tr>
+<tr><td><code>collab_process_heap_used_bytes</code></td><td>flat after warm-up</td><td>Monotonic growth on a fixed client count is tombstones, not a leak &mdash; check <code>tombstoneRatio</code> on <code>/healthz</code> first.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="bt">The load generator is single-threaded too</span>
+  <p>Every simulated client in <code>bench/load.js</code> holds a full RGA and applies every other
+  client's ops, so the generator does N&nbsp;&times; the CRDT work the server does. Past a few
+  hundred sockets it saturates before the server does and you end up measuring your own harness.
+  That is what <code>generatorLoopP99Ms</code> is for: if it is worse than the server's, throw the
+  run away. Split across processes (<code>CLIENTS=250</code> &times; 4 terminals) or run the
+  generator on another machine.</p>
+</div>
+
+<h2>Break it on purpose</h2>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="Decision path inside Connection.send showing the direct write, the bounded queue, and the disconnect when the queue overflows">
+  <rect class="node" x="14" y="60" width="140" height="56" rx="7"/>
+  <text class="lbl-b" x="84" y="82" text-anchor="middle">send(message)</text>
+  <text class="lbl-s" x="84" y="100" text-anchor="middle">encode to JSON</text>
+
+  <rect class="node-w" x="212" y="46" width="216" height="84" rx="7"/>
+  <text class="lbl-b" x="320" y="68" text-anchor="middle">is the socket keeping up?</text>
+  <text class="mono" x="320" y="88" text-anchor="middle">queue.length &gt; 0 ||</text>
+  <text class="mono" x="320" y="106" text-anchor="middle">bufferedAmount &gt; 1 MiB</text>
+  <text class="lbl-s" x="320" y="124" text-anchor="middle">once anything queues, everything queues</text>
+
+  <rect class="node-o" x="490" y="20" width="200" height="52" rx="7"/>
+  <text class="lbl-b" x="590" y="42" text-anchor="middle">ws.send(payload)</text>
+  <text class="lbl-s" x="590" y="60" text-anchor="middle">messages_out_total++</text>
+
+  <rect class="node-i" x="490" y="90" width="200" height="52" rx="7"/>
+  <text class="lbl-b" x="590" y="112" text-anchor="middle">queue.push()</text>
+  <text class="lbl-s" x="590" y="130" text-anchor="middle">drain retry every 25 ms</text>
+
+  <rect class="node-d" x="490" y="160" width="200" height="56" rx="7"/>
+  <text class="lbl-b" x="590" y="182" text-anchor="middle">close(4002, 'too slow')</text>
+  <text class="lbl-s" x="590" y="200" text-anchor="middle">backpressure_disconnects_total++</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="156" y1="88" x2="208" y2="88" marker-end="url(#p52-ar12)"/>
+    <path class="edge" d="M 430 70 C 456 60 466 48 486 46" marker-end="url(#p52-ar13)"/>
+    <path class="edge" d="M 430 106 C 456 110 466 114 486 116" marker-end="url(#p52-ar14)"/>
+  </g>
+  <g color="var(--dang)">
+    <line class="edge-d" x1="590" y1="144" x2="590" y2="156" marker-end="url(#p52-ar15)"/>
+  </g>
+
+  <text class="lbl-s" x="452" y="42" text-anchor="middle">no</text>
+  <text class="lbl-s" x="452" y="130" text-anchor="middle">yes</text>
+  <text class="lbl-s" x="600" y="154">queue.length &ge; MAX_OUTBOUND_QUEUE (256)</text>
+
+  <text class="lbl-s" x="14" y="236">Hanging up is the kind option: everything the client is missing is in the op log, so it reconnects, sends `since`, and is whole again in one round trip.</text>
+  <defs>
+    <marker id="p52-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p52-ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption><code>ws.send()</code> never blocks, so without this ladder a single unread socket grows
+in the server's heap until the process dies. The bound is on <em>our</em> queue, not on the kernel's.</figcaption>
+</figure>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Do this</th><th>Expected symptom</th><th>Where it shows up</th></tr></thead>
+<tbody>
+<tr><td><code>MAX_OUTBOUND_QUEUE=8 node --run start</code>, then a client that never reads while another types fast</td><td>The slow client is closed with <strong>4002</strong>; every other client is unaffected</td><td><code>collab_backpressure_disconnects_total</code>, and <code>outbound queue overflow, disconnecting slow client</code> in the log</td></tr>
+<tr><td><code>docker compose pause redis</code></td><td>Edits still appear locally in the typing tab, but never reach the other tab. The client sees <code>error: internal</code></td><td><code>collab_redis_errors_total</code> climbs; <code>/healthz</code> returns <strong>503 degraded</strong></td></tr>
+<tr><td><code>docker compose unpause redis</code></td><td>Fanout resumes. Ops typed <em>during</em> the outage are gone from the server's view but still present in the tab that typed them</td><td>Nothing &mdash; and that silence is the point (see the gotcha below)</td></tr>
+<tr><td><code>docker compose restart app1</code></td><td>Its clients get close code <strong>1001</strong>, back off with jitter, reconnect, and are served a delta</td><td><code>document loaded</code> with <code>fromSnapshot:true</code> on the new process</td></tr>
+<tr><td><code>redis-cli XTRIM collab:doc:demo:oplog MAXLEN 5</code> then reconnect a stale tab</td><td>The delta is refused as non-contiguous and a snapshot is sent instead</td><td><code>collab_sync_snapshot_total</code>, and <code>delta impossible, log was trimmed past the client position</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">what a repaired gap looks like in the log<span class="lang">text</span></div>
+<pre><code class="lang-text">{"time":"2026-09-02T10:31:44.902Z","level":"warn","instanceId":"dev-b","component":"registry",
+ "msg":"sequence gap on the bus, repairing from the op log",
+ "docId":"demo","have":401,"received":404,"missing":2}
+
+# The pub/sub subscriber missed 402 and 403 during a blip. The envelope for 404
+# carried its sequence number, which is the ONLY reason the hole was detectable:
+# without it the watermark would have jumped to 404 and those two characters
+# would have been unrecoverable by any later sync.</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A Redis outage silently forks the typing client</span>
+  <p>While Redis is paused, <code>registry.submitOps</code> rejects at the <code>oplog.append</code>
+  call, the socket handler replies <code>{t:'error', code:'internal'}</code> &mdash; and that is the
+  end of it. The client already applied those ops optimistically and has <strong>no retry
+  queue</strong>: it never re-sends them, and its <code>lastSeq</code> never advanced past them, so a
+  later reconnect asks for a delta that does not contain them either. That tab now holds characters
+  no other replica will ever see, indefinitely, until something forces a snapshot resync and quietly
+  discards them.</p>
+  <p>This is not a bug in the CRDT &mdash; it is the missing durable send queue on the client, and
+  fixing it properly is exercise&nbsp;7. Until then, treat <code>collab_redis_errors_total</code> as
+  a data-loss alarm, not a warning.</p>
+</div>
+
+<div class="box ok">
+  <span class="bt">The restart test is the one that proves the storage layer</span>
+  <p><code>docker compose restart app1</code> is worth running with <code>/healthz</code> open on
+  both ports. The dying instance writes a final snapshot in <code>unload()</code>, its clients
+  reconnect (some to app2), and when a document is next opened on app1 it is rebuilt from
+  <code>snapshot + XRANGE tail</code> with no memory of the old process. The integration test asserts
+  exactly this with a third instance that has never seen the document: <code>assert.equal(doc.text,
+  alice.text, 'reconstructed from Redis only')</code>.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<p>Roughly in order of difficulty. Each has a test you can write first, and several will make you
+change the CRDT &mdash; run <code>make test-unit</code> after every step, because
+<code>rga.test.js</code> is the only thing standing between you and a document that diverges under
+load three weeks from now.</p>
+
+<ol>
+  <li><strong>Rich-text attributes.</strong> Add a third op type, <code>{type:'fmt', id, key,
+  value}</code>, that attaches a mark to an existing character. Attributes are a
+  last-writer-wins register per (id, key): store the Lamport counter of the op that set it and
+  ignore anything older. Extend <code>protocol.js</code> to validate it and the snapshot format to
+  carry it &mdash; note that <code>snapshot()</code> currently serialises a node as
+  <code>[s, c, ch, deleted]</code>, so you are changing the on-disk format and need a
+  <code>v: 2</code> branch in <code>restore()</code>.</li>
+
+  <li><strong>Tombstone garbage collection, for real.</strong> <code>rga.gc(isStable)</code> exists
+  and is tested, but nothing calls it, because nothing can prove stability. Build the proof: have
+  each client report its <code>lastSeq</code> in its presence record, take the minimum across the
+  presence hash, and collect tombstones from ops below that watermark. The trap is the warning in
+  <code>rga.js</code> &mdash; every replica must run gc with the <em>same</em> predicate, so the
+  watermark has to come from Redis, not from each instance's local view. Measure
+  <code>tombstoneRatio</code> and snapshot <code>HSTRLEN</code> before and after.</li>
+
+  <li><strong>Undo/redo.</strong> Keep a per-client stack of the ops that client originated. Undo of
+  an insert is a delete of the same id; undo of a delete needs a resurrect op, which means
+  <code>deleted</code> stops being a monotonic boolean and becomes a LWW flag with a counter. Decide
+  and document what undo means when someone else has edited inside your range &mdash; that decision,
+  not the data structure, is the hard part.</li>
+
+  <li><strong>Awareness: id-anchored selection ranges.</strong> Presence carries
+  <code>{index, length}</code> today, which drifts the moment someone edits above you. Change it to
+  <code>{anchor: &lt;id&gt;, head: &lt;id&gt;}</code> and resolve ids to indices at render time.
+  Tombstones make this work: an anchor on a deleted character still resolves. Then render the peer
+  cursors as overlays instead of the <code>@12</code> text in the sidebar.</li>
+
+  <li><strong>Document permissions.</strong> Add a signed token to the <code>join</code> frame and
+  reject unauthorised documents. The subtlety is placement: the check must run before
+  <code>registry.attach</code>, and <code>handleOp</code>'s <code>WRONG_DOC</code> guard is what
+  stops a client subscribing to a document by sending an <code>op</code> for it. Add read-only
+  participants and confirm they still receive presence and ops but get an error on submit.</li>
+
+  <li><strong>Snapshots in Postgres.</strong> Redis is a cache with a volume attached; a document you
+  care about belongs in a database. Keep the op log and pub/sub in Redis, move
+  <code>snapshot.js</code> behind a table <code>(doc_id, seq, state jsonb, ts)</code> with the
+  guarded write as <code>INSERT &hellip; ON CONFLICT (doc_id) DO UPDATE &hellip; WHERE
+  excluded.seq &gt; snapshots.seq</code>. Compare the round-trip cost with the Lua version and
+  decide whether the write belongs on the critical path at all.</li>
+
+  <li><strong>An offline queue in the client.</strong> Fixes the data loss above. Buffer every op the
+  client generates in an unacked list; drop entries when the matching <code>ack</code> arrives; on
+  reconnect, re-send the buffer <em>after</em> the <code>welcome</code>. Idempotent integration makes
+  the resend safe &mdash; identical ids are deduplicated. Persist the buffer to
+  <code>IndexedDB</code> so a browser crash does not lose it, and handle the case where the welcome
+  was a <code>snapshot</code> that already contains some of the buffered ops.</li>
+
+  <li><strong>Swap RGA for Yjs and measure.</strong> Keep the transport, the op log and the presence
+  layer; replace the CRDT with <code>Y.Text</code> and ship binary updates instead of JSON ops. Then
+  measure the three numbers that matter: bytes on the wire for a 10,000-character paste, snapshot
+  size after deleting a 400-character paragraph (one tombstone versus 400), and time to load a
+  100,000-op document. Yjs's block-wise representation is exactly the escape from the tombstone
+  problem described at the bottom of <code>rga.js</code>.</li>
+
+  <li><strong>Reliable fanout.</strong> Replace the pub/sub channel with a Redis Stream consumer
+  group per instance, so an instance disconnected for a second replays instead of relying on gap
+  repair. Measure the added latency per op, then decide honestly whether gap repair was the better
+  trade &mdash; it usually is, and knowing why is the point.</li>
+
+  <li><strong>End-to-end encryption.</strong> Encrypt <code>ch</code> and the attribute values
+  client-side; leave ids, <code>after</code> and <code>type</code> in the clear so the server can
+  still order and integrate. Work out what the server can still infer (document length, edit
+  positions, typing cadence, who is in the room) and what breaks: the server can no longer produce a
+  <code>text</code> field in the snapshot, and any server-side search or export is gone.</li>
+
+  <li><strong>Scale-test to 10,000 connections.</strong> Raise the fd limit
+  (<code>ulimit -n 65535</code>), spread clients over many documents rather than one, and run
+  several server instances behind a load balancer with sticky sessions off &mdash; the backplane
+  makes stickiness unnecessary, which is worth proving. Find where it actually breaks: it will be
+  per-connection memory (<code>ws</code> allocates a receiver buffer per socket, and
+  <code>perMessageDeflate</code> is off for exactly this reason) or the fanout loop in
+  <code>broadcastLocal</code>, which re-encodes JSON once per recipient.</li>
+
+  <li><strong>Prove the backpressure path with a test.</strong> Write an integration test with a
+  client that completes the WebSocket handshake and then never reads from its TCP socket, while a
+  second client types thousands of characters. Assert the slow one is closed with 4002 and the fast
+  one is untouched. Setting <code>MAX_OUTBOUND_QUEUE=8</code> in the test env makes it run in
+  milliseconds; a stock <code>ws</code> client is useless here because it always drains.</li>
+</ol>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>Two tabs on one port test the CRDT; two tabs on <em>two ports</em> test the architecture. Until
+  <code>collab_bus_received_total</code> is non-zero on the instance that did not originate the edit,
+  you have not exercised the backplane at all.</li>
+  <li>Self-filtering is by <code>INSTANCE_ID</code>, so two instances sharing one is a silent
+  split-brain: healthy logs, healthy <code>/healthz</code>, two permanently different documents.
+  Leave the variable unset and let <code>config.js</code> generate one.</li>
+  <li>The client persists exactly one number across a disconnect &mdash; <code>lastSeq</code>. Delta
+  versus snapshot is a server decision made from that number plus
+  <code>entries[0].seq === since + 1</code>; the contiguity check is a correctness guard, not an
+  optimisation, because a trimmed log would otherwise produce a delta that skips characters.</li>
+  <li><code>XLEN</code> should equal <code>GET :seq</code> on an untrimmed document. If it does not,
+  a sequence number was allocated and never used &mdash; which is precisely the INCR/XADD race the
+  Lua script exists to close.</li>
+  <li>The integration test <em>skips</em> without Redis rather than failing. A green
+  <code>make test</code> proves nothing about fanout, presence or catch-up unless the summary says
+  <code># skipped 0</code>.</li>
+  <li>Fanout is quadratic in participants, not linear, and <code>broadcastLocal</code> re-encodes per
+  recipient. Load-test with the server's own event-loop delay exposed as a gauge &mdash; and register
+  the gauge in <code>metrics.js</code> first, or <code>metrics.set()</code> throws
+  <code>unknown metric</code>.</li>
+  <li>A Redis outage does not stop the editor; it forks it. Ops typed during the outage are applied
+  locally, rejected by the server, never retried, and never recovered &mdash; the client has no
+  durable send queue. That is the single largest hole in this design and exercise&nbsp;7 is the
+  fix.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="02-implementation.html"><span class="lb">Previous</span>The realtime layer</a>
+  <span class="xref"><span class="lb">Next</span>10 &middot; Projects</span>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

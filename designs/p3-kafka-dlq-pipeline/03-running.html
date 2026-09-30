@@ -1,0 +1,894 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Running, testing &amp; exercises &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Running, testing &amp; exercises</h1>
+<p class="lede">Bring the stack up, follow one order through all five stages of the pipeline, then
+break it four different ways on purpose and watch each mechanism catch its own failure. Every
+command here runs against the real project; every observation has a place to look and a value to
+expect.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">Kafka 4</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Debezium</span>
+  <span class="tag">operations</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">How to use this page</span>
+  <p>Reading the code tells you what the pipeline is <em>supposed</em> to do. The only way to know it
+  does is to make it fail. Each section below has the same shape: <strong>a command that breaks
+  something, the exact place to look, and the value that proves the mechanism engaged.</strong> If a
+  number does not match, that is the interesting part &mdash; the troubleshooting table in
+  <code>code/README.md</code> maps every symptom to its cause.</p>
+</div>
+
+<h2>Bring the stack up</h2>
+
+<p>Infrastructure runs in Docker; the two Spring Boot services run on the host so you can attach a
+debugger and watch the retry ladder in your own console. That split is deliberate and it is also the
+first thing that bites people, because the broker advertises <em>two different addresses</em> and the
+one you need depends on which side of the container boundary you are calling from.</p>
+
+<div class="codewrap">
+<div class="codehead">first session, in order<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make up                        # docker compose up -d --wait
+make connector                 # register the Debezium outbox connector, then print its status
+make build                     # mvn -T1C clean package -DskipTests (also builds the DLQ inspector jar)
+
+# two more terminals, left running:
+make run-consumer              # mvn -pl consumer -am spring-boot:run   on :38082
+make run-producer              # mvn -pl producer -am spring-boot:run   on :38081</code></pre>
+</div>
+
+<p><code>--wait</code> is what makes this reproducible: <code>docker compose</code> blocks until every
+service with a healthcheck reports healthy, so <code>make connector</code> cannot fire at a Connect
+worker that is still starting its REST server. Without it you get an intermittent
+<code>Connection refused</code> that looks like a Debezium problem and is not.</p>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="Bring-up graph: postgres and kafka healthchecks gate the Connect worker and kafka-ui, while host JVMs reach the broker on a different advertised listener than containers do">
+  <text class="lbl-b" x="14" y="22">Startup dependencies are healthchecks, not just process order</text>
+  <text class="lbl-s" x="14" y="38">arrows below the boxes are <tspan class="mono">depends_on: condition: service_healthy</tspan></text>
+
+  <rect class="node-i" x="14"  y="48"  width="150" height="58" rx="7"/>
+  <text class="lbl-b" x="89"  y="70"  text-anchor="middle">postgres 16</text>
+  <text class="mono"  x="89"  y="86"  text-anchor="middle">pg_isready</text>
+  <text class="lbl-s" x="89"  y="100" text-anchor="middle">wal_level=logical</text>
+
+  <rect class="node-o" x="200" y="48"  width="160" height="58" rx="7"/>
+  <text class="lbl-b" x="280" y="70"  text-anchor="middle">connect 3.1</text>
+  <text class="mono"  x="280" y="86"  text-anchor="middle">GET :8083/connectors</text>
+  <text class="lbl-s" x="280" y="100" text-anchor="middle">waits for BOTH</text>
+
+  <rect class="node-a" x="396" y="48"  width="160" height="58" rx="7"/>
+  <text class="lbl-b" x="476" y="70"  text-anchor="middle">kafka 4 (KRaft)</text>
+  <text class="mono"  x="476" y="86"  text-anchor="middle">kafka-topics.sh --list</text>
+  <text class="lbl-s" x="476" y="100" text-anchor="middle">broker + controller</text>
+
+  <rect class="node"   x="200" y="140" width="160" height="48" rx="7"/>
+  <text class="lbl-b" x="280" y="160" text-anchor="middle">kafka-ui :38080</text>
+  <text class="lbl-s" x="280" y="176" text-anchor="middle">no healthcheck, on purpose</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="164" y1="77" x2="194" y2="77" marker-end="url(#p32-ar1)"/>
+    <line class="edge" x1="392" y1="77" x2="366" y2="77" marker-end="url(#p32-ar2)"/>
+    <path class="edge" d="M 362 160 C 420 156 450 132 462 112" marker-end="url(#p32-ar3)"/>
+  </g>
+
+  <line class="dash" x1="14" y1="214" x2="812" y2="214"/>
+  <text class="lbl-s" x="14"  y="208">containers &mdash; docker compose</text>
+  <text class="lbl-s" x="14"  y="230">host JVMs &mdash; make run-*</text>
+
+  <rect class="node"   x="14"  y="238" width="150" height="52" rx="7"/>
+  <text class="lbl-b" x="89"  y="258" text-anchor="middle">producer :38081</text>
+  <text class="lbl-s" x="89"  y="274" text-anchor="middle">no Kafka client at all</text>
+
+  <rect class="node"   x="200" y="238" width="160" height="52" rx="7"/>
+  <text class="lbl-b" x="280" y="258" text-anchor="middle">consumer :38082</text>
+  <text class="lbl-s" x="280" y="274" text-anchor="middle">3 listener threads</text>
+
+  <rect class="node"   x="396" y="238" width="160" height="52" rx="7"/>
+  <text class="lbl-b" x="476" y="258" text-anchor="middle">dlq-inspector.jar</text>
+  <text class="lbl-s" x="476" y="274" text-anchor="middle">no consumer group</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="89"  y1="234" x2="89"  y2="110" marker-end="url(#p32-ar4)"/>
+    <line class="edge-a" x1="330" y1="234" x2="452" y2="112" marker-end="url(#p32-ar5)"/>
+    <line class="edge-a" x1="490" y1="234" x2="490" y2="112" marker-end="url(#p32-ar6)"/>
+  </g>
+  <text class="mono"  x="96"  y="196">localhost:35432</text>
+
+  <text class="lbl-b" x="576" y="66">One broker, two advertised addresses</text>
+  <text class="mono"  x="576" y="86">kafka:19092</text>
+  <text class="lbl-s" x="576" y="100">PLAINTEXT &mdash; containers only</text>
+  <text class="mono"  x="576" y="120">localhost:39092</text>
+  <text class="lbl-s" x="576" y="134">PLAINTEXT_HOST &mdash; host only</text>
+  <text class="lbl-s" x="576" y="158">Pick the wrong one and the client</text>
+  <text class="lbl-s" x="576" y="172">connects, fetches metadata, and is</text>
+  <text class="lbl-s" x="576" y="186">then redirected to a name it cannot</text>
+  <text class="lbl-s" x="576" y="200">resolve. It fails on the SECOND hop,</text>
+  <text class="lbl-s" x="576" y="214">which is why the error is confusing.</text>
+  <text class="lbl-s" x="576" y="246">CONTROLLER://kafka:9093 is the</text>
+  <text class="lbl-s" x="576" y="260">KRaft quorum. Never a client address.</text>
+  <defs>
+    <marker id="p32-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The listener split is not a Docker quirk to work around &mdash; it is the reason a single
+broker can serve clients that resolve <code>kafka</code> and clients that do not.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">docker-compose.yml &mdash; the three listeners, verbatim<span class="lang">yaml</span></div>
+<pre><code class="lang-yaml">KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:39092
+KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+# Retry topics rely on the consumer pausing a partition for minutes at a
+# time. Give the group plenty of room before it evicts a "slow" member.
+KAFKA_GROUP_MAX_SESSION_TIMEOUT_MS: "1200000"</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Port</th><th>What</th><th>First thing to check there</th></tr></thead>
+<tbody>
+<tr><td><strong>35432</strong></td><td>PostgreSQL &mdash; <code>ordersdb</code> and <code>consumerdb</code></td><td><code>make outbox</code>, <code>make projection</code>, <code>SHOW wal_level;</code></td></tr>
+<tr><td><strong>38080</strong></td><td>kafka-ui</td><td>Topic list, per-partition offsets, message headers without a CLI</td></tr>
+<tr><td><strong>38081</strong></td><td>producer</td><td><code>GET /api/orders/outbox/recent-count</code> &mdash; outbox rows written in the last 5 minutes</td></tr>
+<tr><td><strong>38082</strong></td><td>consumer</td><td><code>GET /actuator/health</code>; the log is where the ladder is visible</td></tr>
+<tr><td><strong>38083</strong></td><td>Kafka Connect</td><td><code>GET /connectors/outbox-connector/status</code></td></tr>
+<tr><td><strong>39092</strong></td><td>Kafka, host listener (container 9092)</td><td>Everything the two services and the inspector do</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="bt">The broker has no volume, and that is intentional</span>
+  <p>Mounting a named volume over <code>/var/lib/kafka/data</code> on the <code>apache/kafka</code>
+  image lands you in a root-vs-appuser ownership fight. Broker state here is disposable;
+  <code>make reset</code> (<code>docker compose down -v</code>) wipes the database volume and the
+  topics together and gives you a clean first run. PostgreSQL <em>does</em> have a volume, which is
+  why the consumer database is created only on the first boot of an empty data directory.</p>
+</div>
+
+<h2>Register the Debezium connector</h2>
+
+<p>Nothing flows until the connector exists. Registering it is what creates the logical replication
+slot <code>outbox_slot</code> and the publication <code>outbox_publication</code> inside
+<code>ordersdb</code> &mdash; the connector is not a poller, it is a WAL reader, and those two objects
+are its subscription.</p>
+
+<div class="codewrap">
+<div class="codehead">register, then verify<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -X POST -H 'Content-Type: application/json' \
+     --data @connectors/outbox-connector.json http://localhost:38083/connectors
+
+curl -sS http://localhost:38083/connectors/outbox-connector/status
+# expect "state":"RUNNING" for BOTH the connector and tasks[0].
+# A RUNNING connector with a FAILED task publishes nothing and looks healthy
+# in every dashboard that only reads the top-level field.
+
+# what it created in postgres:
+docker exec p3-postgres psql -U postgres -d ordersdb \
+  -c "SELECT slot_name, plugin, active, confirmed_flush_lsn FROM pg_replication_slots;"</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">connectors/outbox-connector.json &mdash; the four lines that decide the wire format<span class="lang">json</span></div>
+<pre><code class="lang-json">"transforms.outbox.route.by.field": "aggregate_type",
+"transforms.outbox.route.topic.replacement": "${routedByValue}.events",
+"transforms.outbox.table.expand.json.payload": "true",
+"transforms.outbox.table.fields.additional.placement":
+    "event_type:header:eventType,trace_id:header:traceId,id:header:eventId,aggregate_type:header:aggregateType"</code></pre>
+</div>
+
+<p>The topic name is <em>data</em>, not configuration: <code>aggregate_type = "orders"</code> plus that
+replacement string produces <code>orders.events</code>. <code>table.expand.json.payload</code> is the
+line that stops your <code>jsonb</code> payload arriving as a JSON-encoded <em>string</em> &mdash; the
+single most common "why does my consumer see escaped quotes" complaint.</p>
+
+<div class="box gotcha">
+  <span class="bt">Deleting the connector does not delete the slot &mdash; and an idle slot pins WAL forever</span>
+  <p><code>make connector-delete</code> removes the connector; <code>outbox_slot</code> survives. From
+  that moment PostgreSQL <strong>cannot recycle any WAL segment newer than the slot's
+  <code>confirmed_flush_lsn</code></strong>, because it must assume a consumer will come back for it.
+  Keep writing orders and <code>pg_wal</code> grows without bound until the volume fills and the
+  database refuses writes. This is the classic CDC outage and it does not announce itself.</p>
+  <div class="codewrap"><pre><code class="lang-sql">-- the number to alert on, in bytes:
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS retained
+FROM pg_replication_slots;
+
+-- and the cleanup you must not forget:
+SELECT pg_drop_replication_slot('outbox_slot');</code></pre></div>
+</div>
+
+<h2>Trace one order through all five stages</h2>
+
+<p>One <code>curl</code>, five places to look. The <code>eventId</code> minted inside the producer's
+transaction is the same string at every stage &mdash; that is the thread you follow, and it is also
+the reason replay is safe later.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Five stages of one event with the command that verifies each stage and the identity that links them">
+  <text class="lbl-b" x="14" y="22">One order, five observation points</text>
+
+  <rect class="node-i" x="14"  y="40" width="140" height="58" rx="7"/>
+  <text class="lbl-b" x="84"  y="62" text-anchor="middle">1. commit</text>
+  <text class="lbl-s" x="84"  y="78" text-anchor="middle">orders + outbox</text>
+  <text class="lbl-s" x="84"  y="92" text-anchor="middle">ONE transaction</text>
+
+  <rect class="node-a" x="179" y="40" width="140" height="58" rx="7"/>
+  <text class="lbl-b" x="249" y="62" text-anchor="middle">2. WAL</text>
+  <text class="mono"  x="249" y="78" text-anchor="middle">outbox_slot</text>
+  <text class="lbl-s" x="249" y="92" text-anchor="middle">pgoutput decoding</text>
+
+  <rect class="node-a" x="344" y="40" width="140" height="58" rx="7"/>
+  <text class="lbl-b" x="414" y="62" text-anchor="middle">3. topic</text>
+  <text class="mono"  x="414" y="78" text-anchor="middle">orders.events</text>
+  <text class="lbl-s" x="414" y="92" text-anchor="middle">key = aggregate_id</text>
+
+  <rect class="node-o" x="509" y="40" width="140" height="58" rx="7"/>
+  <text class="lbl-b" x="579" y="62" text-anchor="middle">4. consumer</text>
+  <text class="lbl-s" x="579" y="78" text-anchor="middle">marker + effect</text>
+  <text class="lbl-s" x="579" y="92" text-anchor="middle">ONE transaction</text>
+
+  <rect class="node-o" x="674" y="40" width="140" height="58" rx="7"/>
+  <text class="lbl-b" x="744" y="62" text-anchor="middle">5. read model</text>
+  <text class="mono"  x="744" y="78" text-anchor="middle">order_projection</text>
+  <text class="lbl-s" x="744" y="92" text-anchor="middle">apply_count = 1</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="154" y1="69" x2="175" y2="69" marker-end="url(#p32-ar7)"/>
+    <line class="edge" x1="319" y1="69" x2="340" y2="69" marker-end="url(#p32-ar8)"/>
+    <line class="edge" x1="484" y1="69" x2="505" y2="69" marker-end="url(#p32-ar9)"/>
+    <line class="edge" x1="649" y1="69" x2="670" y2="69" marker-end="url(#p32-ar10)"/>
+  </g>
+
+  <text class="lbl-b" x="14" y="132">verify with</text>
+  <text class="mono"  x="84"  y="152" text-anchor="middle">make order</text>
+  <text class="mono"  x="249" y="152" text-anchor="middle">make outbox</text>
+  <text class="mono"  x="414" y="152" text-anchor="middle">kafka-ui :38080</text>
+  <text class="mono"  x="579" y="152" text-anchor="middle">consumer log</text>
+  <text class="mono"  x="744" y="152" text-anchor="middle">make projection</text>
+
+  <rect class="node-w" x="14" y="176" width="800" height="40" rx="7"/>
+  <text class="lbl-b" x="414" y="194" text-anchor="middle">the same eventId appears at every stage: outbox.id &rarr; eventId header &rarr; payload field &rarr; processed_message.event_id</text>
+  <text class="lbl-s" x="414" y="209" text-anchor="middle">it is generated once, inside the producer's transaction, so a Debezium re-emit carries the SAME value and is recognised as a duplicate</text>
+
+  <text class="lbl-s" x="14" y="242">If stage 2 has rows and stage 3 is empty, the connector is the problem &mdash; check its task state, not your consumer.</text>
+  <text class="lbl-s" x="14" y="258">If stage 3 has records and stage 5 does not move, the consumer is failing &mdash; the record is on a retry topic or in the DLT.</text>
+  <text class="lbl-s" x="14" y="274">If stage 1 has no outbox row, the transaction rolled back &mdash; which is exactly what <tspan class="mono">make rollback-demo</tspan> proves on purpose.</text>
+  <defs>
+    <marker id="p32-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Each stage boundary is a place the pipeline can stop. Knowing which two stages disagree
+localises the fault in one query.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">stage 1 &mdash; place an order and look at the outbox<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -X POST -H 'Content-Type: application/json' \
+     -d '{"customerId":"CUST-001","amountCents":4999,"status":"CREATED"}' \
+     http://localhost:38081/api/orders
+
+docker exec p3-postgres psql -U postgres -d ordersdb -c \
+  "SELECT id, aggregate_type, aggregate_id, event_type, created_at
+     FROM outbox ORDER BY created_at DESC LIMIT 10;"</code></pre>
+</div>
+
+<p>The two rows come from two <code>save</code> calls under one annotation. The producer module's
+<code>pom.xml</code> has no Kafka dependency at all &mdash; it <em>cannot</em> dual-write, which is a
+stronger guarantee than a code review.</p>
+
+<div class="codewrap">
+<div class="codehead">OrderService#createOrder &mdash; the whole point of the project<span class="lang">java</span></div>
+<pre><code class="lang-java">// ---------------------------------------------------------------
+// THE ONE TRANSACTION. Two INSERTs, one COMMIT, one durability
+// decision. Nothing between these two lines may talk to a broker,
+// an HTTP endpoint, or anything else that can fail independently.
+// ---------------------------------------------------------------
+orderRepository.save(order);
+outboxEventRepository.save(outboxEvent);</code></pre>
+</div>
+
+<p>For stage 3, open <a href="http://localhost:38080">kafka-ui</a> and select
+<code>orders.events</code>. The record's key is the order id (from <code>aggregate_id</code>), its
+value is the <code>payload</code> column expanded into a JSON object, and its headers carry
+<code>eventId</code>, <code>eventType</code>, <code>traceId</code> and <code>aggregateType</code>.
+Nothing in the producer chose a topic name.</p>
+
+<div class="codewrap">
+<div class="codehead">stages 4 and 5 &mdash; the effect, and the ledger that makes it repeatable<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker exec p3-postgres psql -U postgres -d consumerdb -c \
+  "SELECT order_id, customer_id, amount_cents, status, apply_count, updated_at
+     FROM order_projection ORDER BY updated_at DESC LIMIT 10;"
+
+docker exec p3-postgres psql -U postgres -d consumerdb -c \
+  "SELECT count(*) AS processed_messages FROM processed_message;"
+
+# apply_count = 1 is the assertion. 2 would mean the idempotency guard failed;
+# 0 with a projection row present is impossible, because the row is only ever
+# written by the same statement that sets the counter.</code></pre>
+</div>
+
+<h2>Break it on purpose</h2>
+
+<p>Four failure classes, four different paths through the topology. The status field on the order is
+the control channel: two reserved values drive the consumer into a retryable and a fatal failure
+without stubbing a downstream service.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="State machine of one record: the retry ladder from the main topic through three delay tiers to the dead letter topic, with the exclude list routing fatal failures and poison pills straight to the DLT">
+  <text class="lbl-b" x="14" y="20">Where a record goes, by failure class</text>
+
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 80 112 C 220 34 600 34 736 112" marker-end="url(#p32-ar11)"/>
+  </g>
+  <text class="lbl-s" x="408" y="52" text-anchor="middle">NonRetryableException &middot; DeserializationException &mdash; on the @RetryableTopic exclude list</text>
+  <text class="lbl-s" x="408" y="66" text-anchor="middle">one hop, milliseconds, no retry topic is ever created or touched</text>
+
+  <rect class="node-a" x="14"  y="118" width="132" height="52" rx="7"/>
+  <text class="lbl-b" x="80"  y="140" text-anchor="middle">orders.events</text>
+  <text class="lbl-s" x="80"  y="156" text-anchor="middle">attempt 1</text>
+
+  <rect class="node-w" x="178" y="118" width="132" height="52" rx="7"/>
+  <text class="mono"  x="244" y="138" text-anchor="middle">-retry-5000</text>
+  <text class="lbl-s" x="244" y="156" text-anchor="middle">attempt 2</text>
+
+  <rect class="node-w" x="342" y="118" width="132" height="52" rx="7"/>
+  <text class="mono"  x="408" y="138" text-anchor="middle">-retry-30000</text>
+  <text class="lbl-s" x="408" y="156" text-anchor="middle">attempt 3</text>
+
+  <rect class="node-w" x="506" y="118" width="132" height="52" rx="7"/>
+  <text class="mono"  x="572" y="138" text-anchor="middle">-retry-180000</text>
+  <text class="lbl-s" x="572" y="156" text-anchor="middle">attempt 4</text>
+
+  <rect class="node-d" x="670" y="118" width="132" height="52" rx="7"/>
+  <text class="mono"  x="736" y="138" text-anchor="middle">-dlt</text>
+  <text class="lbl-s" x="736" y="156" text-anchor="middle">terminal</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="146" y1="144" x2="174" y2="144" marker-end="url(#p32-ar12)"/>
+    <line class="edge-a" x1="310" y1="144" x2="338" y2="144" marker-end="url(#p32-ar13)"/>
+    <line class="edge-a" x1="474" y1="144" x2="502" y2="144" marker-end="url(#p32-ar14)"/>
+    <line class="edge-a" x1="638" y1="144" x2="666" y2="144" marker-end="url(#p32-ar15)"/>
+  </g>
+  <text class="lbl-s" x="160" y="110" text-anchor="middle">wait 5s</text>
+  <text class="lbl-s" x="324" y="110" text-anchor="middle">wait 30s</text>
+  <text class="lbl-s" x="488" y="110" text-anchor="middle">wait 180s</text>
+  <text class="lbl-s" x="652" y="110" text-anchor="middle">exhausted</text>
+
+  <g color="var(--ok)">
+    <line class="edge" x1="80"  y1="170" x2="80"  y2="206" marker-end="url(#p32-ar16)"/>
+    <line class="edge" x1="244" y1="170" x2="244" y2="206" marker-end="url(#p32-ar17)"/>
+    <line class="edge" x1="408" y1="170" x2="408" y2="206" marker-end="url(#p32-ar18)"/>
+    <line class="edge" x1="572" y1="170" x2="572" y2="206" marker-end="url(#p32-ar19)"/>
+  </g>
+
+  <rect class="node-o" x="14" y="210" width="624" height="44" rx="7"/>
+  <text class="lbl-b" x="326" y="230" text-anchor="middle">SUCCESS at any tier &rarr; marker + effect committed together, offset advanced, ladder abandoned</text>
+  <text class="lbl-s" x="326" y="246" text-anchor="middle">until then processed_message holds NOTHING for this eventId &mdash; the marker rolls back with every failed attempt</text>
+
+  <text class="lbl-s" x="670" y="228">Total time to the DLT:</text>
+  <text class="lbl-s" x="670" y="244">5 + 30 + 180 &asymp; 3.5 min</text>
+  <text class="lbl-s" x="14"  y="276">The main partition is never blocked: each failure is a forward-and-return, not a sleep. Ordering for the failed key is what you pay.</text>
+  <defs>
+    <marker id="p32-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p32-ar19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The exclude list is the difference between a fatal defect surfacing in milliseconds and
+an operator finding out three and a half minutes late.</figcaption>
+</figure>
+
+<h3>A retryable failure walks the ladder</h3>
+
+<div class="codewrap">
+<div class="codehead">drive it, then watch the topics appear<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make fail-retryable
+# == curl ... -d '{"customerId":"CUST-RETRY","amountCents":4999,
+#                  "status":"SIMULATE_RETRYABLE_FAILURE"}'
+
+docker exec p3-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:19092 --list | sort
+# orders.events
+# orders.events-dlt
+# orders.events-retry-5000        &lt;- created lazily, on first use
+# orders.events-retry-30000
+# orders.events-retry-180000</code></pre>
+</div>
+
+<p>The topic names carry their backoff because the listener uses
+<code>TopicSuffixingStrategy.SUFFIX_WITH_DELAY_VALUE</code>. That is not cosmetic: it means
+<code>kafka-topics.sh --list</code> <em>is</em> the documentation of the ladder, and a tier that
+silently collapsed into another one would be visible as a missing topic.</p>
+
+<div class="codewrap">
+<div class="codehead">application.yml &mdash; where 5s/30s/180s comes from<span class="lang">yaml</span></div>
+<pre><code class="lang-yaml">app:
+  retry:
+    # attempts counts the FIRST delivery as attempt 1, so 4 attempts means the
+    # main topic plus three retry topics, then the DLT.
+    attempts: 4
+    initial-delay-ms: 5000
+    multiplier: 6.0
+    max-delay-ms: 300000</code></pre>
+</div>
+
+<p>While the record is on the ladder, query <code>processed_message</code>: it is empty. The marker
+insert and the business effect share one transaction, so a failed attempt leaves no trace at all.
+That is the property that makes redelivery correct rather than merely tolerated.</p>
+
+<div class="box gotcha">
+  <span class="bt">Two tiers clamped to the same delay become one topic</span>
+  <p>The suffix <em>is</em> the delay, so if <code>max-delay-ms</code> clamps attempt 3 and attempt 4
+  to the same value, both resolve to the same topic name and Spring's default reuse strategy folds
+  them into a single shared topic. You then get four attempts across three tiers and the ladder you
+  drew on the whiteboard does not exist. With <code>5000 &times; 6.0</code> the ladder reaches 180000
+  and never touches the 300000 ceiling &mdash; check that arithmetic every time you change a
+  multiplier. Setting <code>app.retry.multiplier=7.75</code> is the exercise that puts the third tier
+  exactly on the cap.</p>
+</div>
+
+<h3>A fatal failure skips it</h3>
+
+<div class="codewrap">
+<div class="codehead">the exclude list, in the annotation<span class="lang">java</span></div>
+<pre><code class="lang-java">@RetryableTopic(
+        attempts = "${app.retry.attempts}",
+        backoff = @Backoff(
+                delayExpression = "${app.retry.initial-delay-ms}",
+                multiplierExpression = "${app.retry.multiplier}",
+                maxDelayExpression = "${app.retry.max-delay-ms}"),
+        topicSuffixingStrategy = TopicSuffixingStrategy.SUFFIX_WITH_DELAY_VALUE,
+        dltStrategy = DltStrategy.FAIL_ON_ERROR,
+        exclude = { NonRetryableException.class, DeserializationException.class },
+        traversingCauses = "true",
+        kafkaTemplate = "retryKafkaTemplate",
+        listenerContainerFactory = "kafkaListenerContainerFactory")</code></pre>
+</div>
+
+<p><code>traversingCauses = "true"</code> is what makes the exclusion work at all. A
+<code>DeserializationException</code> arrives wrapped in a
+<code>ListenerExecutionFailedException</code>; a classifier that looked only at the thrown type would
+see the wrapper, decide it was retryable, and spend 3.5 minutes proving that bytes which are not JSON
+now are still not JSON later. Run <code>make fail-fatal</code> and confirm no <code>-retry-</code>
+topic is touched.</p>
+
+<h3>A poison pill that does not stop the partition</h3>
+
+<div class="codewrap">
+<div class="codehead">publish bytes that are not JSON, straight past the producer<span class="lang">bash</span></div>
+<pre><code class="lang-bash">echo 'poison-key:{"eventId":"not-a-uuid", broken json &lt;&lt;&lt;' | \
+  docker exec -i p3-kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server kafka:19092 --topic orders.events \
+    --property "parse.key=true" --property "key.separator=:"</code></pre>
+</div>
+
+<p>Without <code>ErrorHandlingDeserializer</code> this is a permanent outage. The exception is thrown
+<em>inside</em> <code>KafkaConsumer.poll()</code> &mdash; before any listener, error handler or offset
+commit exists &mdash; so the container catches it, logs, and polls the same offset again, forever. One
+malformed byte, one dead partition, and the only fix is a manual offset seek.</p>
+
+<div class="codewrap">
+<div class="codehead">KafkaConfig &mdash; the wrapper that turns a poll-time crash into a routable record<span class="lang">java</span></div>
+<pre><code class="lang-java">JsonDeserializer&lt;OrderEvent&gt; jsonDeserializer =
+        new JsonDeserializer&lt;&gt;(OrderEvent.class, objectMapper, false);
+jsonDeserializer.addTrustedPackages("com.acme.consumer.model");
+
+return new DefaultKafkaConsumerFactory&lt;&gt;(
+        props,
+        new StringDeserializer(),
+        new ErrorHandlingDeserializer&lt;&gt;(jsonDeserializer));</code></pre>
+</div>
+
+<p>Now the value deserialises to <code>null</code>, the exception is stashed in a header, the record
+reaches the container, and the error handler routes it like any other failure. Verify two things: the
+DLT holds exactly one record whose bytes equal what you published, and a normal order placed
+afterwards still lands in the projection.</p>
+
+<div class="box gotcha">
+  <span class="bt">A poison pill never appears in <code>dlq_record</code></span>
+  <p><code>make dlq-table</code> will not show it, and that is not a bug. The DLT's own listener
+  container deserialises with the same <code>JsonDeserializer</code> that already rejected the bytes
+  once, so <code>@DltHandler</code> is never invoked for it &mdash; with
+  <code>DltStrategy.FAIL_ON_ERROR</code> the framework logs and moves on rather than republishing to
+  the DLT in a loop. The record <em>is</em> in the topic, byte for byte. Read it with
+  <code>make dlq-describe</code>, which is exactly why the inspector reads <code>byte[]</code> and
+  never deserialises anything.</p>
+</div>
+
+<h3>A duplicate that only lands once</h3>
+
+<p>Republish an event that has already been applied &mdash; a replay, a Debezium re-emit after a
+connector restart, or literally the same <code>curl</code> against the DLQ inspector. The effect must
+not repeat.</p>
+
+<div class="codewrap">
+<div class="codehead">IdempotentProcessor#process &mdash; marker and effect, one transaction<span class="lang">java</span></div>
+<pre><code class="lang-java">int inserted = jdbcTemplate.update(INSERT_MARKER, /* ... ON CONFLICT (event_id) DO NOTHING */);
+
+if (inserted == 0) {
+    // The unique constraint on processed_message.event_id did its job. Note that we return
+    // normally rather than throwing: a duplicate is a success, not an error. Throwing here
+    // would send perfectly healthy redeliveries to the DLT.
+    log.info("Duplicate event {} for order {} from {}-{}@{} - effect already applied, skipping",
+            event.eventId(), event.orderId(), topic, partition, offset);
+    return false;
+}</code></pre>
+</div>
+
+<p>The assertion is <code>apply_count</code>. The projection upsert increments it on every
+application, so "was this applied twice?" is a SQL question with a numeric answer: <strong>1</strong>
+means the guard held, <strong>2</strong> means it did not, <strong>0</strong> means nothing was
+consumed at all. The dedupe key is the producer-assigned <code>eventId</code> &mdash; not the offset,
+which changes the moment a record is forwarded to a retry topic, and not a payload hash, which
+collides with legitimately identical events.</p>
+
+<h3>Stop the consumer, produce, restart</h3>
+
+<div class="codewrap">
+<div class="codehead">build a backlog, then watch it drain<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># 1. Ctrl-C the `make run-consumer` terminal.
+# 2. Place ten orders. They all commit - the producer has no Kafka client to be
+#    blocked by, so the outbox grows and the pipeline is simply behind.
+for i in $(seq 1 10); do make order AMOUNT=$((1000 + i)); done
+
+# 3. Lag, per partition, from outside the application:
+docker exec p3-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:19092 --describe --group order-consumer
+
+# 4. Restart the consumer. It resumes from its COMMITTED offsets, not from the
+#    beginning, and LAG returns to 0 within a poll or two.</code></pre>
+</div>
+
+<p>The same experiment works one level further out: <code>docker compose stop kafka</code>, place ten
+orders, confirm they all commit and the outbox grows, then <code>docker compose start kafka</code>
+and watch Debezium drain the backlog from the WAL. That is the property a dual write cannot give you
+&mdash; the broker being down is a latency problem here, not a data-loss problem.</p>
+
+<div class="box warn">
+  <span class="bt"><code>auto-offset-reset: earliest</code> is only safe because of the ledger</span>
+  <p>It applies when the group has <em>no committed offset</em> &mdash; a fresh group, or one whose
+  offsets aged out of <code>__consumer_offsets</code> (broker default retention is 7 days of group
+  inactivity). At that point the consumer replays the entire topic. With
+  <code>processed_message</code> in place that is a no-op storm; without it, it is every order
+  reapplied. Choosing <code>earliest</code> without an idempotent consumer is choosing to reprocess
+  history the first time a group goes idle over a long weekend.</p>
+</div>
+
+<h2>The CLI you will actually use</h2>
+
+<p>These run inside the broker container, where the scripts live at <code>/opt/kafka/bin</code>. The
+bootstrap address there is <code>kafka:19092</code> &mdash; the <em>internal</em> listener. It cannot be
+the host one: <code>PLAINTEXT_HOST</code> advertises <code>localhost:39092</code>, and a client running
+inside the broker would bootstrap fine and then be redirected to a port nothing in that container
+is listening on. Same trap as before, mirrored.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Command (prefix with <code>docker exec p3-kafka /opt/kafka/bin/</code>)</th><th>What to look at</th></tr></thead>
+<tbody>
+<tr><td>Which topics exist?</td><td><code>kafka-topics.sh --bootstrap-server kafka:19092 --list</code></td><td>The retry tiers appear only after the first failure of that tier</td></tr>
+<tr><td>How is the ladder configured?</td><td><code>kafka-topics.sh ... --describe --topic 'orders.events.*'</code></td><td>Partition count must match across main, retry and DLT or a key changes partition mid-ladder</td></tr>
+<tr><td>Which groups exist?</td><td><code>kafka-consumer-groups.sh ... --list</code></td><td>List before you describe &mdash; the ladder's containers register their own ids; do not assume the name</td></tr>
+<tr><td>How far behind are we?</td><td><code>kafka-consumer-groups.sh ... --describe --group order-consumer</code></td><td><code>LAG</code> per partition, plus <code>CONSUMER-ID</code>: an empty consumer id means nobody is assigned</td></tr>
+<tr><td>What is actually in the DLT?</td><td><code>kafka-console-consumer.sh ... --topic orders.events-dlt --from-beginning --property print.headers=true --property print.key=true</code></td><td>Raw bytes and every header; unreadable but authoritative</td></tr>
+<tr><td>Where does a partition start and end?</td><td><code>kafka-get-offsets.sh ... --topic orders.events</code></td><td>End offset minus committed offset is lag computed by hand, which is worth doing once</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="bt">Lag on a retry topic means something different</span>
+  <p>A retry-topic partition is <strong>paused, not slow</strong>: its container holds the assignment
+  and deliberately does not poll until the backoff elapses. Non-zero lag on
+  <code>orders.events-retry-180000</code> for up to three minutes is the design working. Lag on
+  <code>orders.events</code> is the number that means what you think it means. Alerting on both with
+  the same threshold produces a pager that cries wolf every time one order fails.</p>
+</div>
+
+<h2>Triage and replay</h2>
+
+<p>The inspector is a plain <code>kafka-clients</code> fat jar &mdash; no Spring context, no datasource,
+~15&nbsp;MB &mdash; because a tool you reach for during an incident should start in under a second and
+have nothing unrelated to Kafka that can fail.</p>
+
+<div class="codewrap">
+<div class="codehead">the triage loop<span class="lang">bash</span></div>
+<pre><code class="lang-bash">java -jar tools/target/dlq-inspector.jar list --bootstrap localhost:39092 \
+     --dlt-topic orders.events-dlt
+# one line per record + a breakdown by exception class
+
+java -jar tools/target/dlq-inspector.jar list --exception NonRetryable --since 2h
+java -jar tools/target/dlq-inspector.jar describe --partition 0 --offset 3
+# every header decoded, the payload pretty-printed, the full stack trace
+
+java -jar tools/target/dlq-inspector.jar replay --exception RetryableException
+# DRY RUN - prints exactly what would be sent, sends nothing
+
+java -jar tools/target/dlq-inspector.jar replay --exception RetryableException --execute</code></pre>
+</div>
+
+<p>Two design choices in the tool are worth copying. It <strong>assigns partitions manually and never
+commits an offset</strong>, so running it cannot disturb the application's own DLT consumer and
+running it twice shows the same records. And <strong>replay is dry by default</strong> &mdash;
+replaying a bad batch onto a production topic is a very expensive way to learn the flag ordering.</p>
+
+<div class="box gotcha">
+  <span class="bt"><code>kafka_dlt-original-topic</code> names the LAST hop, not the first</span>
+  <p>Each forward along the ladder overwrites that header, so a record that walked all three tiers
+  reports <code>orders.events-retry-180000</code>. Replaying naively onto that value puts the record
+  back on a retry topic, where the retry container picks it up immediately (the backoff header was
+  stripped) and the main topic's consumer semantics are skipped entirely. The tool strips the suffix
+  to recover the real origin:</p>
+  <div class="codewrap"><pre><code class="lang-java">/** Removes a trailing {@code -retry-&lt;delay&gt;} (optionally {@code -&lt;index&gt;}) suffix. */
+static String stripRetrySuffix(String topic) {
+    return topic.replaceFirst("-retry-\\d+(-\\d+)?$", "");
+}</code></pre></div>
+</div>
+
+<p>A replayed record starts a fresh life: every <code>kafka_dlt-</code>, <code>retry_topic-</code> and
+<code>x-dlq-</code> header is dropped, or the next failure's diagnostics would describe the previous
+incident. Application headers such as <code>traceId</code> survive, plus one
+<code>x-replayed-from-dlt</code> breadcrumb. The DLT keeps the originals &mdash; replay never
+deletes.</p>
+
+<div class="box warn">
+  <span class="bt">Fix the cause before you press <code>--execute</code></span>
+  <p>Replaying into an unfixed consumer just refills the DLT, and each pass adds another
+  <code>x-replayed-from-dlt</code> header to records that are already hard to read. The one case where
+  replaying immediately is correct is when the failure was genuinely transient and the ladder simply
+  ran out of tiers before the downstream recovered &mdash; which is what the
+  <code>x-dlq-classification</code> header (<code>RETRIES_EXHAUSTED</code> /
+  <code>NON_RETRYABLE</code> / <code>DESERIALIZATION</code>) exists to tell you without parsing stack
+  traces.</p>
+</div>
+
+<h2>Running the tests</h2>
+
+<p><code>make test</code> is <code>mvn verify</code>. The consumer's integration tests start real
+Kafka and PostgreSQL containers through Testcontainers, publish real records and assert on real
+topics &mdash; Docker must be running, and the first run pulls <code>apache/kafka:4.0.0</code>.</p>
+
+<div class="codewrap">
+<div class="codehead">AbstractIntegrationTest &mdash; the ladder compressed to milliseconds<span class="lang">java</span></div>
+<pre><code class="lang-java">@SpringBootTest(
+        classes = ConsumerApplication.class,
+        properties = {
+                "app.retry.attempts=4",
+                "app.retry.initial-delay-ms=100",
+                "app.retry.multiplier=3.0",
+                "app.retry.max-delay-ms=60000",
+                "spring.kafka.consumer.group-id=order-consumer-it",
+                ...
+        })
+// Topic names follow the delays, so under these overrides the ladder is
+// orders.events-retry-100 / -retry-300 / -retry-900. The multiplier and max
+// delay are chosen so no two tiers clamp to the same value, which would make
+// Spring fold them into a single shared topic.</code></pre>
+</div>
+
+<p>Four attempts, three retry topics, one DLT &mdash; the topology is identical and only the clock
+changes, which is exactly what you want from a test of <em>routing</em> behaviour. The tests then
+assert the two things a compressed clock cannot fake: the tiers were visited in ascending timestamp
+order, and reaching tier three took at least <code>100 + 300</code>&nbsp;ms, proving the backoff was
+applied rather than skipped.</p>
+
+<div class="box ok">
+  <span class="bt">The sentinel trick &mdash; how the idempotency tests avoid sleeps</span>
+  <p>Naively you publish the duplicate, sleep, and hope. Instead every test publishes a
+  <strong>sentinel event on the same Kafka key</strong> after the records under test. Same key means
+  same partition, and a partition is consumed strictly in order, so the moment the sentinel's row
+  appears in <code>processed_message</code> the earlier records are guaranteed to have been consumed
+  and committed. The assertion then runs against a settled system with no sleeps and no flakiness.
+  This generalises: <em>order on a partition is a synchronisation primitive you already have.</em></p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Test</th><th>What it pins down</th><th>How it would fail if you broke the design</th></tr></thead>
+<tbody>
+<tr><td><code>IdempotencyTest#duplicateEventIsAppliedOnce</code></td><td>Same <code>eventId</code> twice &rarr; <code>apply_count = 1</code></td><td>Removing <code>ON CONFLICT DO NOTHING</code> makes it 2</td></tr>
+<tr><td><code>#twoDistinctEventsForTheSameOrderAreBothApplied</code></td><td>The counter really increments, so the assertion above is not vacuous</td><td>A broken projection would make both tests pass for the wrong reason</td></tr>
+<tr><td><code>#sameEventRepublishedAtADifferentOffsetIsStillADuplicate</code></td><td>Identity travels in the payload, not the coordinates</td><td>Keying dedupe on topic/partition/offset makes every replay a fresh apply</td></tr>
+<tr><td><code>RetryAndDltTest#retryableFailureWalksTheLadder...</code></td><td>One hop per tier, in order, with the full DLT header set and <code>processed_message</code> empty</td><td>A marker written in its own transaction leaves a row behind after attempt 1</td></tr>
+<tr><td><code>#nonRetryableFailureBypassesTheRetryTopics</code></td><td>No <code>-retry-</code> topic ever sees the record</td><td>Dropping <code>traversingCauses</code> sends wrapped exceptions round the ladder</td></tr>
+<tr><td><code>#poisonPillIsRoutedAndPreservedVerbatim</code></td><td>Exactly one dead letter, bytes identical, partition still healthy afterwards</td><td>A plain <code>JsonSerializer</code> mangles the bytes; no <code>ErrorHandlingDeserializer</code> hangs the test</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Exercises</h2>
+
+<p>Each one changes real behaviour. Verify with the tests or the CLI rather than by reading &mdash; if
+you cannot state the observable difference before you start, the exercise is not finished when the
+code compiles.</p>
+
+<ol>
+  <li><strong>Add exactly-once with Kafka transactions.</strong> Wrap the consume&ndash;process&ndash;produce
+  step in a transactional producer (<code>transactional.id</code>, <code>sendOffsetsToTransaction</code>)
+  so the projection write and the offset commit land atomically. Then write down what you still have
+  not solved: Debezium's leg into Kafka is unchanged, and the database write is in a different
+  resource manager from the offsets. Conclusion to reach on your own: <em>Kafka transactions remove
+  one duplicate source, not the need for the ledger.</em></li>
+
+  <li><strong>Add a schema registry with Avro.</strong> Replace the <code>JsonConverter</code> in the
+  connector with <code>AvroConverter</code> and the consumer's <code>JsonDeserializer</code> with the
+  Avro equivalent, both pointed at a registry container. Done when a producer-side field rename is
+  rejected at <em>registration</em> time instead of surfacing as a
+  <code>NonRetryableException</code> in your DLT an hour later.</li>
+
+  <li><strong>Alert on consumer lag.</strong> Export <code>kafka_consumergroup_lag</code> and page on
+  sustained lag against <code>orders.events</code> only. Explain in the alert's runbook why the same
+  threshold on <code>orders.events-retry-180000</code> would fire on every single failed order.</li>
+
+  <li><strong>Implement the inbox pattern.</strong> Today the consumer applies the effect inline.
+  Instead, write the raw event into an <code>inbox</code> table in the same transaction as the marker
+  and process it from a separate worker. Compare: what does this buy when the business effect is slow
+  or calls a third party, and what does it cost in end-to-end latency and in one more table to
+  operate?</li>
+
+  <li><strong>Trace the whole pipeline.</strong> The <code>traceId</code> is already generated in
+  <code>OrderService</code> and carried as a Kafka header by the SMT. Wire OpenTelemetry so one trace
+  spans the HTTP request, the Debezium relay, the consumer, and every retry hop. The hard part is
+  that the CDC leg has no in-process continuation &mdash; you must reconstruct the parent from the
+  header, and decide whether a 180-second retry wait belongs in the same trace at all.</li>
+
+  <li><strong>Partition the outbox.</strong> Convert <code>outbox</code> to a
+  <code>PARTITION BY RANGE (created_at)</code> table with daily partitions, so retention becomes
+  <code>DROP PARTITION</code> instead of the <code>DELETE</code> in
+  <code>OrderService#purgeOldOutboxRows</code>. Confirm Debezium still streams it, then explain why
+  dropping a partition is cheap for autovacuum and a bulk <code>DELETE</code> is not.</li>
+
+  <li><strong>Handle a schema change in the source table.</strong> Add a <code>V2</code> migration
+  renaming <code>outbox.aggregate_id</code> to <code>entity_id</code> without touching the connector.
+  Watch <code>connector-status</code> go to <code>FAILED</code>, read the SMT's error, and fix
+  <code>table.field.event.key</code>. This is the coupling the outbox pattern really has, and it is
+  invisible until you break it.</li>
+
+  <li><strong>Delete the idempotency guard.</strong> Comment out the zero-rows-inserted early return.
+  <code>IdempotencyTest#duplicateEventIsAppliedOnce</code> must fail with
+  <code>apply_count = 2</code>. Put it back.</li>
+
+  <li><strong>Move the marker out of the transaction.</strong> Write it from a method annotated
+  <code>@Transactional(propagation = REQUIRES_NEW)</code> before the effect, then publish a retryable
+  failure. The record walks the ladder, but the marker is already committed, so every retry is
+  silently skipped and the event is lost. <em>This is the single most common idempotency bug in
+  production systems.</em></li>
+
+  <li><strong>Make retries blocking.</strong> Remove <code>@RetryableTopic</code> and give the
+  <code>DefaultErrorHandler</code> a <code>FixedBackOff(30_000L, 4L)</code>. Publish one failing order
+  and ten good ones on the same partition, and time how long the good ones take. Then compute what
+  happens when the backoff exceeds <code>max.poll.interval.ms</code>.</li>
+
+  <li><strong>Remove the byte-passthrough serializer.</strong> Swap
+  <code>PayloadOrRawBytesSerializer</code> for a plain <code>JsonSerializer</code> and run the poison
+  pill test. Inspect what actually lands in the DLT, and note that the corruption is silent.</li>
+
+  <li><strong>Add a second aggregate.</strong> Emit <code>aggregate_type = "shipments"</code> from a
+  new endpoint. A <code>shipments.events</code> topic appears with no connector change at all &mdash;
+  routing is data, not configuration. Now decide whether that is a feature or a way to create
+  production topics by typo.</li>
+</ol>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>A single broker advertises two addresses and the correct one depends on which side of the
+  container boundary you are on: <code>kafka:19092</code> for containers, <code>localhost:39092</code>
+  for host JVMs (the broker's 9092 published on the host as 39092). The failure happens on the metadata hop, not the connect, which is why the error
+  message never says "wrong listener".</li>
+  <li>Deleting a Debezium connector leaves its replication slot behind, and an inactive slot pins
+  every WAL segment after <code>confirmed_flush_lsn</code> until the disk fills. Alert on
+  <code>pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)</code>, and drop slots
+  deliberately.</li>
+  <li>Follow the <code>eventId</code>, not the offset. It is minted inside the producer's transaction,
+  travels as an outbox primary key, a Kafka header, a payload field and a
+  <code>processed_message</code> row &mdash; which is why replayed and re-emitted records are
+  recognisable as duplicates and why <code>apply_count</code> is a one-query correctness check.</li>
+  <li>The exclude list plus <code>traversingCauses = "true"</code> is the difference between a fatal
+  defect surfacing in milliseconds and an operator learning about it 3.5 minutes later. Retrying a
+  message that cannot be parsed is pure waste; retrying a timeout is the entire point.</li>
+  <li>A poison pill reaches the DLT but never reaches <code>@DltHandler</code>, so it is absent from
+  <code>dlq_record</code> by design &mdash; the DLT container cannot deserialise it either. Any DLQ
+  workflow that reads only your archive table will silently miss exactly the failures you most need
+  to see; the byte-level inspector is not a nicety.</li>
+  <li><code>kafka_dlt-original-topic</code> is the last hop, not the first. Strip the
+  <code>-retry-&lt;delay&gt;</code> suffix before replaying, strip the framework headers so the next
+  failure describes itself, and keep replay dry-run by default.</li>
+  <li>Lag on the main topic means the consumer is behind; lag on a retry topic means a partition is
+  deliberately paused mid-backoff. They are different signals and one threshold for both makes the
+  alert useless.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="02-errors-dlq.html"><span class="lb">Previous</span>Retries, DLQ &amp; poison pills</a>
+  <span class="xref"><span class="lb">Next</span>10 &middot; Projects</span>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

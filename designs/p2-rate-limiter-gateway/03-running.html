@@ -1,0 +1,933 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Running, testing &amp; exercises &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Distributed Rate Limiter &amp; API Gateway</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Running, testing &amp; exercises</h1>
+<p class="lede">The commands that take this gateway from a git checkout to a 429 you can read, the
+load-test recipes that prove the limit is real rather than approximately real, and the deliberate
+breakages &mdash; stop Redis, pause Redis, poison an upstream &mdash; that make the fail-open policy
+and the circuit breaker visible instead of theoretical.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">operations</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">Every mechanism in this project has an observation point</span>
+  <p>A rate limiter is a distributed algorithm whose whole value is a number being exactly right
+  under concurrency. You cannot review that into existence &mdash; you have to <em>watch</em> it. So
+  each mechanism here publishes somewhere you can look at it while it runs: the binding tier in
+  <code>X-RateLimit-Rule</code>, the bucket level in a Redis hash, the fail mode in
+  <code>gateway_ratelimit_errors_total</code>, the breaker in <code>/breakers</code>. Work through
+  this page with three terminals open &mdash; one running the gateway, one polling the admin plane,
+  one driving traffic &mdash; and every design decision from the previous two pages turns into a
+  number that moves.</p>
+</div>
+
+<h2>Bring the stack up</h2>
+
+<p>The dependencies run in containers; the gateway itself runs from source on the host. That split
+is deliberate: it gives you a sub-second edit&ndash;compile&ndash;run loop and a debugger you can
+attach, while Redis and the two upstreams stay fixed. <code>make up</code> starts only the three
+dependency services and blocks until their healthchecks pass.</p>
+
+<div class="codewrap">
+<div class="codehead">the three-command start<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># 1. dependencies: Redis 8 + two httpbin-style upstreams, waited until healthy
+make up
+
+# 2. the gateway itself, from source, on :28080 (admin on :29090)
+make run
+
+# 3. in another terminal: watch a 200 become a 429
+make smoke</code></pre>
+</div>
+
+<p>The <code>--wait</code> in the <code>up</code> target is the part worth copying into your own
+projects. Without it, <code>make up &amp;&amp; make smoke</code> races container startup and fails
+intermittently &mdash; and the healthcheck is <code>redis-cli ping</code>, not a port probe,
+because Redis binds its port before it has finished loading and a client that connects in that
+window gets <code>LOADING</code> errors.</p>
+
+<div class="codewrap">
+<div class="codehead">Makefile: why the wait is not optional<span class="lang">bash</span></div>
+<pre><code class="lang-bash">## up: start redis and the two upstreams, and wait for them to be healthy
+up:
+	# --wait blocks until every started service reports healthy, so the next
+	# command in a script can assume the stack is actually ready. Without it,
+	# `make up &amp;&amp; make smoke` races container startup and fails intermittently.
+	$(COMPOSE) up -d --build --wait $(DEPS)</code></pre>
+</div>
+
+<p>If you have no <code>make</code> &mdash; Windows without Git Bash or WSL &mdash; every recipe is
+a plain shell command you can run by hand:</p>
+
+<div class="codewrap">
+<div class="codehead">the same thing without make<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker compose up -d --build --wait redis upstream-alpha upstream-beta
+go run ./cmd/gateway
+
+# everything in containers instead, gateway included:
+make up-all          # == docker compose up -d --build --wait
+make down            # stop and delete volumes</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Endpoint</th><th>Host port</th><th>Rate limited?</th><th>What it is for</th></tr></thead>
+<tbody>
+<tr><td>data plane</td><td><code>28080</code></td><td>Yes</td><td>Tenant traffic. <code>/alpha/*</code> and <code>/beta/*</code> by path prefix.</td></tr>
+<tr><td><code>/metrics</code> <code>/healthz</code> <code>/readyz</code> <code>/breakers</code></td><td><code>29090</code></td><td><strong>No</strong></td><td>Admin plane. Firewall it off in production; a scrape must never cost a customer part of their quota.</td></tr>
+<tr><td>upstream alpha</td><td><code>28081</code></td><td>&mdash;</td><td>Direct access, and the <code>/control</code> fault injector.</td></tr>
+<tr><td>upstream beta</td><td><code>28082</code></td><td>&mdash;</td><td>The control group. It must stay healthy while you break alpha.</td></tr>
+<tr><td>Redis</td><td><code>26379</code></td><td>&mdash;</td><td>Limiter state. No persistence, <code>maxmemory 256mb</code>, <code>allkeys-lru</code>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>These are <strong>host</strong> ports, chosen so this project can run alongside the others in the track and alongside a Redis installed natively on port <code>6379</code>. Inside the compose network nothing moved: the gateway container still listens on <code>:8080</code> and <code>:9090</code>, still dials <code>redis:6379</code>, and still reaches the upstreams at <code>upstream-alpha:8080</code> and <code>upstream-beta:8080</code>. Only the left-hand side of each <code>ports:</code> mapping changed.</p>
+
+<h2>Allowed, then limited &mdash; and the headers that say why</h2>
+
+<p>The free plan is 5 requests per second burst and 60 per minute sustained. The critical detail
+in reproducing that from a shell is that the requests must be genuinely simultaneous. Ten separate
+<code>curl</code> invocations take tens of milliseconds each to start, and the burst bucket refills
+at 5 tokens per second &mdash; 1 token every 200&nbsp;ms &mdash; so a naive
+<code>for i in 1..10; do curl; done</code> loop can pass all ten. Hand one <code>curl</code>
+process all ten URLs instead:</p>
+
+<div class="codewrap">
+<div class="codehead">ten requests, one curl process<span class="lang">bash</span></div>
+<pre><code class="lang-bash">URLS=$(for i in $(seq 1 10); do printf 'http://localhost:28080/alpha/json '; done)
+curl -s -o /dev/null -H 'X-API-Key: demo-free-key' \
+  -w 'status=%{http_code} limit=%header{X-RateLimit-Limit} remaining=%header{X-RateLimit-Remaining} rule=%header{X-RateLimit-Rule} retry=%header{Retry-After}\n' \
+  $URLS</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">five through, then rejection<span class="lang">text</span></div>
+<pre><code class="lang-text">status=200 limit=5 remaining=4 rule=burst retry=
+status=200 limit=5 remaining=3 rule=burst retry=
+status=200 limit=5 remaining=2 rule=burst retry=
+status=200 limit=5 remaining=1 rule=burst retry=
+status=200 limit=5 remaining=0 rule=burst retry=
+status=429 limit=5 remaining=0 rule=burst retry=1
+status=429 limit=5 remaining=0 rule=burst retry=1
+...</code></pre>
+</div>
+
+<p>Now the same ten on <code>demo-enterprise-key</code> (500/s burst): all ten pass, and
+<code>rule</code> reports whichever tier is closest to exhaustion. That is the header worth
+understanding, because it is the one that tells a client <em>why</em> it was refused. Burst
+pressure clears in a second; an exhausted sustained quota clears in a minute; the fleet-wide
+global ceiling is not the client's fault at all. One undifferentiated 429 hides which is
+happening, and a client that cannot tell them apart will retry into the same wall.</p>
+
+<div class="codewrap">
+<div class="codehead">the raw response, headers and body<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -s -D - -H 'X-API-Key: demo-free-key' http://localhost:28080/alpha/json
+
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+Retry-After: 1
+X-RateLimit-Limit: 5
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1
+X-RateLimit-Rule: burst
+X-Request-Id: 6f1c0a2e9b4d7a13
+
+{"error":{"code":"rate_limited","message":"Rate limit exceeded for the 'burst' tier. Retry after the interval in the Retry-After header.","request_id":"6f1c0a2e9b4d7a13"}}</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Header</th><th>Source</th><th>Set on a 200 too?</th><th>Reading it</th></tr></thead>
+<tbody>
+<tr><td><code>X-RateLimit-Limit</code></td><td><code>Decision.Limit</code></td><td>Yes</td><td>Capacity of the <em>binding</em> rule, not of the plan. It changes as the binding rule changes.</td></tr>
+<tr><td><code>X-RateLimit-Remaining</code></td><td><code>Decision.Remaining</code></td><td>Yes</td><td>Whole tokens left, floored. Fractional tokens exist in Redis; the header cannot express them.</td></tr>
+<tr><td><code>X-RateLimit-Reset</code></td><td><code>Decision.ResetAfter</code></td><td>Yes</td><td>Seconds until the binding rule is <em>full</em> again &mdash; not until the next token.</td></tr>
+<tr><td><code>X-RateLimit-Rule</code></td><td><code>Decision.Rule</code></td><td>Yes</td><td><code>burst</code>, <code>sustained</code> or <code>global</code>. The non-standard header that makes the other three interpretable.</td></tr>
+<tr><td><code>Retry-After</code></td><td><code>Decision.RetryAfter</code></td><td>No</td><td>Whole seconds, rounded <strong>up</strong>, floor 1. Rounding 1400&nbsp;ms down to 1&nbsp;s guarantees the retry is rejected again.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>%header{}</code> needs curl 7.83; older curl prints nothing and you conclude the headers are missing</span>
+  <p>The <code>-w '%header{X-RateLimit-Limit}'</code> form landed in curl 7.83.0 (2022). On an older
+  build &mdash; and the curl bundled with some Git-for-Windows installs is older &mdash; the
+  placeholder expands to an empty string with no error, so every line reads
+  <code>limit= remaining= rule=</code> and it looks exactly like a gateway that is not setting
+  headers at all. Check with <code>curl --version</code>, and fall back to <code>-D -</code> plus
+  <code>grep -i '^x-ratelimit'</code>, which works everywhere.</p>
+</div>
+
+<h2>Watching burst give way to sustained</h2>
+
+<p>The multi-tier design only earns its complexity when you can see one tier hand over to another.
+Offer the free plan a steady 5 requests per second &mdash; exactly its burst rate, five times its
+sustained rate &mdash; and the handover happens on a schedule you can predict to the second. The
+sustained bucket holds 60 tokens and refills at 60&nbsp;per&nbsp;minute, which is 1 per second. You
+are draining it at 5 per second. Net drain is 4 per second, so it hits zero after exactly
+15&nbsp;seconds, and from then on the gateway admits precisely 1 request per second forever.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Two token bucket levels over thirty seconds: the burst bucket sawtooths between full and empty every second while the sustained bucket drains linearly to zero at fifteen seconds and then stays empty">
+  <text class="lbl-b" x="14" y="20">Free plan under a steady 5 req/s: burst 5 tokens refilling 5/s, sustained 60 tokens refilling 1/s</text>
+
+  <line class="edge" x1="70" y1="60" x2="70" y2="258"/>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="70" y1="258" x2="800" y2="258" marker-end="url(#p22-ar1)"/>
+  </g>
+  <text class="lbl-s" x="64" y="74" text-anchor="end">full</text>
+  <text class="lbl-s" x="64" y="254" text-anchor="end">empty</text>
+  <text class="lbl-s" x="70" y="274">t=0</text>
+  <text class="lbl-s" x="430" y="274" text-anchor="middle">t=15s</text>
+  <text class="lbl-s" x="790" y="274" text-anchor="end">t=30s</text>
+
+  <line class="dash" x1="430" y1="60" x2="430" y2="258"/>
+
+  <polyline class="edge-a" fill="none" points="70,70 70,250 94,70 94,250 118,70 118,250 142,70 142,250 166,70 166,250 190,70 190,250 214,70 214,250 238,70 238,250 262,70 262,250 286,70 286,250 310,70 310,250 334,70 334,250 358,70 358,250 382,70 382,250 406,70 406,250 430,70 454,88 478,70 502,88 526,70 550,88 574,70 598,88 622,70 646,88 670,70 694,88 718,70 742,88 766,70 790,70"/>
+
+  <g color="var(--ok)">
+    <polyline class="edge" fill="none" stroke-width="2" points="70,70 430,250 790,250"/>
+  </g>
+
+  <text class="lbl-b" x="86" y="46">burst tier</text>
+  <text class="lbl-s" x="86" y="60">drains in one instant, refills within the second</text>
+  <text class="lbl-b" x="440" y="120">sustained tier</text>
+  <text class="lbl-s" x="440" y="134">60 tokens, refilling 1/s, drained 5/s &rarr; empty at 15s</text>
+  <text class="lbl-s" x="440" y="150">from here the gateway admits exactly 1 req/s</text>
+  <text class="lbl-s" x="440" y="164">and X-RateLimit-Rule flips to &quot;sustained&quot;</text>
+  <text class="lbl-s" x="440" y="184">Retry-After goes from sub-second to multi-second</text>
+  <text class="lbl-s" x="440" y="198">&mdash; same 429, completely different advice.</text>
+
+  <text class="lbl-s" x="14" y="292">The burst tier shapes the instantaneous rate. The sustained tier caps the volume you actually sell. Neither alone can say both.</text>
+  <defs>
+    <marker id="p22-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The flip is not a threshold anyone coded. It falls out of the script reporting whichever
+tier is closest to exhaustion <em>as a fraction of its own capacity</em>.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">tokenbucket.lua &mdash; why the reported rule changes on its own<span class="lang">lua</span></div>
+<pre><code class="lang-lua">local idx = denied_index
+if idx == 0 then
+  -- Allowed: report the rule closest to exhaustion, measured as a FRACTION of
+  -- its own capacity. Comparing raw remaining counts would let a global tier of
+  -- 2000 always look "roomier" than a burst tier of 5 even when the burst tier
+  -- is the one about to reject the next request.
+  local worst = nil
+  idx = 1
+  for i = 1, n do
+    local fraction = tokens[i] / caps[i]
+    if worst == nil or fraction &lt; worst then
+      worst = fraction
+      idx = i
+    end
+  end
+end</code></pre>
+</div>
+
+<p>Run the same 5&nbsp;rps for 30 seconds under the other algorithm and the shape changes. Set
+<code>GATEWAY_LIMITER_ALGORITHM=sliding_window</code>, let the client idle for a full window first,
+then burst: the token bucket hands you all five instantly because it <em>banked</em> the idle time,
+while the sliding window counter banks nothing and holds you near a smooth rate. That difference is
+the entire reason both are in the repository.</p>
+
+<div class="codewrap">
+<div class="codehead">the algorithm swap<span class="lang">bash</span></div>
+<pre><code class="lang-bash">GATEWAY_LIMITER_ALGORITHM=sliding_window go run ./cmd/gateway
+
+# then re-run the ten-request burst above and compare the 200/429 split.
+# token_bucket   : idle time is credit. Five instantly, then trickle.
+# sliding_window : estimate = prev_count * (1 - elapsed/window) + current_count
+#                  no credit accrues, and the fixed-window boundary doubling
+#                  (limit at 0.999s + limit at 1.001s) cannot happen.</code></pre>
+</div>
+
+<h2>Inspecting limiter state in Redis</h2>
+
+<p>Every bucket is one hash with two fields: <code>t</code>, the token level as a decimal string,
+and <code>ts</code>, the millisecond timestamp at which that level was accurate. There is no
+background refill job, so what you read is the level as of the last <em>allowed</em> request &mdash;
+the current level is that plus elapsed time times the refill rate, computed on the next call.</p>
+
+<div class="codewrap">
+<div class="codehead">poking at the buckets<span class="lang">bash</span></div>
+<pre><code class="lang-bash">R="docker compose exec -T redis redis-cli"
+
+# Keys are rl:{t:&lt;tenant&gt;}:&lt;rule&gt;. The braces are the Redis Cluster hash tag, so
+# a tenant's tiers always share a slot and one script can touch them all.
+$R --scan --pattern 'rl:*'
+#   rl:{t:acme-free}:burst
+#   rl:{t:acme-free}:sustained
+#   rl:{g}:global
+
+$R HGETALL 'rl:{t:acme-free}:burst'
+#   t   0.482000        &lt;- fractional tokens; rounding these away would drift the limit
+#   ts  1756800123456   &lt;- when t was accurate
+
+$R PTTL 'rl:{t:acme-free}:burst'       # ~2000  (1s window + 1s TTL_SLACK)
+$R PTTL 'rl:{t:acme-free}:sustained'   # ~61000 (60s window + 1s TTL_SLACK)
+
+# Watch the script run, one line per command. Never on a production instance:
+# MONITOR streams every command from every client and costs real throughput.
+$R MONITOR</code></pre>
+</div>
+
+<p>Two things are worth confirming with your own eyes here. First, <strong>a rejected request writes
+nothing</strong>: hammer a drained bucket and <code>ts</code> does not move. That is the difference
+between a limiter that protects Redis and one that melts under the traffic it was installed to
+survive. Second, <strong>the keys expire</strong>: leave a tenant idle for two seconds and its burst
+key is gone, which bounds Redis memory to the number of <em>active</em> tenants rather than the
+number ever seen. A missing key means "start full", which is correct &mdash; a bucket that expired
+has necessarily been idle for at least one full window, which is exactly how long it takes to
+refill anyway.</p>
+
+<div class="box gotcha">
+  <span class="bt"><code>KEYS *</code> on a limiter is how you turn a rate-limit outage into a Redis outage</span>
+  <p><code>KEYS</code> is O(N) over the entire keyspace and Redis executes it on the single command
+  thread, so on a keyspace holding one hash per active tenant it blocks every other client &mdash;
+  including every gateway replica's <code>EVALSHA</code>, on every request. Under
+  <code>GATEWAY_LIMITER_TIMEOUT=150ms</code> that is a fail-open storm triggered by your own
+  debugging. Use <code>--scan</code>, which is cursor-based and cooperative, every single time.</p>
+</div>
+
+<h2>Driving load: hey, vegeta, and which one lies to you</h2>
+
+<p>The two drivers are not interchangeable, and for rate-limit work the difference decides whether
+your numbers mean anything. <code>hey -c 50</code> keeps 50 requests <em>in flight</em>: a
+closed-loop generator. When the gateway starts returning fast 429s, the offered load silently
+rises, because rejections are cheap and the tool immediately sends more. It cannot answer "what
+happens at exactly 200&nbsp;rps", because it never actually offers 200&nbsp;rps. Vegeta's
+<code>-rate</code> is open-loop &mdash; it sends what you asked for regardless of how fast answers
+come back, which is how real clients behave.</p>
+
+<div class="codewrap">
+<div class="codehead">scenario 1: does the limit actually hold?<span class="lang">bash</span></div>
+<pre><code class="lang-bash">go install github.com/tsenart/vegeta@latest
+
+echo "GET http://localhost:28080/alpha/json" \
+  | vegeta attack -rate=200 -duration=60s \
+      -header "X-API-Key: demo-pro-key" \
+  | tee results.bin \
+  | vegeta report</code></pre>
+</div>
+
+<p>The pro plan is 50/s burst and 3000/min sustained, so a 60-second run at 200&nbsp;rps offers
+12,000 requests and should admit roughly 3,050 &mdash; the 3,000 sustained tokens plus the ~50 the
+burst bucket started full with. Divide the <code>200:</code> count by 60. If it lands within a
+percent or two of 50/s the limiter is atomic. <strong>If it is meaningfully higher, it is not</strong>,
+and that is the single most important number on this page: a check-and-consume split across a
+network round trip admits more than its limit only under concurrency, which is precisely when the
+limit matters.</p>
+
+<div class="codewrap">
+<div class="codehead">what a healthy run looks like<span class="lang">text</span></div>
+<pre><code class="lang-text">Requests      [total, rate, throughput]  12000, 200.02, 50.81
+Latencies     [mean, p50, p95, p99, max]  1.31ms, 0.9ms, 2.8ms, 6.1ms, 41ms
+Status Codes  [code:count]                200:3050  429:8950
+
+# 3050 / 60 = 50.8 admitted per second, against a 50/s sustained-equivalent budget.
+# The 429s must be dramatically CHEAPER than the 200s -- they are the response you
+# serve most of during an incident. If they are not, work is happening before the
+# limiter that belongs after it: check internal/middleware/chain.go.</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">hey, and the trap it sets<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make load     # hey -z 30s -c 50 -H "X-API-Key: demo-pro-key" http://localhost:28080/alpha/json
+
+# hey will happily report 4000+ req/s here and it is not a throughput number:
+# it is a measurement of how fast the gateway can say no. If reported throughput
+# RISES as the error rate rises, you are in the closed-loop trap. Use it for
+# "can the proxy path sustain load", never for "does the limit hold".</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The global tier will bite you at laptop scale and look like a per-tenant bug</span>
+  <p><code>GATEWAY_LIMITER_GLOBAL_LIMIT</code> defaults to 2000 per second across <em>all</em>
+  tenants, and it is deliberately small so it is reachable from one machine. Drive two vegeta
+  attacks at 1500&nbsp;rps each and you will see 429s on the enterprise key that is entitled to
+  500/s and nowhere near it &mdash; because the fleet-wide ceiling bound first.
+  <code>X-RateLimit-Rule: global</code> is the only thing that tells you so. Before concluding the
+  per-tenant maths is wrong, check that header and
+  <code>gateway_ratelimit_decisions_total{rule="global"}</code>.</p>
+</div>
+
+<h2>Watching the metrics</h2>
+
+<div class="codewrap">
+<div class="codehead">the gateway's own series, runtime noise filtered out<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make metrics     # curl -s localhost:29090/metrics | grep -E '^gateway_' | grep -v '^#'
+
+watch -n1 'curl -s localhost:29090/metrics | grep -E "^gateway_(ratelimit|breaker|upstream_retries)"'</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">a scrape mid-incident<span class="lang">text</span></div>
+<pre><code class="lang-text">gateway_ratelimit_decisions_total{decision="allowed",plan="free",rule="burst"} 13
+gateway_ratelimit_decisions_total{decision="limited",plan="free",rule="burst"} 5
+gateway_upstream_breaker_state{upstream="alpha"} 0
+gateway_upstream_retries_total{reason="status_503",upstream="alpha"} 40</code></pre>
+</div>
+
+<p>That last number ties out exactly, and checking that it does is a good habit: 20 requests reached
+alpha before the breaker opened, each was retried twice, and
+<code>GATEWAY_UPSTREAM_MAX_RETRIES=2</code>. 20&nbsp;&times;&nbsp;2&nbsp;=&nbsp;40. When a counter
+does not tie out against a mechanism you can count by hand, the instrumentation is wrong, and an
+instrument you cannot trust is worse than none.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Series</th><th>Labels</th><th>What it answers</th><th>Alert on</th></tr></thead>
+<tbody>
+<tr><td><code>gateway_ratelimit_decisions_total</code></td><td><code>plan</code>, <code>rule</code>, <code>decision</code></td><td>Which tier is actually rejecting people, per plan</td><td>A sudden move of <code>rule</code> from <code>burst</code> to <code>sustained</code> &mdash; a client changed shape</td></tr>
+<tr><td><code>gateway_ratelimit_errors_total</code></td><td><code>mode</code></td><td>The limiter itself broke and a fail policy was applied</td><td><strong>Any non-zero rate.</strong> This is the only signal that fail-open is happening</td></tr>
+<tr><td><code>gateway_upstream_breaker_state</code></td><td><code>upstream</code></td><td>0 closed &middot; 1 half_open &middot; 2 open, sampled by a <code>GaugeFunc</code></td><td><code>&gt; 0</code> for longer than one reset timeout</td></tr>
+<tr><td><code>gateway_breaker_transitions_total</code></td><td><code>upstream</code>, target state</td><td>Flapping &mdash; a gauge at 0 hides a breaker that opened and closed forty times</td><td>Transition rate, not state</td></tr>
+<tr><td><code>gateway_upstream_retries_total</code></td><td><code>upstream</code>, <code>reason</code></td><td>Retry amplification, by cause</td><td>Climbing while a breaker is open &mdash; means the breaker is inside the retry loop</td></tr>
+<tr><td><code>gateway_http_requests_in_flight</code></td><td>none</td><td>Whether the connection pool is coping</td><td>Sawtoothing rather than stable</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="bt">Cardinality is a design decision, not an afterthought</span>
+  <p>Every label combination is a separate time series held in memory in this process and forever in
+  your TSDB. This project labels by <em>route</em> (bounded by the number of upstreams), never by URL
+  path; by <em>plan</em> (three values), never by tenant id; never by request id. Adding
+  <code>tenant</code> to <code>gateway_ratelimit_decisions_total</code> looks like a five-character
+  change and multiplies your series count by your customer count &mdash; see exercise 9 for the way
+  to get that data without paying for it.</p>
+</div>
+
+<h2>Deliberately breaking Redis</h2>
+
+<p>The fail-open/fail-closed flag is the one genuinely unresolved decision in the system, and the
+only way to have an opinion about it is to watch both modes. There are two ways to break Redis and
+they produce <em>different failure shapes</em> through the same policy &mdash; which is why you
+should run both.</p>
+
+<div class="codewrap">
+<div class="codehead">two different Redis failures<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># (a) STOP: connection refused. The limiter fails in microseconds.
+docker compose stop redis
+curl -s -o /dev/null -w '%{http_code} %{time_total}\n' \
+  -H 'X-API-Key: demo-free-key' http://localhost:28080/alpha/json
+#   200 0.003     &lt;- fail_open: forwarded, unlimited, in 3ms
+
+# (b) PAUSE: the socket stays open and nothing ever answers. SIGSTOP on the
+#     container process, so every limiter call burns the FULL timeout.
+docker unpause rlg-redis 2&gt;/dev/null; docker compose start redis
+docker pause rlg-redis
+curl -s -o /dev/null -w '%{http_code} %{time_total}\n' \
+  -H 'X-API-Key: demo-free-key' http://localhost:28080/alpha/json
+#   200 0.153     &lt;- GATEWAY_LIMITER_TIMEOUT=150ms, paid on EVERY request
+
+docker unpause rlg-redis</code></pre>
+</div>
+
+<p>Case (b) is the one that actually happens in production &mdash; a Redis under memory pressure,
+a network partition, a node being cordoned &mdash; and it is far worse than case (a), because
+fail-open now costs 150&nbsp;ms of added latency on every single request rather than nothing. That
+is what <code>GATEWAY_LIMITER_TIMEOUT</code> is buying: a bounded amount of damage. The middleware
+applies it itself rather than delegating to the Redis client, so the trade-off is visible at the
+point where it is made.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Flow of a request when the limiter call fails, branching into the fail-open path which forwards the request and the fail-closed path which returns 503, with the consequences for readyz, metrics and startup listed under each">
+  <text class="lbl-b" x="14" y="20">One error, two policies &mdash; and the flag governs startup, runtime and readiness identically</text>
+
+  <rect class="node" x="14" y="44" width="130" height="48" rx="7"/>
+  <text class="lbl-b" x="79" y="66" text-anchor="middle">request</text>
+  <text class="mono"  x="79" y="83" text-anchor="middle">X-API-Key</text>
+
+  <rect class="node-a" x="178" y="44" width="160" height="48" rx="7"/>
+  <text class="lbl-b" x="258" y="66" text-anchor="middle">RateLimit</text>
+  <text class="mono"  x="258" y="83" text-anchor="middle">Limiter.Allow(ctx)</text>
+
+  <rect class="node-d" x="372" y="44" width="170" height="48" rx="7"/>
+  <text class="lbl-b" x="457" y="66" text-anchor="middle">err != nil</text>
+  <text class="lbl-s" x="457" y="83" text-anchor="middle">refused, or 150ms deadline</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="146" y1="68" x2="174" y2="68" marker-end="url(#p22-ar2)"/>
+    <line class="edge" x1="340" y1="68" x2="368" y2="68" marker-end="url(#p22-ar3)"/>
+  </g>
+
+  <rect class="node-w" x="576" y="20" width="230" height="46" rx="7"/>
+  <text class="lbl-b" x="691" y="40" text-anchor="middle">FailOpen = true (default)</text>
+  <text class="mono"  x="691" y="57" text-anchor="middle">next.ServeHTTP(w, r)</text>
+
+  <rect class="node-i" x="576" y="80" width="230" height="46" rx="7"/>
+  <text class="lbl-b" x="691" y="100" text-anchor="middle">FailOpen = false</text>
+  <text class="mono"  x="691" y="117" text-anchor="middle">503 limiter_unavailable</text>
+
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 544 62 C 560 62 560 44 572 44" marker-end="url(#p22-ar4)"/>
+    <path class="edge-a" d="M 544 76 C 560 76 560 102 572 102" marker-end="url(#p22-ar5)"/>
+  </g>
+
+  <text class="lbl-b" x="576" y="152">fail open</text>
+  <text class="lbl-s" x="576" y="170">request forwarded, UNLIMITED</text>
+  <text class="lbl-s" x="576" y="186">/readyz  200 ready (degraded)</text>
+  <text class="lbl-s" x="576" y="202">startup  boots with a warning</text>
+  <text class="lbl-s" x="576" y="218">metric   errors_total{mode="fail_open"}</text>
+
+  <text class="lbl-b" x="180" y="152">fail closed</text>
+  <text class="lbl-s" x="180" y="170">request NOT forwarded, Retry-After: 1</text>
+  <text class="lbl-s" x="180" y="186">/readyz  503 not ready &rarr; LB drains it</text>
+  <text class="lbl-s" x="180" y="202">startup  REFUSES to boot</text>
+  <text class="lbl-s" x="180" y="218">metric   errors_total{mode="fail_closed"}</text>
+
+  <rect class="node-d" x="14" y="240" width="792" height="44" rx="7"/>
+  <text class="lbl-b" x="410" y="260" text-anchor="middle">Both modes log at ERROR. Fail-open is the dangerous one PRECISELY because nothing else changes.</text>
+  <text class="lbl-s" x="410" y="276" text-anchor="middle">Traffic flows, nothing 500s, no dashboard turns red &mdash; the log line and that counter are the only evidence your limits stopped existing.</text>
+  <defs>
+    <marker id="p22-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Fail-closed trades availability for correctness and announces itself. Fail-open trades
+correctness for availability and says nothing &mdash; so the alert is not optional, it is the
+control.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">the same flag, at startup<span class="lang">go</span></div>
+<pre><code class="lang-go">// Connectivity is checked at startup rather than discovered on the first
+// request. Which way a failure here is fatal depends on the SAME policy the
+// limiter uses at runtime -- it would be incoherent to refuse to boot when
+// Redis is down and then fail open once running, or vice versa.
+switch {
+case pingErr != nil &amp;&amp; !cfg.Limiter.FailOpen:
+	return fmt.Errorf("redis unreachable at %s and the limiter is configured fail-closed: %w",
+		cfg.Redis.Addr, pingErr)
+case pingErr != nil:
+	logger.Warn("redis unreachable at startup; the limiter will fail open until it recovers",
+		slog.String("addr", cfg.Redis.Addr),
+		slog.String("error", pingErr.Error()),
+	)</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">run both modes against the same outage<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker compose stop redis
+
+# fail open (default): 200s keep flowing, unlimited
+curl -s localhost:29090/readyz            # 200  ready (degraded) ... mode: fail_open
+curl -s localhost:29090/metrics | grep ratelimit_errors
+#   gateway_ratelimit_errors_total{mode="fail_open"} 412
+
+# fail closed: nothing is forwarded, and the replica takes itself out of rotation
+GATEWAY_LIMITER_FAIL_OPEN=false go run ./cmd/gateway
+#   Error: redis unreachable at 127.0.0.1:26379 and the limiter is
+#   configured fail-closed: dial tcp ...: connect: connection refused
+
+docker compose start redis
+GATEWAY_LIMITER_FAIL_OPEN=false go run ./cmd/gateway   # now it boots
+docker compose stop redis
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-API-Key: demo-free-key' \
+  http://localhost:28080/alpha/json                     # 503 limiter_unavailable
+curl -s localhost:29090/readyz                          # 503 not ready ... mode: fail_closed</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Liveness must not check Redis &mdash; readiness must</span>
+  <p><code>/healthz</code> deliberately checks nothing. A liveness probe that fails when Redis is
+  down makes Kubernetes kill and restart <em>every</em> gateway replica during a Redis outage,
+  turning a degraded system into a crash loop at exactly the moment you need the gateway to keep
+  serving. <code>/readyz</code> does ping Redis, and answers differently per mode: fail-open stays
+  <code>200 ready (degraded)</code> because the replica can still proxy correctly; fail-closed
+  returns 503 so a load balancer drains it. Wiring both probes to the same handler is one of the
+  most common and most expensive Kubernetes mistakes.</p>
+</div>
+
+<h3>Recovery, and the <code>NOSCRIPT</code> path</h3>
+
+<p>Bring Redis back and there should be no error spike at all &mdash; but the first request pays for
+something. Redis's script cache is not persistent: it is emptied by a restart, by
+<code>SCRIPT FLUSH</code>, and, the case that bites people years into a deployment, by failing over
+to a replica that never saw the script. You can trigger it on demand, which is a far better test
+than waiting for a failover:</p>
+
+<div class="codewrap">
+<div class="codehead">forcing the cold-cache path<span class="lang">bash</span></div>
+<pre><code class="lang-bash">R="docker compose exec -T redis redis-cli"
+
+$R CONFIG RESETSTAT
+$R SCRIPT FLUSH                     # every EVALSHA now returns NOSCRIPT
+
+curl -s -o /dev/null -H 'X-API-Key: demo-free-key' http://localhost:28080/alpha/json
+curl -s -o /dev/null -H 'X-API-Key: demo-free-key' http://localhost:28080/alpha/json
+
+$R INFO commandstats | grep -E 'cmdstat_(eval|evalsha)'
+#   cmdstat_eval:calls=1,...        &lt;- one full script body, sent once
+#   cmdstat_evalsha:calls=2,...     &lt;- the failed attempt, then the hit
+# No errors reached the client. That is the fallback doing its job.</code></pre>
+</div>
+
+<h2>Deliberately breaking an upstream</h2>
+
+<p>The test upstream can be told to fail or stall at runtime, with no restart. That is what makes
+the circuit breaker observable rather than a thing you take on faith.</p>
+
+<div class="codewrap">
+<div class="codehead">the fault injector<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -X PUT 'http://localhost:28081/control?fail_ratio=0.3'         # 30% of requests fail
+curl -X PUT 'http://localhost:28081/control?fail_ratio=1&amp;fail_code=503'
+curl -X PUT 'http://localhost:28081/control?delay=2s'               # add 2s latency
+curl -X PUT 'http://localhost:28081/control?fail_ratio=0&amp;delay=0'   # heal
+curl -s http://localhost:28081/control                              # settings + request count</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">open it, then watch it recover<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -X PUT 'http://localhost:28081/control?fail_ratio=1&amp;fail_code=503'
+
+URLS=$(for i in $(seq 1 30); do printf 'http://localhost:28080/alpha/json '; done)
+curl -s -o /dev/null -H 'X-API-Key: demo-enterprise-key' -w '%{http_code} ' $URLS
+#   503 503 503 ... (the upstream's OWN answer) ... then upstream_unavailable
+
+make breakers
+#   alpha	state=open	requests=0	failures=0	successes=0
+#   beta	state=closed	requests=1	failures=0	successes=1
+
+curl -X PUT 'http://localhost:28081/control?fail_ratio=0'
+sleep 11                                    # the 10s reset timeout
+curl -s http://localhost:29090/breakers      # -&gt; half_open
+curl -s -o /dev/null -H 'X-API-Key: demo-enterprise-key' -w '%{http_code} ' \
+  http://localhost:28080/alpha/json http://localhost:28080/alpha/json http://localhost:28080/alpha/json
+curl -s http://localhost:29090/breakers      # -&gt; closed, after 3 consecutive probe successes</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 288" role="img" aria-label="Circuit breaker state machine showing closed, open and half-open with the configured thresholds on each transition and the observable gauge value and breakers output for each state">
+  <text class="lbl-b" x="14" y="20">Three states, four transitions, and what each one looks like from outside the process</text>
+
+  <rect class="node-o" x="24" y="46" width="200" height="66" rx="8"/>
+  <text class="lbl-b" x="124" y="70" text-anchor="middle">CLOSED</text>
+  <text class="lbl-s" x="124" y="87" text-anchor="middle">traffic flows, outcomes counted</text>
+  <text class="mono"  x="124" y="104" text-anchor="middle">breaker_state 0</text>
+
+  <rect class="node-d" x="596" y="46" width="200" height="66" rx="8"/>
+  <text class="lbl-b" x="696" y="70" text-anchor="middle">OPEN</text>
+  <text class="lbl-s" x="696" y="87" text-anchor="middle">503 upstream_unavailable, fn not called</text>
+  <text class="mono"  x="696" y="104" text-anchor="middle">breaker_state 2</text>
+
+  <rect class="node-w" x="310" y="192" width="200" height="66" rx="8"/>
+  <text class="lbl-b" x="410" y="216" text-anchor="middle">HALF-OPEN</text>
+  <text class="lbl-s" x="410" y="233" text-anchor="middle">at most 5 concurrent probes</text>
+  <text class="mono"  x="410" y="250" text-anchor="middle">breaker_state 1</text>
+
+  <g color="var(--dang)">
+    <line class="edge" x1="228" y1="66" x2="592" y2="66" marker-end="url(#p22-ar6)"/>
+  </g>
+  <text class="lbl-s" x="410" y="52" text-anchor="middle">failures/requests &ge; 0.5 with &ge; 20 requests in the 30s rolling window</text>
+  <text class="lbl-s" x="410" y="82" text-anchor="middle">the volume threshold is what makes the ratio mean anything</text>
+
+  <g color="var(--border-strong)">
+    <path class="edge" d="M 696 116 C 696 170 560 200 514 214" marker-end="url(#p22-ar7)"/>
+  </g>
+  <text class="lbl-s" x="600" y="168">reset timeout 10s elapsed</text>
+  <text class="lbl-s" x="600" y="182">(applied lazily, on the next State() call)</text>
+
+  <g color="var(--ok)">
+    <path class="edge" d="M 306 214 C 200 200 124 170 124 118" marker-end="url(#p22-ar8)"/>
+  </g>
+  <text class="lbl-s" x="94" y="168" text-anchor="end">3 consecutive</text>
+  <text class="lbl-s" x="94" y="182" text-anchor="end">probe successes</text>
+
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 512 226 C 620 226 700 180 700 120" marker-end="url(#p22-ar9)"/>
+  </g>
+  <text class="lbl-s" x="536" y="264">ONE failed probe &rarr; OPEN again, for a FULL reset timeout</text>
+
+  <text class="lbl-s" x="24" y="140">A result that started in one state cannot be counted in another:</text>
+  <text class="lbl-s" x="24" y="154">every transition bumps a generation counter, and a late reply</text>
+  <text class="lbl-s" x="24" y="168">whose generation no longer matches is dropped, not applied.</text>
+  <defs>
+    <marker id="p22-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p22-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Beta never moves while alpha does this. Breakers, connection pools and timeouts are all
+per-upstream, so one sick service cannot take out a healthy one &mdash; that isolation is the reason
+there are two upstreams in the compose file at all.</figcaption>
+</figure>
+
+<div class="box gotcha">
+  <span class="bt">Trickle traffic will never trip the breaker, and it is not broken</span>
+  <p><code>GATEWAY_BREAKER_ROLLING_WINDOW</code> is 30&nbsp;s and the volume threshold is 20. Send
+  failing requests by hand at one per second and the closed-state counters reset before they ever
+  reach 20, so the ratio is never consulted and the breaker sits at <code>closed</code> forever
+  while every request 503s. That is correct behaviour &mdash; without the volume threshold the first
+  failed request of a quiet minute is a 100&nbsp;% failure ratio &mdash; but it means the breaker
+  demo needs <em>burst</em> traffic. Use the 30-URL curl above or a vegeta run, not a
+  <code>sleep 1</code> loop.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">why the client sees the upstream's 503, not a synthetic 502<span class="lang">go</span></div>
+<pre><code class="lang-go">	if err != nil {
+		if resp != nil {
+			// We have a real response (a 5xx). The breaker has recorded the
+			// failure; the client still gets the upstream's own answer, which is
+			// far more useful than a synthetic 502.
+			return resp, nil
+		}
+		return nil, err
+	}</code></pre>
+</div>
+
+<h3>Retry amplification and the 504/502 split</h3>
+
+<div class="codewrap">
+<div class="codehead">scenario 7: a slow upstream, and what your retries do to it<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -X PUT 'http://localhost:28081/control?delay=4s'      # under the 5s budget, over the 3s header timeout
+
+echo "GET http://localhost:28080/alpha/json" \
+  | vegeta attack -rate=50 -duration=30s -timeout=10s \
+    -header "X-API-Key: demo-enterprise-key" \
+  | vegeta report
+
+curl -s localhost:28081/control | jq .requests
+#   With MAX_RETRIES=2, 50 rps of failing requests becomes up to 150 rps at the
+#   upstream: you are hitting a struggling service three times harder than the
+#   client is hitting you. Re-run with GATEWAY_UPSTREAM_MAX_RETRIES=0 and watch
+#   this counter drop by two thirds.</code></pre>
+</div>
+
+<p>The status codes are load-bearing. 504 means "we tried and ran out of time" &mdash; retrying may
+help. 502 means "the conversation failed" &mdash; it may not. 503 with
+<code>upstream_unavailable</code> means the breaker refused and we never tried at all. A gateway
+that answers 502 for everything teaches its clients to retry things that will never succeed, and
+teaches its load balancer nothing. The same reasoning governs which upstream statuses are worth
+another attempt:</p>
+
+<div class="codewrap">
+<div class="codehead">proxy.go &mdash; the retry classifier<span class="lang">go</span></div>
+<pre><code class="lang-go">	switch resp.StatusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		// These three mean "the upstream infrastructure could not serve this",
+		// which is exactly the transient class worth another try.
+		//
+		// 500 is deliberately NOT retried: it usually means the application
+		// threw, and re-sending the same request reproduces the same exception
+		// while doubling the load. 429 is not retried either -- the upstream has
+		// explicitly asked us to slow down.
+		return "status_" + strconv.Itoa(resp.StatusCode), true
+	default:
+		return "", false
+	}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Prove that POST is never retried &mdash; do not assume it</span>
+  <p>Set <code>fail_ratio=1</code> and send 1,000 POSTs to <code>/alpha/anything</code>. The
+  upstream's own request counter must equal 1,000, <strong>not</strong> 3,000. Repeat with GET and
+  watch it triple. Retrying a POST is how one "create order" click becomes three orders, and the
+  guard is two conditions that must both hold &mdash; <code>isIdempotent(req.Method)</code> and
+  <code>bodyIsReplayable(req)</code>. A body over
+  <code>GATEWAY_UPSTREAM_MAX_RETRY_BODY_BYTES</code> (64&nbsp;KiB) is forwarded once and never
+  retried at all, because buffering unbounded uploads is how a proxy runs out of memory.</p>
+</div>
+
+<h2>The tests, and the one that matters</h2>
+
+<div class="codewrap">
+<div class="codehead">no Docker required<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test      # go test -race -count=1 ./...
+make bench     # go test -run='^$' -bench=. -benchmem ./internal/limiter/...
+make lint      # gofmt + go vet (+ golangci-lint if installed)</code></pre>
+</div>
+
+<p>Tests run against miniredis, which executes the real <code>.lua</code> through a Lua interpreter
+in-process &mdash; so the script under test is byte-for-byte the script that ships.
+<code>-race</code> is not optional: the limiter's entire reason for existing in Lua is concurrency
+correctness and the breaker is mutex-protected shared state, so a suite that never runs under
+<code>-race</code> does not test either claim. <code>-count=1</code> defeats Go's test result cache,
+which otherwise makes <code>make test</code> a very fast way to learn nothing.</p>
+
+<div class="codewrap">
+<div class="codehead">the assertion that justifies the whole design<span class="lang">go</span></div>
+<pre><code class="lang-go">	if got := allowed.Load(); got != capacity {
+		t.Fatalf("granted %d requests out of %d attempts, want exactly %d; "+
+			"a count above the capacity means the check-and-consume was not atomic",
+			got, goroutines*attemptsPerWorker, capacity)
+	}</code></pre>
+</div>
+
+<p>Fifty goroutines make 500 attempts against a 100-token bucket and exactly 100 are granted. A
+naive Go-side <code>GET</code>/compute/<code>SET</code> limiter passes every sequential test in the
+file and fails this one &mdash; and it fails it in production as <em>"our 100/s limit somehow lets
+through 140/s, but only when we're busy."</em> <code>make bench</code> makes the other structural
+claim measurable: three tiers cost roughly 15&ndash;20&nbsp;% more than one, not 3&times;, because
+they are one round trip and not three.</p>
+
+<h2>Exercises</h2>
+
+<p>Roughly in order of difficulty. Each one has an observable success condition &mdash; a test that
+should fail, a header that should change, a metric that should move. Write the check first.</p>
+
+<ol>
+  <li><strong>Add a leaky bucket as a third algorithm.</strong> Write <code>leakybucket.lua</code>
+  and a <code>LeakyBucket</code> type over the existing <code>redisLimiter</code>; it should be
+  ~15 lines of Go, because the marshalling layer is already shared. The bucket holds queued work
+  that drains at a fixed rate, so it admits at a perfectly constant rate and grants <em>no</em>
+  burst credit at all &mdash; a client that idles for an hour still gets one request per interval.
+  Add it to <code>TestBothAlgorithmsHonourTheSameContract</code>. The interesting part is
+  <code>RetryAfter</code>: for a leaky bucket it is the queue's drain time, which is a genuinely
+  more useful number than the token bucket's.</li>
+
+  <li><strong>Per-endpoint limits.</strong> Today the key is <code>{t:&lt;tenant&gt;}:burst</code>,
+  so one expensive endpoint can consume a tenant's entire budget. Add a fourth rule keyed
+  <code>{t:&lt;tenant&gt;}:route:&lt;route&gt;</code> with limits from a small route table. Two traps:
+  the route is only known after the registry matches, but rate limiting deliberately runs
+  <em>before</em> routing &mdash; so you need a lightweight prefix matcher ahead of the limiter, and
+  you must keep the new key inside the tenant's hash tag or the script becomes
+  <code>CROSSSLOT</code> on a cluster.</li>
+
+  <li><strong>A distributed monthly quota.</strong> Add a fourth tier with a 30-day window &mdash;
+  say 1,000,000 requests per month. Three things break immediately: the <code>PEXPIRE</code> now
+  keeps a key alive for a month per tenant (memory is no longer bounded by activity), a bucket that
+  expires or is LRU-evicted silently refunds a customer their entire monthly quota, and
+  <code>allkeys-lru</code> in <code>docker-compose.yml</code> is now actively wrong. Decide whether
+  a quota belongs in a limiter at all, or in the billing system with the limiter merely reading it.
+  Write down the answer &mdash; this is the exercise about knowing which tool a problem belongs to.</li>
+
+  <li><strong>Request coalescing with <code>singleflight</code>.</strong> Add
+  <code>golang.org/x/sync/singleflight</code> to the proxy so that N concurrent identical GETs to
+  the same upstream path become one upstream request whose response is shared. Measure it: set
+  <code>delay=2s</code> on alpha, fire 100 concurrent identical GETs, and check
+  <code>curl localhost:28081/control | jq .requests</code> went up by 1 and not 100. Then find the
+  hazards &mdash; the shared <code>*http.Response</code> body can only be read once (buffer it, and
+  now you need a size cap), and coalescing requests from <em>different tenants</em> means one
+  tenant's <code>Authorization</code> header serving another's request. Key the flight by the full
+  identity, not the URL.</li>
+
+  <li><strong>Weighted routing.</strong> Extend <code>GATEWAY_UPSTREAMS</code> to accept several
+  targets per route with weights (<code>alpha|/alpha|http://a:8080=80,http://b:8080=20</code>) and
+  pick per request. Each target still needs its own transport, pool and breaker &mdash; that is the
+  whole point &mdash; so the registry now owns a slice per route rather than one handler. Then make
+  it useful: skip targets whose breaker is open and renormalise the weights, so a canary that starts
+  failing sheds its traffic automatically instead of failing 20&nbsp;% of requests.</li>
+
+  <li><strong>mTLS to the upstreams.</strong> <code>proxy.New</code> already builds a dedicated
+  <code>http.Transport</code> per upstream, so this is a <code>TLSClientConfig</code> with a client
+  certificate and a <code>RootCAs</code> pool &mdash; and then all the real work: certificate
+  rotation without a restart (use <code>tls.Config.GetClientCertificate</code>, not
+  <code>Certificates</code>, so a reload is a pointer swap), verifying the upstream's identity rather
+  than setting <code>InsecureSkipVerify</code>, and confirming that
+  <code>ForceAttemptHTTP2</code> still negotiates h2 over your new config. Check the handshake cost
+  lands in <code>gateway_http_request_duration_seconds</code> only once per connection &mdash; if it
+  is per request, your pool is not being reused and <code>MaxIdleConnsPerHost</code> is the reason.</li>
+
+  <li><strong>Replace the Lua script with a Redis Function.</strong> Redis 8 supports
+  <code>FUNCTION LOAD</code> and <code>FCALL</code>: register the limiter as a named function in a
+  library, and call it by name instead of by SHA1. The payoff is that functions are part of the
+  keyspace &mdash; they survive restarts and replicate to replicas &mdash; so the entire
+  <code>NOSCRIPT</code> fallback and its digest bookkeeping disappear. Delete
+  <code>luaScript</code> and watch <code>TestColdScriptCacheFallsBackToEval</code> stop making sense;
+  replace it with a test that <code>FUNCTION FLUSH</code> is a deployment operation you must
+  handle, because it is now a much sharper edge.</li>
+
+  <li><strong>Adaptive limits driven by upstream latency.</strong> Feed the p99 from
+  <code>gateway_http_request_duration_seconds</code> back into the rate card: when an upstream's p99
+  crosses a threshold, scale every tenant's burst limit down by a factor, and restore it as latency
+  recovers. This is a control loop, so it needs everything control loops need &mdash; hysteresis so
+  it does not oscillate, a floor so you cannot throttle to zero, and a bound on how fast the limit
+  may change. Compare it honestly with the alternative you already have: the circuit breaker is a
+  cruder controller that is far harder to get catastrophically wrong. Decide when the extra
+  machinery is worth it.</li>
+
+  <li><strong>Per-tenant visibility without per-tenant cardinality.</strong> You want to know which
+  tenants are being limited; you cannot afford a <code>tenant</code> label. Keep a bounded
+  count-min-sketch or heavy-hitters structure in the middleware and export the top-N as a gauge you
+  recompute every 30 seconds, so the series count is N regardless of customer count.</li>
+
+  <li><strong>Give the breaker's 503 an honest <code>Retry-After</code>.</strong> It is currently
+  hard-coded to <code>5</code> while the reset timeout is configurable. Expose the breaker's
+  remaining time and use it. Then notice the leak you have created: telling every rejected client
+  the exact instant the breaker half-opens synchronises them all onto it, and the recovering
+  upstream is hit by a thundering herd on a timer. Add jitter, for the same reason the retry backoff
+  already has it.</li>
+
+  <li><strong>Shard the global tier.</strong> Split it into K counters keyed <code>{g:0}</code> …
+  <code>{g:K-1}</code> with <code>limit/K</code> each, so it can live on a Redis Cluster alongside
+  per-tenant keys. Then measure the fairness cost: a bursty client can exhaust one shard while the
+  others sit idle, so your effective global ceiling is somewhere between <code>limit/K</code> and
+  <code>limit</code> depending on how requests hash. Quantify it before you ship it.</li>
+</ol>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>Reproduce a burst from <strong>one</strong> curl process, not a shell loop. The free plan's
+  bucket refills a token every 200&nbsp;ms, which is faster than a process can start, so a loop of
+  ten <code>curl</code> invocations can pass all ten and convince you the limiter is broken.</li>
+  <li>Use vegeta, not <code>hey</code>, for anything about rate limits. A closed-loop generator
+  raises its offered load as rejections get cheap, so it measures how fast the gateway can say no
+  &mdash; it can never tell you what happens at exactly 200&nbsp;rps.</li>
+  <li>The number that validates the whole design is admitted-requests &divide; duration. If it is
+  meaningfully above the configured rate under concurrency, the check-and-consume was not atomic
+  &mdash; and that is invisible in every sequential test, including all of the ones that pass.</li>
+  <li>There are two ways Redis fails and they cost different amounts. <code>docker compose stop</code>
+  gives connection-refused in microseconds; <code>docker pause</code> gives a hang that burns the
+  full <code>GATEWAY_LIMITER_TIMEOUT=150ms</code> on every request. Test the second one &mdash; it is
+  the one production gives you.</li>
+  <li>Fail-open is invisible by construction: traffic flows, nothing 500s, no dashboard turns red.
+  <code>gateway_ratelimit_errors_total{mode="fail_open"}</code> and the matching ERROR log line are
+  the only evidence your rate limits stopped existing. Alerting on them is not monitoring hygiene,
+  it is the control itself.</li>
+  <li>A breaker needs volume before a ratio means anything, so it will not trip under hand-typed
+  traffic &mdash; 20 requests inside a 30-second rolling window, or nothing happens. And it must sit
+  <em>outside</em> the retry loop: retries climbing while the gauge reads open is the signature of
+  getting that backwards.</li>
+  <li>Every counter should tie out against something you can count by hand. 20 requests &times; 2
+  retries = <code>gateway_upstream_retries_total 40</code>. When the arithmetic stops working, trust
+  the mechanism and fix the instrument &mdash; an instrument you cannot trust is worse than none.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="02-implementation.html"><span class="lb">Previous</span>Implementation walkthrough</a>
+  <span class="xref"><span class="lb">Next</span>10 &middot; Projects</span>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CRDTs &amp; the convergence problem &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Real-time Collaborative Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>CRDTs &amp; the convergence problem</h1>
+<p class="lede">Why two people typing at the same position cannot be reconciled by timestamps, what
+algebraic property makes delivery order irrelevant, and how <code>src/crdt/rga.js</code> buys that
+property with one character identifier, one predecessor reference, one total order and a very large
+pile of tombstones.</p>
+
+<div class="meta">
+  <span class="tag v">Node 22</span>
+  <span class="tag v">WebSocket</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">crdt</span>
+</div>
+
+<h2>The problem: two carets, one position</h2>
+
+<p>Two browser tabs hold the same document. Neither holds a lock, neither asks permission, and each
+applies its own keystroke to the screen <em>before</em> the network sees it &mdash; that optimism is
+the entire user-visible reason for the architecture. The moment both users touch the same region,
+you have two divergent histories and no authority to arbitrate between them.</p>
+
+<p>The first instinct is a timestamp: last write wins. It does not survive contact with a text
+buffer, because the unit of a text edit is not a document, it is a <em>position</em>, and a position
+is not something you can overwrite. Discard one of two concurrent edits and you have not resolved a
+conflict, you have deleted a character the user watched themselves type.</p>
+
+<p>The second instinct is to ship the edit as an index &mdash; <code>insert "X" at 1</code>. That is
+worse, because it fails silently. An index is only meaningful relative to a document state, and by
+the time the op arrives the receiver's document is no longer in that state.</p>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="Two replicas holding the word cat apply an index-based insert and an index-based delete concurrently, exchange the operations, and end up with two different documents">
+  <text class="lbl-b" x="14" y="20">Both replicas hold the same three characters</text>
+  <rect class="node" x="330" y="30" width="150" height="34" rx="6"/>
+  <text class="mono" x="405" y="52" text-anchor="middle">"cat"</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="380" y1="64" x2="180" y2="98" marker-end="url(#p50-ar1)"/>
+    <line class="edge" x1="430" y1="64" x2="630" y2="98" marker-end="url(#p50-ar2)"/>
+  </g>
+
+  <rect class="node-i" x="40" y="104" width="280" height="46" rx="6"/>
+  <text class="lbl-b" x="180" y="123" text-anchor="middle">replica A &mdash; insert "X" at index 1</text>
+  <text class="mono"  x="180" y="141" text-anchor="middle">"cat" &rarr; "cXat"</text>
+
+  <rect class="node-i" x="490" y="104" width="280" height="46" rx="6"/>
+  <text class="lbl-b" x="630" y="123" text-anchor="middle">replica B &mdash; delete 1 at index 0</text>
+  <text class="mono"  x="630" y="141" text-anchor="middle">"cat" &rarr; "at"</text>
+
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 320 138 C 400 138 410 172 486 178" marker-end="url(#p50-ar3)"/>
+    <path class="edge-a" d="M 490 138 C 410 138 400 172 324 178" marker-end="url(#p50-ar4)"/>
+  </g>
+  <text class="lbl-s" x="405" y="150" text-anchor="middle">the two ops cross on the wire</text>
+
+  <rect class="node-d" x="40" y="182" width="280" height="46" rx="6"/>
+  <text class="lbl-b" x="180" y="201" text-anchor="middle">A applies "delete at 0"</text>
+  <text class="mono"  x="180" y="219" text-anchor="middle">"cXat" &rarr; "Xat"</text>
+
+  <rect class="node-d" x="490" y="182" width="280" height="46" rx="6"/>
+  <text class="lbl-b" x="630" y="201" text-anchor="middle">B applies "insert X at 1"</text>
+  <text class="mono"  x="630" y="219" text-anchor="middle">"at" &rarr; "aXt"</text>
+
+  <text class="lbl-s" x="405" y="205" text-anchor="middle">"Xat" &ne; "aXt"</text>
+  <text class="lbl-s" x="405" y="222" text-anchor="middle">permanently diverged,</text>
+  <text class="lbl-s" x="405" y="238" text-anchor="middle">and nothing reports an error</text>
+  <defs>
+    <marker id="p50-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Neither replica crashed, neither logged anything, and both users are now editing a
+document their colleague cannot see. Index-based ops are not a bug you find in staging.</figcaption>
+</figure>
+
+<p>Operational transformation is the classic fix: keep sending indexes, but <em>transform</em> each
+incoming op against every concurrent op you already applied, so its index is rewritten into your
+frame of reference. It works, and Google Docs runs on it. The cost is that the transformation
+functions must satisfy two properties &mdash; TP1 and TP2 &mdash; and TP2 is the one that ruins
+weekends: for three concurrent ops the transformed results must be independent of the order in which
+you transform. Published OT algorithms have shipped with TP2 violations for years before anyone
+found them, and most production OT systems dodge the problem entirely by routing every op through a
+<strong>central server</strong> that imposes a total order, which reintroduces exactly the single
+point of coordination we are trying to remove.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>Mechanism</th><th>Needs a coordinator?</th><th>How it fails</th></tr></thead>
+<tbody>
+<tr><td>Pessimistic lock / OT-free</td><td>One writer at a time per region</td><td>Yes</td><td>Not collaborative. Latency of the lock round trip is on every keystroke</td></tr>
+<tr><td>Last-write-wins on the document</td><td>Highest timestamp replaces the value</td><td>No</td><td><strong>Silent data loss.</strong> Clock skew decides whose paragraph survives</td></tr>
+<tr><td>Operational transformation</td><td>Rewrite incoming indexes against concurrent ops</td><td>In practice yes &mdash; TP2 is hard enough that most systems serialise instead</td><td>Subtle, rare, unreproducible divergence from a transform-function bug</td></tr>
+<tr><td>Sequence CRDT (this project)</td><td>Position is an immutable identifier, not an index; ops commute</td><td><strong>No</strong></td><td>Memory: tombstones and per-character identifiers. Interleaving of concurrent words</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Why convergence is a lattice property</h2>
+
+<p>A CRDT replaces "resolve the conflict" with "make the conflict impossible to observe". The
+requirement is stated algebraically. If every replica's state is an element of a set with a merge
+operation <code>&#8852;</code>, and that merge is <strong>commutative</strong>, <strong>associative</strong> and
+<strong>idempotent</strong>, then the merge is a join-semilattice, and any two replicas that have
+absorbed the same set of updates hold the same state &mdash; regardless of the order they arrived
+in, how many times each arrived, or how they were grouped into batches.</p>
+
+<p>Those three laws map exactly onto the three things the network does to you. Reordering is
+commutativity. Batching &mdash; one instance delivering a run of ops that another delivers
+one-by-one &mdash; is associativity. Redelivery, which happens constantly here because an op can
+reach you over the pub/sub bus <em>and</em> in an op-log replay <em>and</em> from a client resending
+after a reconnect, is idempotence. Satisfy all three and you can stop reasoning about delivery
+entirely.</p>
+
+<div class="box iv">
+  <span class="bt">The mental model that matters</span>
+  <p>A CRDT does not make ordering unnecessary; it makes <em>agreement on an ordering</em>
+  unnecessary. The document order in this project is fixed by <code>compareIds</code>, a pure
+  function every replica evaluates independently and always agrees on. The network is demoted from
+  "the thing that decides what the document says" to "a best-effort delivery mechanism for a set of
+  facts". That is why <code>src/crdt/rga.js</code> has <strong>no imports</strong> and the browser
+  loads the same file the server runs: convergence is a property of one function, and two
+  hand-written copies of that function is how it gets broken.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Law</th><th>What the network does</th><th>Where <code>rga.js</code> provides it</th></tr></thead>
+<tbody>
+<tr><td>Commutative</td><td>Reorders messages</td><td>The integration scan positions a node by <code>compareIds</code>, not by arrival time</td></tr>
+<tr><td>Associative</td><td>Batches and re-batches</td><td><code>apply(ops)</code> is a loop over <code>applyOp</code>; a batch has no identity of its own</td></tr>
+<tr><td>Idempotent</td><td>Redelivers</td><td><code>if (this.#index.has(key)) return false</code> for inserts; <code>if (node.deleted) return false</code> for deletes</td></tr>
+<tr><td>(not a law) Causal readiness</td><td>Delivers an effect before its cause</td><td><code>#pending</code> parks the op until its anchor exists, then <code>#drain</code> replays it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the convergence assertion, from src/crdt/rga.test.js<span class="lang">js</span></div>
+<pre><code class="lang-js">test('two replicas converge when concurrent inserts are applied in opposite orders', () =&gt; {
+  const a = new RGA('a');
+  const b = new RGA('b');
+
+  // Both start empty and both type at position 0, without seeing each other.
+  const opsA = a.insertAt(0, 'hello');
+  const opsB = b.insertAt(0, 'world');
+
+  assert.equal(a.toString(), 'hello');
+  assert.equal(b.toString(), 'world');
+
+  // Now they exchange - in opposite orders, which is the whole point.
+  a.apply(opsB);
+  b.apply(opsA);
+
+  assert.equal(a.toString(), b.toString(), 'replicas must converge');
+  // Pinned so a change to the comparator cannot silently change document order:
+  // site "b" wins the counter tie, so "world" sorts ahead of "hello".
+  assert.equal(a.toString(), 'worldhello');
+});</code></pre>
+</div>
+
+<h2>Sequences are the hard CRDT</h2>
+
+<p>Counters and sets are easy because their elements have no relationship to each other. A
+grow-only counter merges by taking the per-replica maximum; a grow-only set merges by union. Both
+are trivially commutative, associative and idempotent, and neither has to answer the question a
+text document lives or dies by: <em>where does this element go?</em></p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>CRDT</th><th>Merge</th><th>Why it is easy or hard</th></tr></thead>
+<tbody>
+<tr><td>G-Counter</td><td>Per-replica <code>max</code></td><td>Elements are independent. Max is commutative, associative, idempotent by construction</td></tr>
+<tr><td>G-Set / 2P-Set</td><td>Union</td><td>Membership is a yes/no per element; no element constrains another</td></tr>
+<tr><td>LWW-Register</td><td>Highest (timestamp, replicaId)</td><td>Easy, and lossy &mdash; exactly the naive approach that eats a paragraph</td></tr>
+<tr><td>OR-Map</td><td>Per-key CRDT merge</td><td>Keys are independent; the hard part is only the delete/re-add race</td></tr>
+<tr><td><strong>Sequence</strong></td><td>Position must be preserved</td><td>Every element's meaning depends on its neighbours. There is no "union" of two orderings</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The textbook approach is to give each character a <strong>dense, totally ordered
+identifier</strong>: a position value from a space where, between any two positions, another
+position always exists. Then inserting between <code>0.3</code> and <code>0.4</code> is just picking
+<code>0.35</code>, merging is a set union of (position, character) pairs, and the document is the
+sorted order. That is Logoot and LSEQ, and the density requirement is what makes it painful in
+practice: identifiers are variable-length paths, an adversarial or merely unlucky editing pattern
+(repeatedly typing at the same spot) makes them grow without bound, and a 3&nbsp;KB document can end
+up carrying 60&nbsp;KB of identifiers.</p>
+
+<p>RGA takes the other route. It never invents a position <em>between</em> two things. It says
+"immediately after <em>this specific character</em>", names it by an identifier that never changes,
+and resolves the remaining ambiguity &mdash; several ops naming the same predecessor &mdash; with a
+total order over identifiers. The identifier space does not have to be dense, only unique and
+totally ordered, and a <code>(siteId, counter)</code> pair gives you both in 16 bytes.</p>
+
+<h2>RGA: identity, predecessor, tombstone</h2>
+
+<div class="codewrap">
+<div class="codehead">the entire wire format, from the README<span class="lang">json</span></div>
+<pre><code class="lang-json">{ "type": "ins", "id": { "s": "alice", "c": 7 }, "after": { "s": "bob", "c": 3 }, "ch": "x" }
+{ "type": "del", "id": { "s": "alice", "c": 7 } }</code></pre>
+</div>
+
+<p>Three decisions are packed into those two lines, and each one is load-bearing.</p>
+
+<p><strong>An identifier, not an index.</strong> <code>c</code> is a Lamport counter, raised to at
+least any value the replica has ever observed, so "later" always means "numerically larger".
+<code>s</code> is the site id &mdash; the browser tab, or the server instance. The pair is unique by
+construction, and it is <em>immutable</em>: the character keeps it for the life of the document,
+through snapshots, reconnects and process restarts.</p>
+
+<p><strong>The insert names its predecessor.</strong> <code>after</code> is an id, not a number. It
+means one unambiguous thing on every replica forever, whereas "index 5" means whatever that replica
+happens to hold right now.</p>
+
+<p><strong>The delete does not delete.</strong> It flips a boolean on a node that stays in the list
+&mdash; a tombstone. That is what makes delete commute with everything: it never moves a node, and a
+node that never moves cannot invalidate someone else's <code>after</code> reference.</p>
+
+<div class="codewrap">
+<div class="codehead">the identifier and its total order &mdash; src/crdt/rga.js<span class="lang">js</span></div>
+<pre><code class="lang-js">/** Stable string key for an id. Used for every Map/Set lookup in this file. */
+export function idKey(id) {
+  return id.s + ':' + id.c;
+}
+
+/**
+ * Total order over ids. Returns &gt; 0 when `a` should sit BEFORE `b` in the
+ * document, &lt; 0 when after, 0 only when they are the same id.
+ *
+ * Higher Lamport counter first, ties broken by site id descending. Two things
+ * matter here and both are easy to get wrong:
+ *
+ *   - It must be TOTAL. If the comparator can return 0 for two different ids,
+ *     the scan below becomes order-dependent and the replicas diverge. Since
+ *     (counter, siteId) pairs are unique by construction, comparing both fields
+ *     gives a total order.
+ *   - It must be the same everywhere. Any tie-break works (ascending site id
+ *     would be just as correct) as long as every replica picks the same one.
+ */
+export function compareIds(a, b) {
+  if (a.c !== b.c) return a.c - b.c;
+  if (a.s === b.s) return 0;
+  return a.s &lt; b.s ? -1 : 1;
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A colon in a site id silently aliases two different characters</span>
+  <p><code>idKey</code> joins with <code>':'</code>, so site <code>a</code> counter <code>1:2</code>
+  and site <code>a:1</code> counter <code>2</code> would produce the same map key &mdash; and the
+  second character to arrive would be swallowed as a duplicate. The constructor refuses the input
+  rather than letting it become a data-corruption bug six hours later:</p>
+<div class="codewrap"><pre><code class="lang-js">if (siteId.includes(':')) {
+  // idKey() joins with ':', so a colon in a siteId would make two different
+  // ids collide on the same key. Cheap invariant, nasty bug if violated.
+  throw new TypeError('siteId must not contain ":"');
+}</code></pre></div>
+  <p>The same reasoning is why <code>src/config.js</code> validates
+  <code>INSTANCE_ID</code> against <code>/^[A-Za-z0-9_.-]{1,32}$/</code>: the instance id becomes
+  part of the server's site id (<code>srv-${config.instanceId}</code>), so a colon in a Kubernetes
+  pod name would reach the comparator.</p>
+</div>
+
+<h2>The integration scan, and the tie-break</h2>
+
+<p>Placing a remote insert is four lines. Resolve the anchor; walk forward past every node that
+"wins" the comparator; splice in. Because <code>compareIds</code> is a strict total order over ids
+that are unique by construction, every replica walks exactly the same distance and stops in exactly
+the same place, no matter which order the surrounding nodes arrived in.</p>
+
+<div class="codewrap">
+<div class="codehead">#integrateInsert &mdash; the whole CRDT is these lines<span class="lang">js</span></div>
+<pre><code class="lang-js">this.#observe(op.id);
+
+const key = idKey(op.id);
+// Idempotence: the same op can arrive twice (bus + op-log replay, or a
+// client that resent after a reconnect). Seeing it again is a no-op.
+if (this.#index.has(key) || this.#redirect.has(key)) return false;
+
+const anchor = this.#resolveAnchor(op.after);
+if (anchor === undefined) {
+  // Causally not ready: we have not seen the predecessor yet. Park it.
+  this.#pend(idKey(op.after), op);
+  return false;
+}
+
+// ---- the integration scan -------------------------------------------
+// Walk forward from the anchor while the next node "wins" the comparator.
+// Because compareIds is a total order over ids, every replica walks the
+// same distance and stops at the same place, no matter what order the
+// nodes arrived in.
+let prev = anchor;
+while (prev.next !== null &amp;&amp; compareIds(prev.next.id, op.id) &gt; 0) {
+  prev = prev.next;
+}
+
+const node = { id: op.id, ch: op.ch, deleted: false, next: prev.next };
+prev.next = node;
+this.#index.set(key, node);
+this.#visible++;
+return true;</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Two replicas insert different characters after the same predecessor, exchange the operations in opposite orders, and both integration scans produce the identical document HBA">
+  <text class="lbl-b" x="14" y="20">Shared history: one character "H" with id base:1. Both replicas have seen it, so both clocks read 1.</text>
+
+  <text class="lbl-b" x="14" y="46">replica "alice"</text>
+  <text class="lbl-b" x="470" y="46">replica "bob"</text>
+  <line class="dash" x1="410" y1="30" x2="410" y2="266"/>
+
+  <rect class="node-i" x="14" y="56" width="380" height="44" rx="6"/>
+  <text class="lbl-s" x="24" y="74">types "A" after H, mints</text>
+  <text class="mono"  x="200" y="74">{s:"alice", c:2}</text>
+  <text class="mono"  x="24"  y="92">head &rarr; base:1(H) &rarr; alice:2(A)</text>
+
+  <rect class="node-i" x="426" y="56" width="380" height="44" rx="6"/>
+  <text class="lbl-s" x="436" y="74">types "B" after H, mints</text>
+  <text class="mono"  x="606" y="74">{s:"bob", c:2}</text>
+  <text class="mono"  x="436" y="92">head &rarr; base:1(H) &rarr; bob:2(B)</text>
+
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 394 112 C 500 112 520 132 802 140" marker-end="url(#p50-ar5)"/>
+    <path class="edge-a" d="M 426 112 C 320 112 300 132 18 140" marker-end="url(#p50-ar6)"/>
+  </g>
+  <text class="lbl-s" x="410" y="128" text-anchor="middle">ops cross</text>
+
+  <rect class="node-w" x="14" y="150" width="380" height="60" rx="6"/>
+  <text class="lbl-b" x="24" y="168">scan for bob:2, anchor = base:1</text>
+  <text class="mono"  x="24" y="186">compareIds(alice:2, bob:2) = &minus;1</text>
+  <text class="lbl-s" x="24" y="204">not &gt; 0 &rarr; stop immediately &rarr; splice BEFORE alice:2</text>
+
+  <rect class="node-w" x="426" y="150" width="380" height="60" rx="6"/>
+  <text class="lbl-b" x="436" y="168">scan for alice:2, anchor = base:1</text>
+  <text class="mono"  x="436" y="186">compareIds(bob:2, alice:2) = +1</text>
+  <text class="lbl-s" x="436" y="204">&gt; 0 &rarr; step past bob:2 &rarr; splice AFTER it</text>
+
+  <rect class="node-o" x="14"  y="220" width="380" height="40" rx="6"/>
+  <rect class="node-o" x="426" y="220" width="380" height="40" rx="6"/>
+  <text class="mono" x="204" y="238" text-anchor="middle">head &rarr; base:1(H) &rarr; bob:2(B) &rarr; alice:2(A)</text>
+  <text class="mono" x="616" y="238" text-anchor="middle">head &rarr; base:1(H) &rarr; bob:2(B) &rarr; alice:2(A)</text>
+  <text class="lbl-s" x="204" y="254" text-anchor="middle">"HBA"</text>
+  <text class="lbl-s" x="616" y="254" text-anchor="middle">"HBA"</text>
+
+  <text class="lbl-s" x="14" y="282">Counters tie at 2, so the site id decides: "bob" &gt; "alice", and descending order puts bob to the LEFT. Arbitrary &mdash; but identical on both sides, which is the entire requirement.</text>
+  <defs>
+    <marker id="p50-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Neither replica consulted the network, a clock, or the other's arrival order. Both
+evaluated the same pure comparator over the same two ids and reached the same answer.</figcaption>
+</figure>
+
+<div class="box gotcha">
+  <span class="bt">A comparator that returns 0 for two different ids diverges &mdash; rarely, and forever</span>
+  <p>Drop the site-id tie-break so <code>compareIds</code> compares counters only, and the test suite
+  still passes most single-replica tests. It breaks exactly when two sites mint the same counter,
+  which is precisely the concurrent-edit case you shipped the CRDT for. The scan then stops in
+  different places on different replicas and the documents drift apart with no error anywhere.
+  That is why <code>rga.test.js</code> asserts the order-theoretic laws directly rather than trusting
+  a few examples:</p>
+<div class="codewrap"><pre><code class="lang-js">// totality: only identical ids may compare equal. If two DIFFERENT ids
+// ever compared equal, the integration scan would stop at different
+// places on different replicas and the whole CRDT would fall apart.
+if (idKey(x) !== idKey(y)) assert.notEqual(xy, 0, `${idKey(x)} and ${idKey(y)} must be ordered`);</code></pre></div>
+</div>
+
+<div class="box note">
+  <span class="bt">A local insert never actually scans</span>
+  <p><code>insertAt</code> mints an id with the largest counter this replica has ever seen, so the
+  <code>while</code> loop's first comparison already fails and the character lands exactly where the
+  caret is. Local editing is O(1) per character after the index walk; the scan cost only appears for
+  genuinely concurrent remote inserts.</p>
+<div class="codewrap"><pre><code class="lang-js">for (let i = 0; i &lt; text.length; i++) {
+  const op = { type: 'ins', id: this.#nextId(), after: anchor.id, ch: text[i] };
+  // A locally minted id always has the largest counter this replica has
+  // seen, so the integration scan stops immediately and the character lands
+  // exactly where the user put it. We still route through applyOp so there
+  // is exactly one code path that mutates the list.
+  this.applyOp(op);
+  anchor = this.#index.get(idKey(op.id));
+  ops.push(op);
+}</code></pre></div>
+</div>
+
+<h2>Causal buffering: why delivery order stops mattering</h2>
+
+<p>Commutativity says nothing about an op whose anchor has not arrived. <code>ins after=bob:3</code>
+is unplaceable on a replica that has never seen <code>bob:3</code> &mdash; not wrong, just not yet
+resolvable. The fix is local and cheap: park it, keyed by the id it is waiting for, and replay it
+the instant that id appears. The network gets to reorder freely; causality is reconstructed on the
+receiving side.</p>
+
+<div class="codewrap">
+<div class="codehead">park and drain &mdash; src/crdt/rga.js<span class="lang">js</span></div>
+<pre><code class="lang-js">#pend(key, op) {
+  if (this.#pendingCount &gt;= this.#maxPending) {
+    // BOUNDED on purpose. A peer that streams inserts referencing ids it
+    // never sends would otherwise grow this map until the process dies.
+    // Dropping is safe: the op log replay on the next sync re-delivers.
+    this.#pendingDropped++;
+    return;
+  }
+  const list = this.#pending.get(key);
+  if (list === undefined) this.#pending.set(key, [op]);
+  else list.push(op);
+  this.#pendingCount++;
+}
+
+/** Replay ops that were waiting on `key`, and anything they in turn unblock. */
+#drain(key) {
+  const queue = [key];
+  while (queue.length &gt; 0) {
+    const current = queue.pop();
+    const waiting = this.#pending.get(current);
+    if (waiting === undefined) continue;
+    this.#pending.delete(current);
+    this.#pendingCount -= waiting.length;
+    for (const op of waiting) {
+      const applied = op.type === 'ins' ? this.#integrateInsert(op) : this.#integrateDelete(op);
+      if (applied &amp;&amp; op.type === 'ins') queue.push(idKey(op.id));
+    }
+  }
+}</code></pre>
+</div>
+
+<p>The drain is an explicit work queue rather than recursion for a concrete reason: a whole word
+delivered in reverse is a chain of <em>n</em> parked ops, and the arrival of the first character
+unblocks all of them in one cascade. At 4&nbsp;kB of pasted text that recursion would be 4,000 frames
+deep. The test pins the cascade behaviour exactly.</p>
+
+<div class="codewrap">
+<div class="codehead">the reverse-delivery test<span class="lang">js</span></div>
+<pre><code class="lang-js">// Strict reverse order: every op except the last one to arrive references an
+// element that does not exist yet.
+const r = new RGA('r');
+const reversed = ops.slice().reverse();
+for (const op of reversed.slice(0, -1)) {
+  assert.equal(r.applyOp(op), false, 'not integrable yet');
+}
+assert.equal(r.length, 0, 'nothing visible while the chain is broken');
+assert.equal(r.pendingCount, 4, 'four ops parked');
+
+// The head of the chain arrives and unblocks the entire cascade at once.
+assert.equal(r.applyOp(reversed.at(-1)), true);
+assert.equal(r.pendingCount, 0);
+assert.equal(r.toString(), 'hello');</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Deletes need buffering too, and forgetting it looks like a haunting</span>
+  <p>It is easy to buffer inserts and drop a delete whose target is unknown &mdash; "there is nothing
+  to delete, so nothing to do". Wrong: the insert may still be in flight. Discard the delete and the
+  character arrives moments later and stays <em>forever</em>, on that replica only. Users report it
+  as text coming back from the dead after a reconnect, which is a spectacularly unpleasant bug to
+  reproduce.</p>
+<div class="codewrap"><pre><code class="lang-js">const node = this.#index.get(key);
+if (node === undefined) {
+  // Delete arrived before the insert it refers to. Park it: this is the
+  // half of causal buffering people forget, and it shows up as characters
+  // that "come back from the dead" after a reconnect.
+  this.#pend(key, op);
+  return false;
+}</code></pre></div>
+</div>
+
+<div class="box warn">
+  <span class="bt">The pending buffer is bounded, and that is only safe because of the op log</span>
+  <p>Once <code>maxPending</code> (default 10,000) is reached, further parked ops are counted in
+  <code>pendingDropped</code> and thrown away. On its own that would be data loss. It is safe here
+  purely because every op is also durably in the Redis Stream: the next
+  <code>sync</code>/<code>welcome</code> re-delivers it. Remove the op log and this bound becomes a
+  bug. Watch <code>pendingDropped</code> in <code>/healthz</code> &mdash; a non-zero value means
+  either an abusive peer or a genuinely broken causal chain upstream.</p>
+</div>
+
+<h2>Tombstones, and the price of never forgetting</h2>
+
+<figure>
+<svg viewBox="0 0 820 260" role="img" aria-label="The RGA linked list with a head sentinel, live character nodes, a tombstone node retained as an anchor, and a redirect table entry created by garbage collection">
+  <text class="lbl-b" x="14" y="20">The list: one node per character ever typed, plus a head sentinel</text>
+
+  <rect class="node"   x="14"  y="34" width="86" height="52" rx="6"/>
+  <text class="lbl-b"  x="57"  y="54" text-anchor="middle">head</text>
+  <text class="lbl-s"  x="57"  y="72" text-anchor="middle">id = null</text>
+
+  <rect class="node-o" x="126" y="34" width="120" height="52" rx="6"/>
+  <text class="lbl-b"  x="186" y="54" text-anchor="middle">'a'</text>
+  <text class="mono"   x="186" y="72" text-anchor="middle">a:1</text>
+
+  <rect class="node-o" x="272" y="34" width="120" height="52" rx="6"/>
+  <text class="lbl-b"  x="332" y="54" text-anchor="middle">'b'</text>
+  <text class="mono"   x="332" y="72" text-anchor="middle">a:2</text>
+
+  <rect class="node-d" x="418" y="34" width="140" height="52" rx="6"/>
+  <text class="lbl-b"  x="488" y="54" text-anchor="middle">'c' TOMBSTONE</text>
+  <text class="mono"   x="488" y="72" text-anchor="middle">a:3 deleted=true</text>
+
+  <rect class="node-o" x="584" y="34" width="120" height="52" rx="6"/>
+  <text class="lbl-b"  x="644" y="54" text-anchor="middle">'d'</text>
+  <text class="mono"   x="644" y="72" text-anchor="middle">a:4</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="100" y1="60" x2="122" y2="60" marker-end="url(#p50-ar7)"/>
+    <line class="edge" x1="246" y1="60" x2="268" y2="60" marker-end="url(#p50-ar8)"/>
+    <line class="edge" x1="392" y1="60" x2="414" y2="60" marker-end="url(#p50-ar9)"/>
+    <line class="edge" x1="558" y1="60" x2="580" y2="60" marker-end="url(#p50-ar10)"/>
+  </g>
+  <text class="lbl-s" x="716" y="64">toString() skips</text>
+  <text class="lbl-s" x="716" y="80">deleted nodes: "abd"</text>
+
+  <rect class="node-w" x="272" y="112" width="286" height="46" rx="6"/>
+  <text class="lbl-b" x="415" y="130" text-anchor="middle">a late concurrent op arrives</text>
+  <text class="mono"  x="415" y="148" text-anchor="middle">{type:"ins", after:{s:"a",c:3}, ch:"!"}</text>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="470" y1="112" x2="482" y2="90" marker-end="url(#p50-ar11)"/>
+  </g>
+  <text class="lbl-s" x="14" y="136">Physically removing 'c' would</text>
+  <text class="lbl-s" x="14" y="152">make this op unplaceable</text>
+  <text class="lbl-s" x="14" y="168">forever. The tombstone IS the</text>
+  <text class="lbl-s" x="14" y="184">anchor.</text>
+
+  <text class="lbl-b" x="272" y="186">after gc(isStable) collects a:3</text>
+  <rect class="node-i" x="272" y="196" width="286" height="46" rx="6"/>
+  <text class="lbl-s" x="415" y="214" text-anchor="middle">#redirect table (key-only, no char, no node)</text>
+  <text class="mono"  x="415" y="232" text-anchor="middle">"a:3" &rarr; {s:"a", c:2}</text>
+  <text class="lbl-s" x="584" y="214">#resolveAnchor follows the</text>
+  <text class="lbl-s" x="584" y="230">redirect chain, so a late op</text>
+  <text class="lbl-s" x="584" y="246">anchored on a:3 still resolves</text>
+  <defs>
+    <marker id="p50-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Collection replaces a full node &mdash; id, character, <code>next</code> pointer, index
+entry &mdash; with one key-to-id map entry. Smaller, not free, and only sound if every replica
+collects the same set.</figcaption>
+</figure>
+
+<p>Type 100,000 characters, delete all of them, and the empty document still costs 100,000 nodes:
+memory, snapshot bytes, and an O(n) walk for every index lookup in
+<code>#nodeBeforeVisibleIndex</code>. In a long-lived document tombstones routinely outnumber live
+characters, which is why <code>Document.stats()</code> exposes <code>tombstoneRatio</code> on
+<code>/healthz</code> &mdash; it is the number that tells you when a document needs resetting.</p>
+
+<p>You cannot simply drop them. Removal is only safe once a delete is <strong>causally
+stable</strong>: every replica has seen it, so no future op can name the removed character as its
+anchor. Proving that requires version vectors exchanged between replicas plus knowledge of the full
+membership set &mdash; neither of which a system built from anonymous, reconnecting browser tabs has
+cheaply.</p>
+
+<div class="codewrap">
+<div class="codehead">gc() &mdash; collection with anchor inheritance<span class="lang">js</span></div>
+<pre><code class="lang-js">gc(isStable) {
+  if (typeof isStable !== 'function') throw new TypeError('gc requires an isStable(node) predicate');
+  let collected = 0;
+  let prev = this.#head;
+  let node = this.#head.next;
+  while (node !== null) {
+    if (node.deleted &amp;&amp; isStable(node)) {
+      const key = idKey(node.id);
+      prev.next = node.next;
+      this.#index.delete(key);
+      // Anchor inheritance: anything that pointed at this node now points at
+      // its surviving predecessor (null == the head sentinel).
+      this.#redirect.set(key, prev.id === null ? null : prev.id);
+      this.#tombstones--;
+      collected++;
+      node = prev.next;
+      continue;
+    }
+    prev = node;
+    node = node.next;
+  }
+  return collected;
+}</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">and the resolver that makes redirects work &mdash; #resolveAnchor<span class="lang">js</span></div>
+<pre><code class="lang-js">#resolveAnchor(after) {
+  if (after === null || after === undefined) return this.#head;
+  let cursor = after;
+  for (let hops = 0; hops &lt; 1_000_000; hops++) {
+    const key = idKey(cursor);
+    const node = this.#index.get(key);
+    if (node !== undefined) return node;
+    if (!this.#redirect.has(key)) return undefined; // never seen it
+    const next = this.#redirect.get(key); // collected: follow the redirect
+    if (next === null) return this.#head;
+    cursor = next;
+  }
+  throw new Error('redirect chain did not terminate');
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Every replica must run <code>gc()</code> with the SAME predicate</span>
+  <p>Collection is the one operation in this CRDT that is <em>not</em> safe to do independently. If
+  replica A collects tombstone <code>a:3</code> and replica B does not, a late insert anchored on
+  <code>a:3</code> is placed after <code>a:3</code>'s <em>predecessor</em> on A and after
+  <code>a:3</code> itself on B &mdash; and if a live character sits between them, the two replicas
+  place the new character on opposite sides of it. Convergence is gone, and the fuzz test will not
+  catch it because <code>gc()</code> is never called automatically. Nothing in the server calls it;
+  it is there so you can see what a correct collection scheme has to prove.</p>
+</div>
+
+<div class="box ok">
+  <span class="bt">The three real answers to tombstone growth</span>
+  <ol>
+    <li><strong>Never collect.</strong> Bound the damage with snapshots plus periodic document
+    resets. That is this project's default, and for documents with a bounded lifetime it is the
+    right trade.</li>
+    <li><strong>Collect under a coordinator</strong> that can prove every session has acknowledged a
+    sequence number &mdash; what <code>gc()</code> models. You already have the acknowledgement
+    machinery here: the op log's sequence number and each client's <code>since</code>.</li>
+    <li><strong>Change the data model.</strong> Block-wise CRDTs store a run of characters in one
+    node, so a deleted paragraph costs one tombstone rather than 400. This is what Yjs does, and it
+    is the biggest single constant-factor win available.</li>
+  </ol>
+</div>
+
+<div class="box note">
+  <span class="bt">Snapshots keep tombstones, and drop the <code>after</code> links</span>
+  <p><code>snapshot()</code> writes <code>[siteId, counter, char, deletedFlag]</code> per node in
+  document order. The predecessor links are dead weight once the order is materialised &mdash;
+  <code>restore</code> rebuilds in O(n) with no comparator at all. Tombstones <em>are</em> written,
+  because a future op may still name one as its anchor; <code>#pending</code> is not, because parked
+  ops are by definition ops that were never applied and the op log will re-deliver them.</p>
+</div>
+
+<h2>What RGA gives up, and what Yjs and Automerge do instead</h2>
+
+<p>Convergence is not the same as <em>intention preservation</em>. RGA's scan walks a flat list
+rather than a tree of siblings, and the consequence has a name: <strong>interleaving</strong>. Two
+users typing whole words at the same position concurrently can end up with their characters
+interleaved rather than each word kept whole. Every replica agrees on the interleaved result &mdash;
+it converges perfectly &mdash; it is simply not what either user meant.</p>
+
+<div class="codewrap">
+<div class="codehead">the honest comment in the integration scan<span class="lang">js</span></div>
+<pre><code class="lang-js">// Note it scans the flat list rather than a tree of siblings. That is the
+// classic RGA formulation and it converges; the price is INTERLEAVING - if
+// two users type whole words at the same spot concurrently, the words can
+// end up shuffled character by character rather than kept whole. YATA
+// (Yjs) and Fugue fix that with extra origin bookkeeping. Convergence is
+// preserved either way, which is what the tests assert.</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>OT (Google Docs)</th><th>RGA (this project)</th><th>YATA (Yjs)</th><th>Automerge</th></tr></thead>
+<tbody>
+<tr><td>Position is</td><td>An index, transformed on arrival</td><td>An immutable id + predecessor</td><td>An immutable id + left <em>and</em> right origin</td><td>An immutable id + predecessor (RGA-family)</td></tr>
+<tr><td>Needs a central server</td><td>In practice yes</td><td>No</td><td>No</td><td>No</td></tr>
+<tr><td>Correctness burden</td><td>TP1 + TP2 on every transform pair</td><td>One total order over ids</td><td>Origin bookkeeping per item</td><td>Column-compressed op history</td></tr>
+<tr><td>Delete</td><td>Really removes</td><td>Tombstone per character</td><td>Tombstone per <em>run</em> of characters</td><td>Tombstone, compressed in the history</td></tr>
+<tr><td>Concurrent word interleaving</td><td>Avoided by serialisation</td><td><strong>Possible</strong></td><td>Avoided</td><td>Reduced, not eliminated</td></tr>
+<tr><td>Per-character overhead</td><td>None (indexes only)</td><td>One node + <code>{s, c}</code></td><td>Amortised over a run</td><td>Amortised by columnar encoding</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box deep">
+  <span class="bt">Why write RGA rather than depend on Yjs</span>
+  <p>For production you should almost certainly use Yjs: it is block-wise, binary-encoded, battle
+  tested, and roughly an order of magnitude leaner per character. The reason this project implements
+  RGA in 565 readable lines is that Yjs's efficiency is achieved by making the interesting parts
+  &mdash; the comparator, the scan, the tombstone policy &mdash; invisible. Once you have written
+  the comparator and watched the fuzz test fail when you weaken it, the library stops being magic
+  and becomes a set of engineering trades you can evaluate.</p>
+</div>
+
+<h2>The system around the CRDT</h2>
+
+<p>The CRDT solves merge. It solves nothing else &mdash; not durability, not "what did I miss while
+my laptop was asleep", not "Alice is on instance A and Bob is on instance B". Those are the
+backplane's job, and the separation between the two is the design's spine.</p>
+
+<figure>
+<svg viewBox="0 0 820 330" role="img" aria-label="Architecture: two browser tabs holding RGA replicas connect to two Node instances, which share a Redis backplane holding a stream op log, a sequence counter, a pub/sub channel, a presence hash and a snapshot hash">
+  <rect class="node-i" x="14" y="14" width="240" height="52" rx="7"/>
+  <text class="lbl-b" x="134" y="34" text-anchor="middle">browser tab A</text>
+  <text class="lbl-s" x="134" y="52" text-anchor="middle">RGA replica &middot; optimistic local apply</text>
+
+  <rect class="node-i" x="566" y="14" width="240" height="52" rx="7"/>
+  <text class="lbl-b" x="686" y="34" text-anchor="middle">browser tab B</text>
+  <text class="lbl-s" x="686" y="52" text-anchor="middle">same rga.js, served from /rga.js</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="134" y1="66" x2="134" y2="94" marker-end="url(#p50-ar12)"/>
+    <line class="edge" x1="686" y1="66" x2="686" y2="94" marker-end="url(#p50-ar13)"/>
+  </g>
+  <text class="mono" x="142" y="86">ws://:58080/ws</text>
+  <text class="mono" x="694" y="86">ws://:58081/ws</text>
+
+  <rect class="node-a" x="14" y="100" width="240" height="82" rx="7"/>
+  <text class="lbl-b" x="134" y="120" text-anchor="middle">instance app1</text>
+  <text class="lbl-s" x="134" y="138" text-anchor="middle">wsServer &rarr; protocol &rarr; registry</text>
+  <text class="lbl-s" x="134" y="156" text-anchor="middle">document.js: RGA + seq watermark</text>
+  <text class="lbl-s" x="134" y="174" text-anchor="middle">crdt/rga.js &mdash; the merge logic</text>
+
+  <rect class="node-a" x="566" y="100" width="240" height="82" rx="7"/>
+  <text class="lbl-b" x="686" y="120" text-anchor="middle">instance app2</text>
+  <text class="lbl-s" x="686" y="138" text-anchor="middle">identical build, different INSTANCE_ID</text>
+  <text class="lbl-s" x="686" y="156" text-anchor="middle">drops bus messages stamped with</text>
+  <text class="lbl-s" x="686" y="174" text-anchor="middle">its own id (self-echo filter)</text>
+
+  <rect class="node" x="282" y="100" width="256" height="196" rx="7"/>
+  <text class="lbl-b" x="410" y="122" text-anchor="middle">Redis 8 backplane</text>
+  <text class="mono" x="296" y="146">Stream :oplog</text>
+  <text class="lbl-s" x="296" y="162">durable, sequence-numbered</text>
+  <text class="mono" x="296" y="184">String :seq</text>
+  <text class="lbl-s" x="296" y="200">INCR allocator, inside a Lua script</text>
+  <text class="mono" x="296" y="222">PubSub :events</text>
+  <text class="lbl-s" x="296" y="238">fire-and-forget fanout</text>
+  <text class="mono" x="296" y="260">Hash :presence &middot; Hash :snapshot</text>
+  <text class="lbl-s" x="296" y="276">heartbeat TTLs &middot; bounded replay</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="254" y1="140" x2="278" y2="140" marker-end="url(#p50-ar14)"/>
+    <line class="edge-a" x1="566" y1="140" x2="542" y2="140" marker-end="url(#p50-ar15)"/>
+    <line class="edge-a" x1="278" y1="164" x2="254" y2="164" marker-end="url(#p50-ar16)"/>
+    <line class="edge-a" x1="542" y1="164" x2="566" y2="164" marker-end="url(#p50-ar17)"/>
+  </g>
+
+  <text class="lbl-b" x="14" y="212">the edit path, in order</text>
+  <text class="lbl-s" x="14" y="230">1. XADD to the op log &mdash; durable, and</text>
+  <text class="lbl-s" x="14" y="246">&nbsp;&nbsp;&nbsp;this is what allocates the seq</text>
+  <text class="lbl-s" x="14" y="262">2. apply to the in-memory RGA</text>
+  <text class="lbl-s" x="14" y="278">3. write to local sockets (author gets ack)</text>
+  <text class="lbl-s" x="14" y="294">4. PUBLISH to the other instances</text>
+
+  <text class="lbl-b" x="566" y="212">why the order cannot be swapped</text>
+  <text class="lbl-s" x="566" y="230">Publishing before appending broadcasts</text>
+  <text class="lbl-s" x="566" y="246">an op that may never become durable.</text>
+  <text class="lbl-s" x="566" y="262">Crash in between and other clients hold</text>
+  <text class="lbl-s" x="566" y="278">an edit the log has never heard of &mdash;</text>
+  <text class="lbl-s" x="566" y="294">"it was fine until someone restarted".</text>
+  <defs>
+    <marker id="p50-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p50-ar17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>The CRDT makes the fanout allowed to be unreliable; the sequence number makes the
+unreliability detectable. Neither works without the other.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">submitOps &mdash; the ordering IS the design (src/doc/registry.js)<span class="lang">js</span></div>
+<pre><code class="lang-js">async submitOps(docId, ops, clientId) {
+  const doc = await load(docId);
+
+  // 1. Durable first. This also allocates the sequence number.
+  const seq = await oplog.append(docId, { ops, clientId });
+
+  // 2. Local state.
+  const applied = doc.applyOps(ops);
+  doc.advanceTo(seq);
+  metrics.inc('collab_ops_applied_total', applied.length);
+  metrics.inc('collab_ops_duplicate_total', ops.length - applied.length);
+
+  // 3. Sockets on this instance (the author gets an ack instead of an echo:
+  //    it already applied these ops optimistically).
+  broadcastLocal(docId, opsMessage({ docId, seq, ops, clientId }), clientId);
+
+  // 4. Every other instance. Note we send the full batch, not just what
+  //    changed here - another instance may be missing exactly the ops we
+  //    deduplicated.
+  await bus.publish(docId, { type: 'ops', docId, seq, ops, clientId });
+
+  // 5. Snapshot cadence, off the critical path.
+  this.maybeSnapshot(docId).catch((err) =&gt; log.error('snapshot failed', { docId, err }));
+
+  return { seq, applied: applied.length };
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>seq</code> is not causality &mdash; do not order CRDT ops by it</span>
+  <p>The sequence number answers "how much of the op log have I consumed", nothing more. It exists
+  so a reconnecting client can say "I last saw 4210" and be sent exactly what it missed. The CRDT
+  answers "what does the document say" and does not care about order at all. Conflating them is the
+  classic mistake in this architecture: if you sorted ops by <code>seq</code> before applying them,
+  you would have rebuilt a total-order broadcast and thrown away the reason for the CRDT.</p>
+<div class="codewrap"><pre><code class="lang-js">advanceTo(seq) {
+  if (!Number.isInteger(seq) || seq &lt; 0) throw new TypeError(`seq must be a non-negative integer, got ${seq}`);
+  if (seq &gt; this.seq) this.seq = seq;
+  return this.seq;
+}</code></pre></div>
+  <p>Note it never moves backwards. A gap fill reads the log directly and can interleave with live
+  pub/sub delivery, so entries genuinely arrive out of order &mdash; and rewinding the watermark
+  would make this instance serve a stale delta to a client that is ahead of it.</p>
+</div>
+
+<p>Because ops commute, the failure modes of the backplane degrade gently. Redis pub/sub is
+fire-and-forget and <em>will</em> drop messages during a subscriber blip; the receiving instance
+notices the sequence gap, reads the missing entries straight out of the Stream, and applies them.
+Applying the newer op first and repairing afterwards is not a problem: it is exactly the reordering
+the CRDT was chosen to absorb.</p>
+
+<div class="codewrap">
+<div class="codehead">gap repair tolerating its own failure &mdash; src/doc/registry.js<span class="lang">js</span></div>
+<pre><code class="lang-js">} catch (err) {
+  metrics.inc('collab_redis_errors_total');
+  // Not fatal: ops commute, so applying the live message now and
+  // repairing later still converges once the missing ops arrive by any
+  // route (another gap fill, or a client resync).
+  log.error('gap repair failed', { docId, err });
+}</code></pre>
+</div>
+
+<details><summary>The fuzz test, and why it is the only test that would catch a comparator regression</summary>
+<div class="dbody">
+<p>Three replicas each start from a shared seed, edit in isolation for 40 random steps, and pool
+every op they produced. Twenty-five different shuffles of that pool are replayed into fresh
+replicas; all twenty-five must produce byte-identical text and leave nothing parked. The PRNG is
+seeded so a failure is reproducible from its seed rather than being a flaky CI ticket.</p>
+<div class="codewrap"><pre><code class="lang-js">const outputs = new Set();
+for (let i = 0; i &lt; 25; i++) {
+  const replica = replayInto(`fuzz-${i}`, shuffled(pool, rnd));
+  assert.equal(replica.pendingCount, 0, `run ${i} left ops unintegrated`);
+  outputs.add(replica.toString());
+}
+
+assert.equal(outputs.size, 1, `divergence across shuffles: ${[...outputs].map((s) =&gt; JSON.stringify(s)).join(' | ')}`);</code></pre></div>
+<p>Collapsing every run into a <code>Set</code> and asserting <code>size === 1</code> is the whole
+trick: you are not asserting a particular document, you are asserting that <em>there is only
+one</em>. That assertion survives any change to the tie-break direction, which a pinned string
+would not.</p>
+</div>
+</details>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>An index is a statement about one replica's current state, so it cannot be shipped. RGA
+  replaces it with an immutable <code>{s, c}</code> identifier plus an <code>after</code> reference,
+  which means the same thing on every replica forever.</li>
+  <li>Convergence is the join-semilattice property &mdash; commutative, associative, idempotent
+  merge. Those three laws are exactly reordering, re-batching and redelivery, which is why the CRDT
+  lets you stop reasoning about the network.</li>
+  <li>Everything rests on <code>compareIds</code> being a <em>strict total order</em>. A comparator
+  that returns 0 for two different ids diverges only when two sites pick the same counter &mdash;
+  i.e. only under genuine concurrency &mdash; and it does so silently. Assert the order-theoretic
+  laws, not examples.</li>
+  <li>Commutativity does not cover causality. An op whose anchor has not arrived must be parked and
+  replayed, and that includes <strong>deletes</strong> &mdash; dropping an early delete is how
+  characters come back from the dead after a reconnect.</li>
+  <li>Tombstones are the rent you pay for commuting deletes, and they are unbounded. Collection is
+  only sound when a delete is causally stable and every replica collects the identical set; watch
+  <code>tombstoneRatio</code> in <code>/healthz</code> and prefer block-wise storage (Yjs) if you
+  need it to actually scale.</li>
+  <li>RGA converges but does not preserve intention: concurrent word-level typing at one position
+  interleaves. YATA and Fugue buy intention preservation with extra per-item origin bookkeeping;
+  know which property you actually need.</li>
+  <li>The CRDT solves merge and nothing else. Durability, catch-up and cross-instance fanout are the
+  op log's, the sequence watermark's and the bus's jobs &mdash; and <code>seq</code> is a log
+  position, never a causal order. Sort ops by it and you have rebuilt the coordinator you removed.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="index.html"><span class="lb">Previous</span>Real-time Collaborative Engine</a>
+  <a href="02-implementation.html"><span class="lb">Next</span>The realtime layer</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1083 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Design &amp; data model &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Distributed Job Scheduler &amp; Workflow Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Design &amp; data model</h1>
+<p class="lede">The requirements, the arithmetic they imply, the four tables and the indexes that make
+them fast &mdash; and then the one problem the whole project exists to solve: how N identical
+instances take exclusive ownership of the same row without a lock service, a leader, or a
+membership protocol.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">design</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The one sentence this design is built around</span>
+  <p>Ownership of a unit of work and the state of that unit of work must live in the <em>same</em>
+  system, changed by the <em>same</em> commit. Every alternative &mdash; a Redis lock, a ZooKeeper
+  ephemeral node, a leader that assigns shards &mdash; adds a second store that can disagree with the
+  first about who owns a row. Here the lock manager is PostgreSQL and the state is a PostgreSQL row,
+  so there is nothing to reconcile: the claim is one transaction, and after it commits the
+  <code>status</code> column <em>is</em> the ownership record.</p>
+</div>
+
+<h2>Requirements</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Functional</th><th>What it means concretely</th></tr></thead>
+<tbody>
+<tr><td>One-off jobs</td><td><code>POST /api/jobs/{id}/trigger</code> materialises a run now; the row is claimable within one poll interval.</td></tr>
+<tr><td>Cron jobs</td><td>Six-field Spring cron. Occurrences are materialised ahead of time as rows, not held in memory, so a restart loses nothing.</td></tr>
+<tr><td>DAG workflows</td><td>A step becomes runnable only when <em>every</em> parent has succeeded <em>for the same run</em>. A diamond fan-in must not start on one parent.</td></tr>
+<tr><td>Retries with backoff</td><td>Exponential with full jitter, capped, then a <code>DEAD_LETTER</code> terminus that is distinguishable from a terminal <code>FAILED</code>.</td></tr>
+<tr><td>Crash recovery</td><td>A SIGKILLed instance's in-flight work is picked up by a peer without operator action.</td></tr>
+<tr><td>Horizontal scale</td><td>Adding an instance requires no configuration change anywhere: every process runs every loop.</td></tr>
+<tr><td>REST surface</td><td>Job CRUD, trigger, execution history, cluster stats, RFC 7807 errors.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Non-functional</th><th>Target</th><th>Mechanism that delivers it</th></tr></thead>
+<tbody>
+<tr><td>Claim exclusivity</td><td>No row is ever <code>RUNNING</code> on two instances at once <em>as a result of claiming</em></td><td><code>SELECT &hellip; FOR UPDATE SKIP LOCKED</code> + <code>UPDATE</code> in one transaction</td></tr>
+<tr><td>Delivery</td><td><strong>At-least-once</strong>, honestly stated</td><td>A lease expiry can re-run work; <code>processed_execution</code> makes the duplicate completion a no-op</td></tr>
+<tr><td>Dispatch latency</td><td>&le; <code>poll-interval</code> (500&nbsp;ms) + one claim round trip</td><td>Occurrences already exist as rows by the time they come due (60&nbsp;s horizon)</td></tr>
+<tr><td>Failure detection</td><td>&le; <code>lease-timeout</code> + <code>sweeper.interval</code> = 30&nbsp;s + 10&nbsp;s = <strong>40&nbsp;s</strong></td><td><code>heartbeat_at</code> as liveness, swept by every instance</td></tr>
+<tr><td>Cron uniqueness</td><td>Exactly one execution row per (job, occurrence), cluster-wide</td><td><code>UNIQUE (idempotency_key)</code>, with <code>pg_try_advisory_xact_lock</code> as the cost optimisation</td></tr>
+<tr><td>Retry bound</td><td><code>max_attempts</code> (default 3) attempts total, then terminal</td><td><code>RetryPolicy</code>; a lease expiry <em>costs an attempt</em></td></tr>
+<tr><td>Backoff</td><td><code>uniform(0, min(5m, 1s &times; 2^attempt))</code></td><td>Full jitter, drawn per row</td></tr>
+<tr><td>Availability</td><td>Any subset of instances may die</td><td>&hellip; but <strong>PostgreSQL is a single point of failure</strong>, deliberately and explicitly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>The estimation</h3>
+
+<p>Size it before designing it. Take 5,000 job definitions producing <strong>2&nbsp;million executions
+per day</strong> &mdash; a mean of 23/s, with the usual pathology that ~20&nbsp;% of them are
+<code>0 0 0 * * *</code> and land in the same microsecond. The defaults in
+<code>application.yml</code> then give you every number you need:</p>
+
+<div class="codewrap">
+<div class="codehead">the knobs the arithmetic runs on &mdash; <code>application.yml</code><span class="lang">yaml</span></div>
+<pre><code class="lang-yaml">  worker:
+    threads: 8               # pool size; also the cap on rows RUNNING on this instance
+    claim-batch-size: 16     # rows requested per poll
+    poll-interval: 500ms
+    lease-timeout: 30s       # a RUNNING row with an older heartbeat_at is orphaned
+    heartbeat-interval: 5s   # 30s / 5s = six missed beats before reclaim
+    shutdown-grace: 20s
+  cron:
+    tick-interval: 1s
+    horizon: 60s                  # materialise occurrences this far ahead
+    max-occurrences-per-tick: 16  # bound on catch-up after downtime
+  sweeper:
+    interval: 10s
+    batch-size: 100
+  retry:
+    base-delay: 1s
+    max-delay: 5m</code></pre>
+</div>
+
+<ul>
+<li><strong>Throughput per instance.</strong> 8 threads at a 200&nbsp;ms median handler is 40
+executions/s; in-flight capacity is <code>threads &times; 2</code> = 16 rows. Four instances sustain
+~160/s &mdash; seven times the mean &mdash; and drain a 1,000-row midnight burst in about seven
+seconds.</li>
+<li><strong>Coordination cost.</strong> Claim polls are <code>2/s &times; instances</code>: 8/s at four
+instances, each one index scan plus one UPDATE. The cron tick is 1/s of real work cluster-wide, and
+the three losers each execute a single <code>SELECT pg_try_advisory_xact_lock(&hellip;)</code> and
+commit. The sweeper adds 0.4 scans/s. Coordination is free here; the <em>work</em> is what costs.</li>
+<li><strong>Storage.</strong> A <code>job_execution</code> tuple is roughly 250&nbsp;bytes (four UUIDs,
+six <code>timestamptz</code>, a ~60-character key) before its five indexes: ~500&nbsp;MB/day of heap,
+nearer 1&nbsp;GB/day with indexes. <strong>Retention is not optional at this scale</strong>, and the
+partial claim index is what stops the queue degrading while you postpone it.</li>
+</ul>
+
+<h2>The shape of the system</h2>
+
+<figure>
+<svg viewBox="0 0 820 330" role="img" aria-label="Three identical scheduler instances each running five scheduled loops, all coordinating through PostgreSQL, with Redis attached by a dashed advisory-only link">
+  <text class="lbl-b" x="14" y="18">Every instance is identical. There is no control plane, no leader between ticks, and no membership protocol.</text>
+
+  <rect class="node-a" x="14"  y="30" width="256" height="118" rx="8"/>
+  <rect class="node-a" x="282" y="30" width="256" height="118" rx="8"/>
+  <rect class="node-a" x="550" y="30" width="256" height="118" rx="8"/>
+  <text class="lbl-b" x="142" y="50" text-anchor="middle">scheduler-a &nbsp;:18080</text>
+  <text class="lbl-b" x="410" y="50" text-anchor="middle">scheduler-b &nbsp;:18081</text>
+  <text class="lbl-b" x="678" y="50" text-anchor="middle">scheduler-c &nbsp;&hellip;</text>
+
+  <text class="mono"  x="26" y="70">CronTicker</text>
+  <text class="lbl-s" x="150" y="70">@Scheduled 1s &middot; advisory lock</text>
+  <text class="mono"  x="26" y="88">WorkerLoop</text>
+  <text class="lbl-s" x="150" y="88">500ms claim + dispatch</text>
+  <text class="mono"  x="26" y="106">WorkerLoop</text>
+  <text class="lbl-s" x="150" y="106">5s heartbeat</text>
+  <text class="mono"  x="26" y="124">OrphanSweeper</text>
+  <text class="lbl-s" x="150" y="124">10s reclaim expired</text>
+  <text class="mono"  x="26" y="142">DagResolver</text>
+  <text class="lbl-s" x="150" y="142">2s promote / cancel</text>
+
+  <text class="lbl-s" x="294" y="70">same five loops</text>
+  <text class="lbl-s" x="294" y="88">same jar</text>
+  <text class="lbl-s" x="294" y="106">same config</text>
+  <text class="lbl-s" x="294" y="124">different node-id</text>
+  <text class="lbl-s" x="294" y="142">serves the same REST API</text>
+  <text class="lbl-s" x="562" y="70">add one and nothing</text>
+  <text class="lbl-s" x="562" y="88">is reconfigured: the</text>
+  <text class="lbl-s" x="562" y="106">queue is a table, so</text>
+  <text class="lbl-s" x="562" y="124">a new process simply</text>
+  <text class="lbl-s" x="562" y="142">starts winning claims</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="142" y1="150" x2="300" y2="212" marker-end="url(#p10-arch1)"/>
+    <line class="edge-a" x1="410" y1="150" x2="410" y2="212" marker-end="url(#p10-arch2)"/>
+    <line class="edge-a" x1="678" y1="150" x2="520" y2="212" marker-end="url(#p10-arch3)"/>
+  </g>
+  <g color="var(--border-strong)">
+    <line class="edge-d" x1="740" y1="150" x2="740" y2="212" marker-end="url(#p10-arch4)"/>
+  </g>
+  <text class="lbl-s" x="196" y="178">ALL coordination: claim, lease, cron lock, ledger</text>
+  <text class="lbl-s" x="752" y="186">advisory only</text>
+
+  <rect class="node-i" x="234" y="216" width="352" height="94" rx="8"/>
+  <text class="lbl-b" x="410" y="238" text-anchor="middle">PostgreSQL 16</text>
+  <text class="mono"  x="250" y="260">job</text>
+  <text class="lbl-s" x="330" y="260">definitions</text>
+  <text class="mono"  x="250" y="278">job_execution</text>
+  <text class="lbl-s" x="360" y="278">&larr; this table IS the queue</text>
+  <text class="mono"  x="250" y="296">job_dependency &middot; processed_execution</text>
+
+  <rect class="node" x="640" y="216" width="166" height="94" rx="8"/>
+  <text class="lbl-b" x="723" y="238" text-anchor="middle">Redis 8</text>
+  <text class="mono"  x="723" y="258" text-anchor="middle">scheduler:nodes</text>
+  <text class="lbl-s" x="723" y="276" text-anchor="middle">a sorted set of live peers</text>
+  <text class="lbl-s" x="723" y="292" text-anchor="middle">for the stats endpoint only</text>
+  <text class="lbl-s" x="723" y="306" text-anchor="middle">outage costs nothing</text>
+  <defs>
+    <marker id="p10-arch1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-arch2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-arch3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-arch4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Redis is on the far side of a dashed line on purpose. Two systems that can disagree about
+who owns a row is precisely the failure mode this design exists to avoid, so the cache holds nothing
+a correctness decision depends on &mdash; its health indicator is even disabled so a Redis outage
+cannot pull an instance out of the load balancer.</figcaption>
+</figure>
+
+<h2>The API surface</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Method</th><th>Path</th><th>Notes worth knowing</th></tr></thead>
+<tbody>
+<tr><td><code>POST</code></td><td><code>/api/jobs</code></td><td>Creates the job <em>and</em> its <code>dependsOn</code> edges in one transaction. Rejects cycles with a recursive CTE and bad cron at the boundary.</td></tr>
+<tr><td><code>GET</code></td><td><code>/api/jobs</code>, <code>/api/jobs/{id}</code></td><td>Jobs with resolved parent names.</td></tr>
+<tr><td><code>PATCH</code></td><td><code>/api/jobs/{id}</code></td><td>Partial update. Disabling a cron job stops <em>new</em> occurrences; it does not cancel queued ones.</td></tr>
+<tr><td><code>DELETE</code></td><td><code>/api/jobs/{id}</code></td><td>Edges explicitly, history via <code>ON DELETE CASCADE</code>.</td></tr>
+<tr><td><code>POST</code></td><td><code>/api/jobs/{id}/trigger</code></td><td>Materialises one run plus its whole downstream closure. Keyed on <code>(jobId, now-truncated-to-&micro;s)</code>, so a retried HTTP request collapses instead of double-running.</td></tr>
+<tr><td><code>GET</code></td><td><code>/api/jobs/{id}/executions?status=&amp;limit=</code></td><td>Newest occurrence first, capped at <code>MAX_PAGE_SIZE = 500</code>.</td></tr>
+<tr><td><code>GET</code></td><td><code>/api/executions/stats</code></td><td>Status histogram from Postgres (authoritative) + this node's counters + live peers from Redis (advisory, empty if Redis is down).</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">creating a cron job and a fan-in DAG step<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># Spring cron has SIX fields (second minute hour dom month dow). A five-field Unix
+# expression is rejected at create time rather than silently never firing.
+curl -X POST localhost:18080/api/jobs -H 'Content-Type: application/json' -d '{
+  "name": "every-10s",
+  "type": "CRON",
+  "cronExpr": "*/10 * * * * *",
+  "payload": {"handler": "logging", "message": "tick"}
+}'
+
+curl -X POST localhost:18080/api/jobs -H 'Content-Type: application/json' -d '{
+  "name": "load",
+  "type": "DAG_STEP",
+  "payload": {"handler": "logging", "message": "load"},
+  "dependsOn": ["transform-a", "transform-b"]
+}'</code></pre>
+</div>
+
+<h2>The data model</h2>
+
+<p>Four tables. <code>job</code> is the definition, <code>job_execution</code> is the queue,
+<code>job_dependency</code> is the edge set, <code>processed_execution</code> is the idempotency
+ledger. Two decisions apply to all of them and are worth stating before the DDL: every timestamp is
+<code>timestamptz</code>, and every enumeration is <code>text</code> plus a <code>CHECK</code>.</p>
+
+<div class="codewrap">
+<div class="codehead">the definition table<span class="lang">sql</span></div>
+<pre><code class="lang-sql">CREATE TABLE job (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          text        NOT NULL,
+    type          text        NOT NULL,
+    cron_expr     text,
+    -- payload is opaque to the scheduler except for the reserved key "handler",
+    -- which selects the JobHandler bean. Everything else is passed through to
+    -- the handler untouched.
+    payload       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    max_attempts  integer     NOT NULL DEFAULT 3,
+    timeout_ms    bigint      NOT NULL DEFAULT 30000,
+    enabled       boolean     NOT NULL DEFAULT true,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT job_name_unique          UNIQUE (name),
+    CONSTRAINT job_type_check           CHECK (type IN ('ONE_OFF', 'CRON', 'DAG_STEP')),
+    -- A CRON job without an expression can never fire; reject it at the storage
+    -- layer so a bad API call cannot create an invisible no-op job.
+    CONSTRAINT job_cron_expr_required   CHECK (type &lt;&gt; 'CRON' OR cron_expr IS NOT NULL),
+    CONSTRAINT job_max_attempts_check   CHECK (max_attempts &gt;= 1),
+    CONSTRAINT job_timeout_check        CHECK (timeout_ms &gt; 0)
+);</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Why <code>text</code> + <code>CHECK</code> and not a PostgreSQL <code>ENUM</code></span>
+  <p>Adding a value to a real enum takes a lock and, on older versions, could not be done inside a
+  transaction; a <code>CHECK</code> is trivially altered in a later migration. The price is that the
+  values must stay byte-identical to the Java enum <code>ExecutionStatus</code> &mdash; renaming a
+  constant there compiles fine and then fails at runtime with a constraint violation, or worse,
+  silently stops matching rows.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the queue &mdash; one row per (job, logical occurrence)<span class="lang">sql</span></div>
+<pre><code class="lang-sql">CREATE TABLE job_execution (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id          uuid        NOT NULL REFERENCES job (id) ON DELETE CASCADE,
+
+    -- scheduled_for is the LOGICAL occurrence time (e.g. the cron instant).
+    -- It never moves. It is also the correlation key that groups every step of
+    -- one DAG run together - see job_dependency below.
+    scheduled_for   timestamptz NOT NULL,
+
+    -- run_at is the PHYSICAL earliest-eligible time. Retry backoff pushes this
+    -- into the future; scheduled_for stays put. Keeping the two separate is what
+    -- lets you answer "was the 09:00 run late?" after three retries.
+    run_at          timestamptz NOT NULL,
+
+    status          text        NOT NULL,
+    attempt         integer     NOT NULL DEFAULT 0,
+
+    -- The unit-of-work identity. Derived deterministically from
+    -- (job_id, scheduled_for), so a leader flap that materialises the same cron
+    -- occurrence twice collides here instead of double-scheduling.
+    idempotency_key text        NOT NULL,
+
+    claimed_by      text,
+    claimed_at      timestamptz,
+    heartbeat_at    timestamptz,
+    started_at      timestamptz,
+    finished_at     timestamptz,
+    error           text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT job_execution_idempotency_key_unique UNIQUE (idempotency_key),
+    CONSTRAINT job_execution_status_check CHECK (
+        status IN ('PENDING', 'BLOCKED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'DEAD_LETTER', 'CANCELLED')
+    ),
+    CONSTRAINT job_execution_attempt_check CHECK (attempt &gt;= 0),
+    -- Invariant: a RUNNING row always names its owner and carries a heartbeat.
+    -- Without this a bug that forgets claimed_by would make the orphan sweeper
+    -- silently unable to attribute (or reclaim) the row.
+    CONSTRAINT job_execution_running_is_owned CHECK (
+        status &lt;&gt; 'RUNNING' OR (claimed_by IS NOT NULL AND heartbeat_at IS NOT NULL)
+    )
+);</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Column</th><th>Role</th><th>Why it is shaped that way</th></tr></thead>
+<tbody>
+<tr><td><code>scheduled_for</code></td><td>Logical occurrence instant</td><td>Never moves. Doubles as the DAG run-correlation key, which is what removes the need for a <code>run_id</code> column &mdash; and is also the single-root limitation of the design.</td></tr>
+<tr><td><code>run_at</code></td><td>Physical earliest-eligible instant</td><td>The claim predicate reads this, never <code>scheduled_for</code>. Retry backoff, DAG promotion and (if you add it) start jitter all move this column and nothing else.</td></tr>
+<tr><td><code>status</code></td><td>Ownership record after commit</td><td>Row locks hold the line <em>during</em> the claim transaction; <code>status</code> holds it afterwards. Both are needed and they are needed at different times.</td></tr>
+<tr><td><code>attempt</code></td><td>Attempts that already finished and failed</td><td>0 on the first run. <code>max_attempts = 3</code> means three executions total: the third failure sets <code>attempt = 3</code>, <code>3 &ge; 3</code> holds, dead letter. The off-by-one here is the classic bug.</td></tr>
+<tr><td><code>idempotency_key</code></td><td><code>jobId@ISO-instant</code>, unique</td><td>Deterministic, so two instances that independently decide to materialise 09:00 produce the <em>same string</em> and collide. A random UUID would pass every single-instance test and duplicate every cron job the moment you scaled to two replicas.</td></tr>
+<tr><td><code>claimed_by</code> / <code>claimed_at</code></td><td>Owner attribution</td><td>Makes <code>SELECT claimed_by, status, count(*) &hellip; GROUP BY 1,2</code> a one-line proof that <code>SKIP LOCKED</code> partitions the queue.</td></tr>
+<tr><td><code>heartbeat_at</code></td><td>Liveness, as a timestamp</td><td>Replaces a membership protocol entirely. Older than <code>lease-timeout</code> &rArr; orphan.</td></tr>
+<tr><td><code>started_at</code></td><td>First attempt's start</td><td>Written once, with <code>COALESCE(started_at, :now)</code> on claim, and never cleared on retry &mdash; so <code>lagMillis</code> keeps measuring the whole occurrence rather than resetting to the newest attempt.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A naive <code>timestamp</code> column silently double-fires or skips jobs</span>
+  <p>Never store scheduler time as <code>timestamp without time zone</code>. The claim query compares
+  against <code>now()</code>; on a naive column a DST shift moves that comparison by an hour and you
+  get an hour of duplicate firings or of skipped ones, with nothing in the logs to explain it.
+  Everything here is <code>timestamptz</code>, Hibernate is pinned with
+  <code>hibernate.jdbc.time_zone: UTC</code> so a worker in <code>Europe/Berlin</code> cannot disagree
+  with one in UTC, and the native queries bind <code>OffsetDateTime</code> rather than
+  <code>Instant</code> because the driver has a direct binding for it.</p>
+</div>
+
+<h2>The claim index, and the reasoning</h2>
+
+<p>The hot query runs a few times per second per instance forever, against a table that grows by two
+million rows a day. Everything about the index follows from those two facts.</p>
+
+<div class="codewrap">
+<div class="codehead">the index the whole queue rests on<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- Why a PARTIAL index:
+--   PENDING rows are a small, self-cleaning minority. SUCCEEDED rows accumulate
+--   forever. A full index on (status, run_at) would grow without bound and every
+--   claim would page through dead heap entries. The partial index only ever
+--   holds rows that are actually claimable, so it stays roughly the size of the
+--   backlog no matter how much history the table carries.
+--
+-- Why (status, run_at) and not just (run_at):
+--   Under the WHERE status = 'PENDING' predicate the leading column is constant,
+--   so it costs one byte per entry and contributes no selectivity. It is kept
+--   because it makes the index self-documenting and lets the planner match the
+--   query's own predicate order without relying on predicate-implication proofs.
+--   Crucially, entries are still ordered by run_at within the constant status,
+--   so ORDER BY run_at is served directly from the index - no sort node, which
+--   is what makes LIMIT :batch cheap even with a million-row backlog.
+--
+-- Why this matters for SKIP LOCKED:
+--   SKIP LOCKED skips rows another transaction has locked, but it only knows to
+--   skip them AFTER visiting them. With an index scan the visit order is run_at
+--   order, so N workers walk the same ordered list and each takes the first
+--   :batch rows nobody else holds. Without the index you get a seq scan + sort,
+--   every worker materialises the whole backlog, and throughput collapses.
+CREATE INDEX idx_job_execution_claim
+    ON job_execution (status, run_at)
+    WHERE status = 'PENDING';</code></pre>
+</div>
+
+<p>The sweeper gets the same treatment for the same reason &mdash; <code>RUNNING</code> is a tiny,
+transient set, so its index should cost in proportion to in-flight work rather than to history:</p>
+
+<div class="codewrap">
+<div class="codehead">the other four indexes, and what each one is for<span class="lang">sql</span></div>
+<pre><code class="lang-sql">CREATE INDEX idx_job_execution_heartbeat
+    ON job_execution (heartbeat_at)
+    WHERE status = 'RUNNING';
+
+-- FK index. PostgreSQL does NOT create one automatically for a foreign key, and
+-- without it `DELETE FROM job` has to seq-scan job_execution to enforce the
+-- ON DELETE CASCADE.
+CREATE INDEX idx_job_execution_job_id ON job_execution (job_id);
+
+-- Backs the DAG eligibility check, which asks "is there a SUCCEEDED execution of
+-- parent P for this exact scheduled_for?" for every parent of every BLOCKED row.
+CREATE INDEX idx_job_execution_dag_lookup
+    ON job_execution (job_id, scheduled_for, status);
+
+-- Backs GET /api/jobs/{id}/executions (most recent first) and the cron ticker's
+-- "what is the latest occurrence I already materialised for this job?" probe.
+CREATE INDEX idx_job_execution_job_scheduled_desc
+    ON job_execution (job_id, scheduled_for DESC);
+
+CREATE INDEX idx_job_execution_blocked
+    ON job_execution (scheduled_for)
+    WHERE status = 'BLOCKED';</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>BLOCKED</code> is a separate status, not "<code>PENDING</code> with a far-future <code>run_at</code>"</span>
+  <p>The tempting simplification is to park unsatisfied DAG steps as <code>PENDING</code> with
+  <code>run_at = 'infinity'</code> and save a status value. Do that and every blocked step becomes an
+  entry in the claim index: a 500-step fan-out costs the hot path 500 unclaimable index entries on
+  every poll, forever. A distinct status keeps blocked work out of
+  <code>idx_job_execution_claim</code> entirely, so wide DAGs cost the queue nothing.</p>
+</div>
+
+<h2>The core problem: claiming work exactly once across N instances</h2>
+
+<p>N identical processes see the same table of due rows. Each must end up executing a disjoint
+subset, with no row executed by two of them, and no row left behind if a process dies. There are four
+credible ways to do it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Candidate</th><th>How it works</th><th>Why it was rejected</th></tr></thead>
+<tbody>
+<tr><td><strong>Single scheduler</strong> (active/passive)</td><td>One process claims and executes; the others idle behind a leader lock or a Kubernetes <code>replicas: 1</code>.</td><td>Trivially correct and trivially capacity-bound: throughput is one JVM, and a failover gap is a scheduling gap. The standby costs money to do nothing. Worse, "exactly once" degrades to "exactly once <em>while that process is alive</em>" &mdash; you still need everything below to recover its work.</td></tr>
+<tr><td><strong>Per-job distributed lock</strong> (Redis <code>SET NX PX</code>, Redlock, ZooKeeper ephemeral node)</td><td>Read due rows, then take a per-row lock in the lock service before executing.</td><td>Two stores that can disagree. The lock has a TTL; a GC pause longer than the TTL means the lock expires while the holder is still running, and there is no fencing token on the side effect to stop it. It is also <em>chatty</em>: N instances &times; M due rows lock round trips per poll. And a Redis outage now stops scheduling, which is exactly the coupling the design refuses.</td></tr>
+<tr><td><strong>Leader-partitioned assignment</strong> (leader hashes jobs into shards, Kafka-style rebalance)</td><td>A leader assigns partitions to members; each member claims only its own shard, so claims never collide by construction.</td><td>You now own a membership protocol, a rebalance protocol and a generation/epoch number. During a rebalance a partition is briefly owned by two members, so you need fencing anyway. Load skews with hash distribution, and a single hot job cannot be split. Enormous machinery for a problem the database already solves.</td></tr>
+<tr><td><strong><code>FOR UPDATE SKIP LOCKED</code></strong> &nbsp;&larr; chosen</td><td>Each worker runs one transaction: lock up to <code>batch</code> due rows, skipping anything a peer holds, flip them to <code>RUNNING</code>, commit.</td><td>The lock manager and the state are the same system, so they cannot disagree. No membership, no TTL, no fencing token, no second dependency. The costs are real and accepted: it is PostgreSQL-bound, it needs the partial index to stay fast, and PostgreSQL is now a single point of failure.</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Two workers scanning the same run_at-ordered index; worker A locks the first three rows, worker B steps over them and takes the next three, so the queue is partitioned without either waiting">
+  <text class="lbl-b" x="14" y="18">idx_job_execution_claim, walked in run_at order by both workers at the same instant</text>
+
+  <rect class="node-o" x="120" y="30" width="86" height="34" rx="5"/>
+  <rect class="node-o" x="210" y="30" width="86" height="34" rx="5"/>
+  <rect class="node-o" x="300" y="30" width="86" height="34" rx="5"/>
+  <rect class="node-i" x="390" y="30" width="86" height="34" rx="5"/>
+  <rect class="node-i" x="480" y="30" width="86" height="34" rx="5"/>
+  <rect class="node-i" x="570" y="30" width="86" height="34" rx="5"/>
+  <rect class="node"   x="660" y="30" width="86" height="34" rx="5"/>
+  <text class="mono" x="163" y="52" text-anchor="middle">10:00:00.1</text>
+  <text class="mono" x="253" y="52" text-anchor="middle">10:00:00.2</text>
+  <text class="mono" x="343" y="52" text-anchor="middle">10:00:00.4</text>
+  <text class="mono" x="433" y="52" text-anchor="middle">10:00:00.7</text>
+  <text class="mono" x="523" y="52" text-anchor="middle">10:00:01.1</text>
+  <text class="mono" x="613" y="52" text-anchor="middle">10:00:01.3</text>
+  <text class="mono" x="703" y="52" text-anchor="middle">10:00:31.0</text>
+  <text class="lbl-s" x="14" y="52">run_at &rarr;</text>
+  <text class="lbl-s" x="703" y="80" text-anchor="middle">not due yet:</text>
+  <text class="lbl-s" x="703" y="94" text-anchor="middle">run_at &gt; now()</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="80" y1="140" x2="120" y2="70" marker-end="url(#p10-clm1)"/>
+    <line class="edge-a" x1="80" y1="200" x2="390" y2="70" marker-end="url(#p10-clm2)"/>
+  </g>
+
+  <rect class="node-o" x="14" y="126" width="60" height="34" rx="5"/>
+  <text class="lbl-b" x="44" y="147" text-anchor="middle">A</text>
+  <rect class="node-i" x="14" y="186" width="60" height="34" rx="5"/>
+  <text class="lbl-b" x="44" y="207" text-anchor="middle">B</text>
+
+  <text class="lbl-s" x="120" y="130">A arrives first, locks the three oldest rows, marks them RUNNING, commits.</text>
+  <text class="lbl-s" x="120" y="148">Its FOR UPDATE row locks hold from the SELECT until COMMIT.</text>
+  <text class="lbl-s" x="120" y="176">B starts the identical query one millisecond later. It VISITS rows 1-3,</text>
+  <text class="lbl-s" x="120" y="194">sees them locked, and &mdash; because of SKIP LOCKED &mdash; steps over them</text>
+  <text class="lbl-s" x="120" y="212">instead of blocking. It takes the next three it can lock.</text>
+
+  <rect class="node-w" x="120" y="234" width="626" height="52" rx="6"/>
+  <text class="lbl-b" x="433" y="254" text-anchor="middle">Delete SKIP LOCKED and it is still CORRECT &mdash; but B now blocks on A's locks,</text>
+  <text class="lbl-s" x="433" y="272" text-anchor="middle">then re-evaluates the predicate after A commits, finds nothing PENDING, and returns empty. N workers, the throughput of one.</text>
+  <defs>
+    <marker id="p10-clm1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-clm2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption><code>FOR UPDATE</code> buys correctness; <code>SKIP LOCKED</code> buys throughput. They are
+separable, and exercise 1 in the project has you remove them one at a time to see exactly which
+guarantee came from which keyword.</figcaption>
+</figure>
+
+<h3>The actual SQL</h3>
+
+<div class="codewrap">
+<div class="codehead"><code>JobExecutionRepository.selectDueForUpdate</code> &mdash; step 1 of 2<span class="lang">java</span></div>
+<pre><code class="lang-java">@Query(value = """
+        SELECT e.id
+          FROM job_execution e
+         WHERE e.status = 'PENDING'
+           AND e.run_at &lt;= :now
+         ORDER BY e.run_at
+           FOR UPDATE SKIP LOCKED
+         LIMIT :batchSize
+        """, nativeQuery = true)
+List&lt;UUID&gt; selectDueForUpdate(@Param("now") OffsetDateTime now,
+                              @Param("batchSize") int batchSize);</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead"><code>markRunning</code> &mdash; step 2 of 2, same transaction<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional
+@Modifying(flushAutomatically = true, clearAutomatically = true)
+@Query(value = """
+        UPDATE job_execution
+           SET status       = 'RUNNING',
+               claimed_by   = :workerId,
+               claimed_at   = :now,
+               heartbeat_at = :now,
+               started_at   = COALESCE(started_at, :now)
+         WHERE id IN (:ids)
+        """, nativeQuery = true)
+int markRunning(@Param("ids") Collection&lt;UUID&gt; ids,
+                @Param("workerId") String workerId,
+                @Param("now") OffsetDateTime now);</code></pre>
+</div>
+
+<p>Three details in those twenty lines carry the design. <strong>Ids, not entities</strong>: the
+projection keeps the locked window short and stops Hibernate hydrating objects while peers contend on
+the index. <strong><code>ORDER BY run_at</code> survives the lock</strong> &mdash; PostgreSQL orders
+<em>before</em> locking and drops locked rows rather than reordering them, so the effective policy is
+"oldest eligible work first, minus whatever peers already took"; drop it and a large backlog starves
+its own head. <strong><code>clearAutomatically</code></strong> because bulk SQL bypasses the
+persistence context: without it the re-read serves cached copies that still say
+<code>PENDING</code>.</p>
+
+<div class="codewrap">
+<div class="codehead"><code>ExecutionClaimer.claim</code> &mdash; the transaction boundary is the whole mechanism<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional(propagation = Propagation.REQUIRES_NEW)
+public List&lt;Claimed&gt; claim(String workerId, int batchSize) {
+    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+
+    List&lt;UUID&gt; ids = executions.selectDueForUpdate(now, batchSize);
+    if (ids.isEmpty()) {
+        return List.of();
+    }
+
+    int updated = executions.markRunning(ids, workerId, now);
+    if (updated != ids.size()) {
+        // Cannot happen while we hold the row locks - which is exactly why it is worth
+        // asserting. If this ever fires, someone has added a code path that mutates
+        // job_execution without taking the lock first.
+        log.warn("claim mismatch: locked {} rows but updated {} (workerId={})",
+                ids.size(), updated, workerId);
+    }
+
+    // Re-read after the bulk UPDATE (which cleared the persistence context) so the snapshots
+    // reflect committed-to-be state, with the definition fetch-joined.
+    List&lt;JobExecution&gt; claimed = executions.findAllWithJobByIdIn(ids);
+
+    // An "id IN (:ids)" query makes NO promise about row order - the planner is free to return
+    // a bitmap heap scan in physical order, or an index scan in (random) UUID order. The claim
+    // order that matters was established by ORDER BY run_at in selectDueForUpdate, and the
+    // whole fairness property ("oldest eligible work first") depends on the batch being
+    // dispatched in that order, so re-impose it here instead of inheriting the planner's whim.
+    Map&lt;UUID, JobExecution&gt; byId = new HashMap&lt;&gt;();
+    for (JobExecution execution : claimed) {
+        byId.put(execution.getId(), execution);
+    }
+    List&lt;Claimed&gt; result = ids.stream()
+            .map(byId::get)
+            .filter(Objects::nonNull)
+            .map(ExecutionClaimer::snapshot)
+            .toList();
+    log.debug("worker {} claimed {} execution(s)", workerId, result.size());
+    return result;
+}</code></pre>
+</div>
+
+<p>The re-read is what forces the last five lines. <code>ORDER BY run_at</code> orders the
+<em>ids</em>, but <code>findAllWithJobByIdIn</code> is a separate <code>id IN (:ids)</code> query with
+no <code>ORDER BY</code> of its own, and SQL guarantees nothing about the order of an unordered
+result. So the batch is re-sorted into <code>ids</code> order before it is dispatched. Skip that step
+and half the fairness argument above evaporates at the last moment: the SELECT still picks the oldest
+eligible rows, but <code>pollOnce</code> hands them to the pool in whatever order the planner
+happened to emit &mdash; which, with a bounded pool, is the order they actually run in.</p>
+
+<p><code>REQUIRES_NEW</code> is deliberate: a claim must never be enlisted in a longer-lived caller
+transaction. The locks have to be released promptly, and a claim that "succeeds" and is then rolled
+back by an unrelated failure leaves rows <code>RUNNING</code> with nobody running them &mdash;
+recoverable only via the 30-second lease. See
+<span class="xref">Spring transactions</span> and
+<span class="xref">PostgreSQL concurrency
+patterns</span>.</p>
+
+<div class="box gotcha">
+  <span class="bt">Never claim more rows than you have free slots</span>
+  <p>A claimed row is <code>RUNNING</code> in the database with a lease already ticking, whether or not
+  a thread is working on it. Claim greedily and rows time out while queued locally, the sweeper hands
+  them to a peer, and the same work runs twice &mdash; a duplicate you inflicted on yourself. Hence
+  <code>pollOnce</code> asks for <code>Math.min(claimBatchSize, slots.availablePermits())</code>. The
+  pool also uses <code>AbortPolicy</code>, not <code>CallerRunsPolicy</code>: caller-runs would execute
+  the job on the <code>@Scheduled</code> thread and block every other scheduled task &mdash; including
+  the heartbeat keeping this instance's leases alive.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">The claim is exact; delivery is not</span>
+  <p>Do not overstate what <code>SKIP LOCKED</code> buys. It guarantees that <em>claiming</em> never
+  hands one row to two instances. It says nothing about afterwards: a frozen-then-thawed JVM can
+  resume and finish a job whose row was already reclaimed and re-run elsewhere. That is unavoidable
+  without fencing tokens on every downstream side effect, so the system accepts at-least-once and
+  makes duplicates cheap (see <span class="xref">idempotency</span>).
+  The ledger closes the "completion write was lost" window, not the "side effect happened twice"
+  window. Handlers must still be idempotent.</p>
+</div>
+
+<h3>Cron materialisation uses a different lock, on purpose</h3>
+
+<p>Claiming is contention over <em>existing</em> rows, so row locks work. Materialisation creates rows
+that do not exist yet, and you cannot lock a row that is not there. The unique constraint on
+<code>idempotency_key</code> already makes duplicate materialisation harmless, so the advisory lock is
+purely a cost optimisation: it makes the tick O(1) per cluster rather than O(instances), and stops
+every loser logging a constraint violation once a second.</p>
+
+<div class="codewrap">
+<div class="codehead"><code>CronTicker.tick</code> &mdash; the entire leader election<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional
+public int tick() {
+    // A losing instance discovers it lost in microseconds and does no further work. This is
+    // the whole leader election: no heartbeats, no term numbers, no split brain, because the
+    // lock is held by a database transaction rather than by a process's belief about itself.
+    if (!advisoryLock.tryLock(props.cron().advisoryLockKey())) {
+        log.trace("another instance holds the cron lock this tick; skipping");
+        return 0;
+    }
+    ...
+}</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">and the insert that makes a leader flap harmless anyway<span class="lang">sql</span></div>
+<pre><code class="lang-sql">INSERT INTO job_execution
+       (id, job_id, scheduled_for, run_at, status, attempt, idempotency_key, created_at)
+VALUES (:id, :jobId, :scheduledFor, :runAt, :status, 0, :idempotencyKey, now())
+ON CONFLICT (idempotency_key) DO NOTHING</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>pg_try_advisory_lock</code> instead of <code>pg_try_advisory_xact_lock</code> wedges the cluster</span>
+  <p>A session lock is held until you unlock it or the backend session ends. Behind HikariCP you
+  acquire on one pooled connection and release on another, the lock leaks, and cron materialisation
+  stops cluster-wide until that connection is retired &mdash; with no error anywhere. The
+  transaction-scoped form is released by COMMIT or ROLLBACK, so "the tick failed halfway" and "the
+  lock was released" cannot disagree, and a SIGKILLed JVM's lock evaporates with its backend rather
+  than waiting on TCP keepalive. <code>AdvisoryLock.tryLock</code> therefore <em>throws</em> outside a
+  transaction: in autocommit the lock is taken and released by the same statement and always returns
+  <code>true</code> &mdash; invisible in testing (one instance always wins), catastrophic in production
+  (every instance always wins).</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Spring self-invocation silently disables the transaction</span>
+  <p><code>@Transactional</code> is proxy-based, and a proxy only intercepts calls arriving from
+  outside the bean. Had <code>scheduledTick()</code> called <code>this.tick()</code> directly there
+  would be no transaction and the advisory lock would be meaningless. The project routes the call back
+  through the container as <code>self.getObject().tick()</code>, where the
+  <code>ObjectProvider&lt;CronTicker&gt;</code> indirection avoids the circular constructor dependency a
+  direct self-injection would create. <code>OrphanSweeper</code> and <code>DagResolver</code> do the
+  same.</p>
+</div>
+
+<h2>Cron semantics: zones, DST, catch-up and the midnight herd</h2>
+
+<h3>Everything is UTC, and that is a choice with consequences</h3>
+
+<p>The ticker advances its cursor with <code>cursorInstant.atZone(ZoneOffset.UTC)</code>, so
+<code>0 0 2 * * *</code> means 02:00 UTC on every one of the year's 365 days. There is no DST, because
+UTC has no DST. That is the right default for a scheduler and the wrong one for a business calendar,
+and the difference is worth being explicit about.</p>
+
+<div class="box gotcha">
+  <span class="bt">Adding a per-job timezone imports two bugs you currently do not have</span>
+  <p>Evaluate a cron expression in a DST zone and the daily 02:30 job hits both hazards. On the
+  <strong>spring-forward</strong> day 02:30 local <em>does not exist</em>:
+  <code>CronExpression.next</code> steps over it and the job silently does not run. On the
+  <strong>fall-back</strong> day it happens <em>twice</em>, an hour apart &mdash; two distinct instants,
+  so two <code>scheduled_for</code> values, two idempotency keys, and the job genuinely runs twice. The
+  unique constraint cannot save you: those are not duplicates, they are two different logical instants
+  sharing a wall-clock label. Add a <code>timezone</code> column if you must, then decide per job, in
+  writing, which of skip-or-double you prefer.</p>
+</div>
+
+<h3>Catch-up after downtime</h3>
+
+<div class="codewrap">
+<div class="codehead">the cursor is what makes the ticker resumable<span class="lang">java</span></div>
+<pre><code class="lang-java">CronExpression cron = CronExpression.parse(job.getCronExpr());
+
+Instant cursorInstant = executions.findLatestScheduledFor(job.getId()).orElse(now);
+ZonedDateTime cursor = cursorInstant.atZone(ZoneOffset.UTC);
+
+int created = 0;
+for (int i = 0; i &lt; props.cron().maxOccurrencesPerTick(); i++) {
+    ZonedDateTime next = cron.next(cursor);
+    if (next == null) {
+        // CronExpression returns null when the expression can never match again, e.g.
+        // "0 0 0 30 2 *" - 30 February.
+        log.warn("cron expression '{}' on job '{}' has no further occurrences",
+                job.getCronExpr(), job.getName());
+        break;
+    }
+    Instant nextInstant = next.toInstant();
+    if (nextInstant.isAfter(horizonEnd)) {
+        break;
+    }
+    created += materializer.materializeRun(job, nextInstant).size();
+    cursor = next;
+}</code></pre>
+</div>
+
+<p>Three policies are encoded there. The cursor starts at <strong>the newest occurrence already in
+the database</strong>, so a restart &mdash; or ten minutes of cluster downtime &mdash; resumes where
+it stopped instead of silently dropping the gap. A job seen for the <strong>first time</strong> starts
+from <code>now</code>: created at noon with <code>0 0 * * * *</code> it schedules 13:00, not a replay
+of every hour since midnight. And catch-up is <strong>bounded</strong>, because a one-second job down
+for a day would otherwise create 86,400 rows in one transaction &mdash; a long lock hold, a bloated
+WAL record, and a burst that saturates every worker the instant it commits.</p>
+
+<div class="box gotcha">
+  <span class="bt">Bounded catch-up means a long outage takes hours to drain, and every recovered row is due <em>now</em></span>
+  <p>Do the arithmetic before you rely on it. A once-per-second job misses 86,400 occurrences in a day
+  of downtime; the ticker fires once per second and creates at most 16, so it closes the gap at
+  15/second &mdash; 86,400&nbsp;/&nbsp;15 &asymp; <strong>1.6&nbsp;hours</strong> before the schedule is
+  current again, with every recovered row's <code>run_at</code> in the past and therefore immediately
+  claimable. For most jobs the honest policy is not "replay everything" but "run the missed occurrence
+  once, or skip it", and the place to implement it is the cursor, clamped to
+  <code>max(latestScheduledFor, now - graceWindow)</code>.</p>
+</div>
+
+<h3>The midnight thundering herd</h3>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="Timeline showing scheduled_for fixed at midnight while run_at moves right under jitter and retry backoff, keeping the two columns distinct">
+  <text class="lbl-b" x="14" y="18">scheduled_for never moves. run_at is the only column anything is allowed to push right.</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="120" y1="70" x2="800" y2="70" marker-end="url(#p10-jit1)"/>
+  </g>
+  <text class="lbl-s" x="14" y="74">wall clock &rarr;</text>
+  <line class="dash" x1="150" y1="40" x2="150" y2="220"/>
+  <text class="mono"  x="150" y="34" text-anchor="middle">00:00:00.000</text>
+
+  <rect class="node-d" x="128" y="86" width="46" height="26" rx="4"/>
+  <text class="lbl-s" x="184" y="104">1,000 daily jobs all materialise with scheduled_for = run_at = midnight exactly:</text>
+  <text class="lbl-s" x="184" y="120">one instant, 1,000 claimable rows, every worker and every downstream target hit at once.</text>
+
+  <rect class="node-o" x="128" y="140" width="26" height="24" rx="4"/>
+  <rect class="node-o" x="196" y="140" width="26" height="24" rx="4"/>
+  <rect class="node-o" x="268" y="140" width="26" height="24" rx="4"/>
+  <rect class="node-o" x="352" y="140" width="26" height="24" rx="4"/>
+  <rect class="node-o" x="430" y="140" width="26" height="24" rx="4"/>
+  <rect class="node-o" x="520" y="140" width="26" height="24" rx="4"/>
+  <text class="lbl-s" x="566" y="157">&larr; run_at = scheduled_for + hash(jobId) mod window</text>
+  <text class="lbl-s" x="184" y="184">Same occurrence, same idempotency key, same SLA report &mdash; the key is built from</text>
+  <text class="lbl-s" x="184" y="200">scheduled_for alone, so spreading run_at cannot change which occurrence a row is.</text>
+  <text class="lbl-s" x="184" y="216">Retry backoff moves run_at the same way, which is why "was the 00:00 run late?" stays answerable.</text>
+  <defs>
+    <marker id="p10-jit1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Splitting the logical instant from the physical one costs a column and buys start jitter,
+retry backoff and honest lateness reporting from the same mechanism.</figcaption>
+</figure>
+
+<p>The project does <strong>not</strong> jitter cron start times: <code>materializeRun</code> writes
+the same instant into both columns. That is right for its scale, and it stays a one-line change
+because the schema was shaped for it. Note what the jittered value must <em>not</em> touch:</p>
+
+<div class="codewrap">
+<div class="codehead">the key is a pure function of the LOGICAL instant &mdash; <code>ExecutionMaterializer</code><span class="lang">java</span></div>
+<pre><code class="lang-java">public static String idempotencyKey(UUID jobId, Instant scheduledFor) {
+    return jobId + "@" + DateTimeFormatter.ISO_INSTANT.format(normalize(scheduledFor));
+}
+
+/** Microsecond truncation, matching timestamptz resolution. */
+public static Instant normalize(Instant instant) {
+    return instant.truncatedTo(ChronoUnit.MICROS);
+}</code></pre>
+</div>
+
+<div class="box deep">
+  <span class="bt">Adding start jitter &mdash; not in the project, but this is the shape</span>
+  <p>Only the <code>run_at</code> argument to <code>insertIfAbsent</code> changes. Derive the offset
+  from the job id rather than from a random draw, so two instances materialising the same occurrence
+  compute the same <code>run_at</code> and the row is identical whichever of them wins the insert.</p>
+<div class="codewrap"><pre><code class="lang-java">// run_at only. scheduled_for and idempotencyKey(jobId, when) stay untouched.
+long windowMs = 120_000L;                                   // spread over two minutes
+long offset   = Math.floorMod(jobId.hashCode(), windowMs);  // deterministic per job
+Instant runAt = when.plusMillis(offset);</code></pre></div>
+  <p>The trade is visible and worth naming: p50 start latency for a midnight job goes from ~0 to
+  ~60&nbsp;s, and any job that genuinely must run at exactly 00:00:00 has to be excluded. Jitter is a
+  load-shaping tool, not a default.</p>
+</div>
+
+<h2>The execution state machine</h2>
+
+<figure>
+<svg viewBox="0 0 820 360" role="img" aria-label="State machine for one execution: BLOCKED or PENDING at materialisation, PENDING to RUNNING by claim, then SUCCEEDED, a jittered retry back to PENDING, DEAD_LETTER when attempts are exhausted, FAILED when non-retryable, and CANCELLED for unreachable DAG steps">
+  <text class="lbl-b" x="14" y="18">materialisation &rarr; one row per (job, occurrence)</text>
+
+  <rect class="node"   x="14"  y="30" width="150" height="42" rx="6"/>
+  <text class="lbl-b"  x="89"  y="49" text-anchor="middle">BLOCKED</text>
+  <text class="lbl-s"  x="89"  y="65" text-anchor="middle">has parents</text>
+
+  <rect class="node-a" x="14"  y="140" width="150" height="42" rx="6"/>
+  <text class="lbl-b"  x="89"  y="159" text-anchor="middle">PENDING</text>
+  <text class="lbl-s"  x="89"  y="175" text-anchor="middle">claimable when run_at &le; now()</text>
+
+  <rect class="node-i" x="300" y="140" width="150" height="42" rx="6"/>
+  <text class="lbl-b"  x="375" y="159" text-anchor="middle">RUNNING</text>
+  <text class="lbl-s"  x="375" y="175" text-anchor="middle">owner + ticking lease</text>
+
+  <rect class="node-o" x="620" y="36"  width="176" height="42" rx="6"/>
+  <text class="lbl-b"  x="708" y="55"  text-anchor="middle">SUCCEEDED</text>
+  <text class="lbl-s"  x="708" y="71"  text-anchor="middle">+ ledger row, one transaction</text>
+
+  <rect class="node-d" x="620" y="196" width="176" height="42" rx="6"/>
+  <text class="lbl-b"  x="708" y="215" text-anchor="middle">DEAD_LETTER</text>
+  <text class="lbl-s"  x="708" y="231" text-anchor="middle">attempt &ge; max_attempts</text>
+
+  <rect class="node-d" x="620" y="256" width="176" height="42" rx="6"/>
+  <text class="lbl-b"  x="708" y="275" text-anchor="middle">FAILED</text>
+  <text class="lbl-s"  x="708" y="291" text-anchor="middle">NonRetryableException</text>
+
+  <rect class="node-w" x="14"  y="286" width="150" height="42" rx="6"/>
+  <text class="lbl-b"  x="89"  y="305" text-anchor="middle">CANCELLED</text>
+  <text class="lbl-s"  x="89"  y="321" text-anchor="middle">an ancestor died</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="89"  y1="74"  x2="89"  y2="136" marker-end="url(#p10-sm1)"/>
+    <line class="edge-a" x1="166" y1="161" x2="296" y2="161" marker-end="url(#p10-sm2)"/>
+    <line class="edge-a" x1="452" y1="152" x2="616" y2="70"  marker-end="url(#p10-sm3)"/>
+  </g>
+  <text class="lbl-s" x="98"  y="96">all parents SUCCEEDED</text>
+  <text class="lbl-s" x="98"  y="112">for THIS scheduled_for</text>
+  <text class="lbl-s" x="182" y="152">claim: FOR UPDATE</text>
+  <text class="lbl-s" x="182" y="136">SKIP LOCKED, one tx</text>
+  <text class="lbl-s" x="470" y="120">handler returned</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="452" y1="172" x2="616" y2="214" marker-end="url(#p10-sm4)"/>
+    <line class="edge-d" x1="452" y1="180" x2="616" y2="272" marker-end="url(#p10-sm5)"/>
+    <path class="edge-d" d="M 375 186 C 375 250 200 250 120 186" marker-end="url(#p10-sm6)"/>
+    <line class="edge-d" x1="89" y1="184" x2="89" y2="282" marker-end="url(#p10-sm7)"/>
+  </g>
+  <text class="lbl-s" x="196" y="238">retry: status &rarr; PENDING,</text>
+  <text class="lbl-s" x="196" y="254">run_at += uniform(0, cap),</text>
+  <text class="lbl-s" x="196" y="270">claim released, slot freed</text>
+  <text class="lbl-s" x="470" y="200">attempts exhausted</text>
+  <text class="lbl-s" x="470" y="262">never going to work</text>
+
+  <text class="lbl-s" x="480" y="330">A lease expiry is a FAILURE, not a free re-queue: the sweeper routes it through the same</text>
+  <text class="lbl-s" x="480" y="346">RetryPolicy, so a job that reliably kills its worker dead-letters instead of looping forever.</text>
+  <defs>
+    <marker id="p10-sm1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p10-sm7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Seven states, and the two red terminals are deliberately distinct:
+<code>DEAD_LETTER</code> means "we tried and gave up", <code>FAILED</code> means "trying was never
+going to help". Collapsing them costs you the ability to tell a flaky dependency from a bad payload.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead"><code>RetryPolicy.recordFailure</code> &mdash; every transition out of RUNNING except success<span class="lang">java</span></div>
+<pre><code class="lang-java">public void recordFailure(JobExecution execution, String error, Instant now, boolean retryable) {
+    int attempt = execution.getAttempt() + 1;
+    execution.setAttempt(attempt);
+    execution.setError(truncate(error));
+    // Must happen before the status is set to anything non-RUNNING, and must happen at all:
+    // the job_execution_running_is_owned CHECK constraint only permits RUNNING rows to carry
+    // an owner, so leaving claimed_by set on a PENDING row is not merely untidy, the sweeper
+    // and the heartbeat would both misattribute it.
+    execution.releaseClaim();
+
+    int maxAttempts = execution.getJob().getMaxAttempts();
+
+    if (!retryable) {
+        execution.setStatus(ExecutionStatus.FAILED);
+        execution.setFinishedAt(now);
+        return;
+    }
+    if (attempt &gt;= maxAttempts) {
+        execution.setStatus(ExecutionStatus.DEAD_LETTER);
+        execution.setFinishedAt(now);
+        return;
+    }
+    execution.setStatus(ExecutionStatus.PENDING);
+    execution.setRunAt(now.plus(nextDelay(attempt)));
+    // started_at is deliberately LEFT ALONE. It records when this occurrence first began, not
+    // when the current attempt began, which is what makes ExecutionResponse.lagMillis ("how
+    // late did this occurrence start?") comparable across a retried and a first-time execution.
+    // Clearing it here would also make the COALESCE(started_at, :now) in the claim UPDATE dead
+    // code: the column would be NULL at every claim, so each retry would overwrite the true
+    // start time and end-to-end latency including retries would be unrecoverable.
+    // "Is it in progress?" is answered by status, which is PENDING from here.
+}</code></pre>
+</div>
+
+<p>The last line of that method is the one to read twice: it is the line that <em>is not there</em>.
+<code>started_at</code> is never cleared on a retry, so it keeps the instant the occurrence first
+started running &mdash; which is exactly what <code>COALESCE(started_at, :now)</code> in
+<code>markRunning</code> assumes. Clear it here and the COALESCE becomes dead code, because the column
+is <code>NULL</code> at every claim; each retry then stamps a fresh <code>started_at</code> and
+<code>lagMillis</code> silently changes meaning from "how late did the 09:00 run start?" to "how late
+did its most recent attempt start?" &mdash; a metric that <em>falls</em> as a job gets sicker. Nothing
+needs <code>started_at</code> to mean "in progress": that question is answered by <code>status</code>,
+which is <code>PENDING</code> from here.</p>
+
+<p>Retrying is "put the row back in the queue with a future <code>run_at</code>", never "sleep in the
+worker". Sleeping would occupy a thread and, far worse, keep the lease alive, so a five-minute
+backoff would pin capacity for five minutes doing nothing. Pushing <code>run_at</code> forward frees
+the slot instantly and lets <em>any</em> instance pick the work up when it comes due.</p>
+
+<div class="codewrap">
+<div class="codehead">the backoff cap, and why it is a loop and not a shift<span class="lang">java</span></div>
+<pre><code class="lang-java">public Duration capFor(int attempt) {
+    long base = Math.max(1L, props.retry().baseDelay().toMillis());
+    long max = Math.max(base, props.retry().maxDelay().toMillis());
+
+    long cap = base;
+    for (int i = 0; i &lt; attempt &amp;&amp; cap &lt; max; i++) {
+        cap = cap * 2;
+    }
+    if (cap &gt; max || cap &lt;= 0) {
+        cap = max;
+    }
+    return Duration.ofMillis(cap);
+}
+
+public Duration nextDelay(int attempt) {
+    long cap = capFor(attempt).toMillis();
+    // nextLong(bound) is exclusive, so +1 makes the cap itself reachable.
+    return Duration.ofMillis(ThreadLocalRandom.current().nextLong(cap + 1));
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>base &lt;&lt; attempt</code> is wrong twice over</span>
+  <p>Java masks the shift distance to the low six bits, so <code>1L &lt;&lt; 64</code> is <code>1</code>,
+  not 0 &mdash; a job on attempt 64 suddenly gets a one-millisecond backoff and hammers the failing
+  dependency as fast as the queue can serve it. The doubling loop above cannot overflow because it
+  exits at the cap. The clamp matters too: without it, attempt 20 at a 1&nbsp;s base schedules a retry
+  twelve days out, which is indistinguishable from losing the job.</p>
+</div>
+
+<div class="box ok">
+  <span class="bt">Full jitter, not "exponential backoff"</span>
+  <p>Plain exponential backoff does not spread load, it delays a thundering herd in lockstep: 500 jobs
+  fail in the same second, all retry at exactly <code>base &times; 2</code>, and the dependency gets the
+  same simultaneous spike that knocked it over, forever. Of the three AWS variants &mdash;
+  <code>delay = cap</code>, <code>cap/2 + random(0, cap/2)</code>, <code>random(0, cap)</code> &mdash;
+  this is full jitter: widest spread, lowest total work under contention. The orphan sweeper reuses the
+  same policy, so a dead instance's 200 reclaimed rows do not all return to <code>PENDING</code> at the
+  same instant.</p>
+</div>
+
+<h3>DAG eligibility, in one statement</h3>
+
+<div class="codewrap">
+<div class="codehead">universal quantification, which SQL has no operator for<span class="lang">sql</span></div>
+<pre><code class="lang-sql">UPDATE job_execution e
+   SET status = 'PENDING',
+       run_at = now()
+ WHERE e.status = 'BLOCKED'
+   AND NOT EXISTS (                       -- no parent of mine is unsatisfied
+       SELECT 1
+         FROM job_dependency d
+        WHERE d.job_id = e.job_id
+          AND NOT EXISTS (                -- ... "unsatisfied" = has no SUCCEEDED run for MY occurrence
+              SELECT 1
+                FROM job_execution p
+               WHERE p.job_id = d.depends_on_job_id
+                 AND p.scheduled_for = e.scheduled_for
+                 AND p.status = 'SUCCEEDED'
+          )
+   )</code></pre>
+</div>
+
+<p>The obvious implementation &mdash; load blocked rows, loop, query each one's parents &mdash; is
+O(blocked&nbsp;&times;&nbsp;parents) round trips and races with itself across instances. The
+doubly-negated form promotes every eligible row in one atomic statement, so concurrent resolvers just
+write the same value to the same rows. And <code>p.scheduled_for = e.scheduled_for</code> <em>is</em>
+the run-correlation mechanism &mdash; it is why yesterday's success cannot unblock today's step.
+<code>DagEligibilityTest</code> uses a diamond rather than a chain precisely because a chain passes
+even with a broken "any parent succeeded" rule.</p>
+
+<div class="box warn">
+  <span class="bt">The configuration that would quietly destroy the design refuses to start</span>
+<div class="codewrap"><pre><code class="lang-java">if (worker.leaseTimeout().compareTo(worker.heartbeatInterval()) &lt;= 0) {
+    throw new IllegalArgumentException(
+            "scheduler.worker.lease-timeout (" + worker.leaseTimeout()
+                    + ") must be strictly greater than scheduler.worker.heartbeat-interval ("
+                    + worker.heartbeatInterval()
+                    + "); otherwise the orphan sweeper reclaims work that is still running");
+}</code></pre></div>
+  <p>A lease shorter than the heartbeat interval means every instance continuously reclaims its own
+  live work and runs everything twice, while every dashboard shows healthy throughput. The default
+  ratio, 30&nbsp;s&nbsp;/&nbsp;5&nbsp;s, is six consecutive missed heartbeats &mdash; your tolerance
+  for GC pauses and transient database slowness, not a magic number.</p>
+</div>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>Put the lock where the state is. <code>SELECT &hellip; FOR UPDATE SKIP LOCKED</code> followed by
+  an <code>UPDATE</code>, in one transaction, gives exact claiming with no lock service, no membership
+  protocol and no fencing tokens &mdash; because the row locks hold the line until COMMIT and the
+  <code>status</code> column holds it afterwards. The price is that PostgreSQL becomes a single point
+  of failure, and that is the trade to defend in an interview.</li>
+  <li><code>FOR UPDATE</code> and <code>SKIP LOCKED</code> buy different things. The first is
+  correctness; the second is throughput. Without <code>SKIP LOCKED</code> the query is still correct
+  and N workers give you the performance of one, plus lock-wait latency.</li>
+  <li>The partial index <code>ON job_execution (status, run_at) WHERE status = 'PENDING'</code> is what
+  makes <code>SKIP LOCKED</code> fast rather than merely correct: it stays backlog-sized rather than
+  history-sized, and it serves <code>ORDER BY run_at</code> with no sort node, so every worker walks
+  the same ordered list and takes the first rows nobody holds.</li>
+  <li>Separate the logical instant (<code>scheduled_for</code>, never moves) from the physical one
+  (<code>run_at</code>, freely moved). One extra column pays for retry backoff, DAG promotion, start
+  jitter and the ability to still answer "was the 09:00 run late?" after three retries.</li>
+  <li>Derive the idempotency key deterministically from (job, logical instant). A random UUID compiles,
+  passes every single-instance test, and duplicates every cron job the moment you run two replicas.</li>
+  <li>Transaction-scoped advisory locks (<code>pg_try_advisory_xact_lock</code>) over session-scoped
+  ones: connection pools break session affinity, exception paths leak session locks, and a SIGKILLed
+  instance must not wedge the cluster. Refuse to run outside a transaction rather than silently
+  granting the lock to everyone.</li>
+  <li>Be honest about the delivery guarantee. The claim is exact; delivery is at-least-once, because a
+  frozen process can finish work that was already reclaimed. Write down which window the ledger closes
+  (lost completion write) and which it does not (duplicated side effect), and require handlers to be
+  idempotent.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="index.html"><span class="lb">Previous</span>Distributed Job Scheduler &amp; Workflow Engine</a>
+  <a href="02-implementation.html"><span class="lb">Next</span>Implementation walkthrough</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

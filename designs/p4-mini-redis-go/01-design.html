@@ -1,0 +1,988 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Design &amp; the RESP protocol &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Mini-Redis: an in-memory store in Go</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Design &amp; the RESP protocol</h1>
+<p class="lede">The four packages, the wire format byte by byte, why the parser refuses to trust a
+length prefix, and the one decision that shapes everything else: real Redis is single-threaded and
+therefore trivially atomic, and this server is not.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24.6</span>
+  <span class="tag">resp &amp; keyspace design</span>
+</div>
+
+<h2>What we are building, and what we are not</h2>
+
+<p>A Redis-compatible server the real <code>redis-cli</code> talks to without noticing, in four
+packages with no third-party dependencies. Everything interesting is written rather than imported:
+a streaming RESP2 parser, a sharded keyspace, five data types with a real skip list behind the
+sorted set, two-part expiry, sampled LRU/LFU eviction, an append-only log and a checksummed
+snapshot. It is not a clone, and the divergences are stated up front &mdash; a teaching
+implementation that hides its shortcuts teaches the wrong thing.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Divergence</th><th>Why</th><th>What it costs</th></tr></thead>
+<tbody>
+<tr><td>Goroutine per connection + sharded locks, not a single event loop</td><td>It is the idiomatic Go shape and it scales across cores</td><td><strong>No cross-key atomicity.</strong> This is the big one &mdash; see below</td></tr>
+<tr><td>One database, not sixteen</td><td>Numbered databases do not survive into Cluster; a db index on every store method buys nothing</td><td><code>SELECT 0</code> works, anything else errors</td></tr>
+<tr><td>One representation per type</td><td>No listpack, intset or quicklist</td><td><code>OBJECT ENCODING</code> <em>predicts</em> what Redis would pick rather than reporting what is stored</td></tr>
+<tr><td>SCAN cursor is a slot index, not a reverse-binary bucket walk</td><td>Go's map exposes no bucket handle, so Redis's rehash-proof trick is unavailable</td><td>A weaker guarantee, documented in <code>scan.go</code> rather than glossed over</td></tr>
+<tr><td>AOF rewrite blocks writes</td><td>Go cannot <code>fork()</code>, so there is no free copy-on-write snapshot</td><td>Writes stall for the length of a rewrite</td></tr>
+<tr><td>RESP2 only</td><td>RESP3 is additive and orthogonal to everything else here</td><td><code>HELLO 3</code> returns <code>NOPROTO</code>, which is exactly what a client needs to fall back</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 356" role="img" aria-label="Architecture: bytes arrive from TCP into the RESP reader, pass through the dispatcher to a command handler, which locks one shard of the store; the dirty counter drives the AOF and the reply goes back through the writer">
+  <text class="lbl-b" x="14" y="18">One command, end to end &mdash; and the dependency arrows only ever point downward</text>
+
+  <rect class="node"   x="14"  y="30" width="132" height="50" rx="7"/>
+  <text class="lbl-b"  x="80"  y="50" text-anchor="middle">net.Conn</text>
+  <text class="lbl-s"  x="80"  y="66" text-anchor="middle">TCP_NODELAY on</text>
+
+  <rect class="node-i" x="176" y="30" width="172" height="50" rx="7"/>
+  <text class="lbl-b"  x="262" y="50" text-anchor="middle">resp.Reader</text>
+  <text class="lbl-s"  x="262" y="66" text-anchor="middle">bufio 16 KiB, streaming</text>
+
+  <rect class="node-a" x="378" y="30" width="196" height="50" rx="7"/>
+  <text class="lbl-b"  x="476" y="50" text-anchor="middle">Dispatcher.Execute</text>
+  <text class="lbl-s"  x="476" y="66" text-anchor="middle">lookup &middot; arity &middot; OOM gate</text>
+
+  <rect class="node"   x="604" y="30" width="202" height="50" rx="7"/>
+  <text class="lbl-b"  x="705" y="50" text-anchor="middle">commands handler</text>
+  <text class="lbl-s"  x="705" y="66" text-anchor="middle">reads Context, calls store</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="148" y1="55" x2="172" y2="55" marker-end="url(#p40-ar1)"/>
+    <line class="edge" x1="350" y1="55" x2="374" y2="55" marker-end="url(#p40-ar2)"/>
+    <line class="edge" x1="576" y1="55" x2="600" y2="55" marker-end="url(#p40-ar3)"/>
+    <line class="edge" x1="705" y1="82" x2="705" y2="122" marker-end="url(#p40-ar4)"/>
+  </g>
+  <text class="lbl-s" x="262" y="96" text-anchor="middle">resp.Command = [][]byte</text>
+  <text class="lbl-s" x="716" y="106">Lock(shard)</text>
+
+  <rect class="node-o" x="368" y="128" width="438" height="118" rx="7"/>
+  <text class="lbl-b" x="587" y="148" text-anchor="middle">internal/store &mdash; N shards, one mutex each</text>
+  <rect class="node"  x="384" y="158" width="94" height="72" rx="5"/>
+  <rect class="node"  x="490" y="158" width="94" height="72" rx="5"/>
+  <rect class="node"  x="596" y="158" width="94" height="72" rx="5"/>
+  <rect class="node"  x="702" y="158" width="94" height="72" rx="5"/>
+  <text class="lbl-b" x="431" y="176" text-anchor="middle">shard 0</text>
+  <text class="lbl-b" x="537" y="176" text-anchor="middle">shard 1</text>
+  <text class="lbl-b" x="643" y="176" text-anchor="middle">&hellip;</text>
+  <text class="lbl-b" x="749" y="176" text-anchor="middle">shard N-1</text>
+  <text class="mono"  x="431" y="192" text-anchor="middle">sync.Mutex</text>
+  <text class="mono"  x="431" y="206" text-anchor="middle">entries</text>
+  <text class="mono"  x="431" y="220" text-anchor="middle">expires</text>
+  <text class="mono"  x="537" y="192" text-anchor="middle">slots</text>
+  <text class="mono"  x="537" y="206" text-anchor="middle">mem (atomic)</text>
+  <text class="lbl-s" x="643" y="206" text-anchor="middle">shard = FNV-1a(key)</text>
+  <text class="lbl-s" x="643" y="220" text-anchor="middle">&amp; mask</text>
+  <text class="lbl-s" x="749" y="206" text-anchor="middle">string list hash</text>
+  <text class="lbl-s" x="749" y="220" text-anchor="middle">set zset</text>
+
+  <rect class="node-w" x="14" y="128" width="286" height="58" rx="7"/>
+  <text class="lbl-b" x="157" y="150" text-anchor="middle">internal/persist &mdash; AOF</text>
+  <text class="mono"  x="157" y="168" text-anchor="middle">if ctx.Dirty &gt; 0 &rarr; append as RESP</text>
+
+  <rect class="node-i" x="14" y="212" width="286" height="58" rx="7"/>
+  <text class="lbl-b" x="157" y="234" text-anchor="middle">resp.Writer</text>
+  <text class="lbl-s" x="157" y="252" text-anchor="middle">sticky error; flush once per pipeline batch</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="476" y1="82" x2="300" y2="146" marker-end="url(#p40-ar5)"/>
+    <line class="edge-a" x1="368" y1="222" x2="304" y2="240" marker-end="url(#p40-ar6)"/>
+    <line class="edge-a" x1="80"  y1="212" x2="80"  y2="86"  marker-end="url(#p40-ar7)"/>
+  </g>
+  <text class="lbl-s" x="330" y="126">propagate</text>
+  <text class="lbl-s" x="316" y="268">reply</text>
+
+  <text class="lbl-s" x="14" y="296">resp knows only about bytes and imports nothing from this project. store knows only about the keyspace and does NOT import resp,</text>
+  <text class="lbl-s" x="14" y="312">so the wire format cannot leak into the data structures. commands sees both, plus two narrow interfaces (ConnInfo, ServerInfo) that</text>
+  <text class="lbl-s" x="14" y="328">describe the sliver of the server a handler may touch &mdash; which is what keeps commands from importing server and closing a cycle.</text>
+  <defs>
+    <marker id="p40-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>The layering is not decoration: because <code>store</code> cannot see <code>resp</code>,
+changing the wire format is impossible to do accidentally, and because <code>persist</code> only
+ever sees <code>store.Entry</code>, changing the in-memory representation cannot silently change
+the on-disk format.</figcaption>
+</figure>
+
+<h2>RESP2 on the wire</h2>
+
+<p>RESP2 is deliberately trivial: the first byte names the type, every frame ends in CRLF, and an
+aggregate has no terminator &mdash; the declared count is the contract. That is the whole protocol,
+and it is why a server can push millions of frames a second while you can still debug it with
+telnet.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/resp/types.go &mdash; the five type bytes and the limits<span class="lang">go</span></div>
+<pre><code class="lang-go">// Frame type bytes. These are the first byte of every RESP2 frame.
+const (
+	TypeSimpleString byte = '+'
+	TypeError        byte = '-'
+	TypeInteger      byte = ':'
+	TypeBulkString   byte = '$'
+	TypeArray        byte = '*'
+)
+
+// Protocol limits. Real Redis uses the same values (proto-max-bulk-len defaults
+// to 512MB, the multibulk limit to 1M elements, inline requests to 64KB). They
+// exist to stop a malicious client from making the server allocate unbounded
+// memory from a three byte header.
+const (
+	MaxBulkSize        = 512 * 1024 * 1024
+	MaxMultiBulkLength = 1024 * 1024
+	MaxInlineSize      = 64 * 1024
+	maxHeaderLine      = 128
+)</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Byte</th><th>Type</th><th>Frame</th><th>Example bytes</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>+</code></td><td>simple string</td><td><code>+&lt;text&gt;\r\n</code></td><td><code>+OK\r\n</code></td><td>May not contain CR or LF &mdash; there is no length, so the CRLF <em>is</em> the terminator</td></tr>
+<tr><td><code>-</code></td><td>error</td><td><code>-&lt;CODE&gt; &lt;msg&gt;\r\n</code></td><td><code>-WRONGTYPE Operation against&hellip;\r\n</code></td><td>Same framing as <code>+</code>; the leading word is a machine-readable code</td></tr>
+<tr><td><code>:</code></td><td>integer</td><td><code>:&lt;n&gt;\r\n</code></td><td><code>:42\r\n</code></td><td>Signed 64-bit. Booleans travel as <code>:0</code>/<code>:1</code></td></tr>
+<tr><td><code>$</code></td><td>bulk string</td><td><code>$&lt;len&gt;\r\n&lt;len bytes&gt;\r\n</code></td><td><code>$5\r\nhello\r\n</code></td><td>Binary safe. <code>$-1\r\n</code> is the null bulk string &mdash; how Redis says "no such key"</td></tr>
+<tr><td><code>*</code></td><td>array</td><td><code>*&lt;count&gt;\r\n</code> then <code>count</code> frames</td><td><code>*2\r\n:1\r\n:2\r\n</code></td><td>Nests freely. <code>*-1\r\n</code> is the null array. <strong>No terminator</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">every byte of one request/response pair<span class="lang">text</span></div>
+<pre><code class="lang-text">CLIENT -&gt; SERVER    SET greeting hello
+  2a 33 0d 0a                          *3\r\n        array of 3 elements
+  24 33 0d 0a 53 45 54 0d 0a           $3\r\nSET\r\n     3-byte bulk: the command name
+  24 38 0d 0a 67 72 65 65 74 ...       $8\r\ngreeting\r\n
+  24 35 0d 0a 68 65 6c 6c 6f 0d 0a     $5\r\nhello\r\n
+
+SERVER -&gt; CLIENT
+  2b 4f 4b 0d 0a                       +OK\r\n
+
+CLIENT -&gt; SERVER    ZRANGE board 0 1 WITHSCORES
+  *5\r\n$6\r\nZRANGE\r\n$5\r\nboard\r\n$1\r\n0\r\n$1\r\n1\r\n$10\r\nWITHSCORES\r\n
+
+SERVER -&gt; CLIENT    a flat array - RESP2 has no map and no float type
+  *4\r\n$3\r\nbob\r\n$1\r\n5\r\n$5\r\nalice\r\n$2\r\n10\r\n
+
+SERVER -&gt; CLIENT    GET on a missing key, and LRANGE on a missing key
+  $-1\r\n                              null bulk string  (nil)
+  *0\r\n                               EMPTY array, not a null array</code></pre>
+</div>
+
+<p>Requests are narrower than replies: a command is always an array of bulk strings. There is a
+second dialect &mdash; <strong>inline</strong> commands, a bare space-separated line, what you get
+typing into telnet &mdash; parsed with Redis's own <code>sdssplitargs</code> rules: double quotes
+allow <code>\n \r \t \b \a \xHH \" \\</code>, single quotes only <code>\'</code>, and an unbalanced
+quote is a protocol error rather than a guess, "because guessing would silently execute a different
+command than the user typed".</p>
+
+<div class="box note">
+  <span class="bt">RESP3 is a superset, and this server refuses it honestly</span>
+  <p>RESP3 (Redis 6+) adds the typed frames the flat arrays above have to fake: <code>_</code> null,
+  <code>,</code> double, <code>#</code> boolean, <code>%</code> map, <code>~</code> set,
+  <code>(</code> big number, <code>=</code> verbatim and <code>&gt;</code> out-of-band push &mdash;
+  which is what makes client-side caching and Pub/Sub on a live connection possible. A client asks
+  with <code>HELLO 3</code>:</p>
+<div class="codewrap"><pre><code class="lang-go">// cmdHello answers the handshake redis-cli sends when it is asked for RESP3.
+// We only speak RESP2, so anything other than protocol 2 is refused with the
+// error code clients look for before falling back.
+func cmdHello(c *Context) {
+	if c.ArgCount() &gt; 1 {
+		ver, err := strconv.Atoi(c.Str(1))
+		if err != nil || (ver != 2 &amp;&amp; ver != 3) {
+			c.Errorf("NOPROTO unsupported protocol version")
+			return
+		}
+		if ver == 3 {
+			c.Errorf("NOPROTO this server speaks RESP2 only")
+			return
+		}
+	}</code></pre></div>
+  <p><code>NOPROTO</code> is the specific code every client library checks before downgrading, so a
+  modern <code>redis-cli</code> connects and works. Returning a generic <code>ERR</code> here would
+  make the client give up instead.</p>
+</div>
+
+<h2>The parser: streaming, bounded, hostile-input-safe</h2>
+
+<p>"Streaming" means the parser never needs a whole command in memory and never loses its place when
+one arrives split across TCP segments. In an event-loop server that needs a hand-rolled state
+machine with saved partial state; with a goroutine per connection it falls out of
+<code>bufio.Reader</code> for free &mdash; when the buffer runs dry mid-frame the underlying
+<code>Read</code> just blocks.</p>
+
+<figure>
+<svg viewBox="0 0 820 330" role="img" aria-label="State machine of ReadCommand: the first byte selects multibulk or inline parsing, each length prefix is bounds-checked, and any violation becomes a protocol error that closes the connection">
+  <text class="lbl-b" x="14" y="18">ReadCommand &mdash; every edge that leaves the happy path is bounded</text>
+
+  <rect class="node" x="14" y="34" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="74" y="54" text-anchor="middle">read 1 byte</text>
+  <text class="lbl-s" x="74" y="70" text-anchor="middle">peek the type</text>
+
+  <rect class="node-a" x="180" y="34" width="176" height="44" rx="7"/>
+  <text class="lbl-b" x="268" y="54" text-anchor="middle">MULTIBULK COUNT</text>
+  <text class="mono"  x="268" y="70" text-anchor="middle">count &le; 1,048,576</text>
+
+  <rect class="node-a" x="400" y="34" width="160" height="44" rx="7"/>
+  <text class="lbl-b" x="480" y="54" text-anchor="middle">EXPECT '$'</text>
+  <text class="lbl-s" x="480" y="70" text-anchor="middle">once per element</text>
+
+  <rect class="node-a" x="604" y="34" width="202" height="44" rx="7"/>
+  <text class="lbl-b" x="705" y="54" text-anchor="middle">BULK LEN</text>
+  <text class="mono"  x="705" y="70" text-anchor="middle">0 &le; len &le; 512 MiB</text>
+
+  <rect class="node-o" x="604" y="112" width="202" height="48" rx="7"/>
+  <text class="lbl-b" x="705" y="132" text-anchor="middle">io.ReadFull(len+2)</text>
+  <text class="lbl-s" x="705" y="148" text-anchor="middle">payload, then verify CRLF</text>
+
+  <rect class="node-i" x="180" y="112" width="176" height="48" rx="7"/>
+  <text class="lbl-b" x="268" y="132" text-anchor="middle">INLINE LINE</text>
+  <text class="mono"  x="268" y="148" text-anchor="middle">&le; 64 KiB, then split</text>
+
+  <rect class="node-o" x="380" y="196" width="200" height="46" rx="7"/>
+  <text class="lbl-b" x="480" y="216" text-anchor="middle">Command [][]byte</text>
+  <text class="lbl-s" x="480" y="232" text-anchor="middle">payloads copied out</text>
+
+  <rect class="node-d" x="14" y="196" width="200" height="46" rx="7"/>
+  <text class="lbl-b" x="114" y="216" text-anchor="middle">*ProtocolError</text>
+  <text class="lbl-s" x="114" y="232" text-anchor="middle">reply, flush, CLOSE</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="136" y1="48" x2="176" y2="48" marker-end="url(#p40-ar8)"/>
+    <line class="edge" x1="358" y1="56" x2="396" y2="56" marker-end="url(#p40-ar9)"/>
+    <line class="edge" x1="562" y1="56" x2="600" y2="56" marker-end="url(#p40-ar10)"/>
+    <line class="edge" x1="705" y1="80"  x2="705" y2="108" marker-end="url(#p40-ar11)"/>
+    <path class="edge" d="M 604 136 C 560 136 552 92 564 74" marker-end="url(#p40-ar12)"/>
+    <line class="edge" x1="74" y1="80" x2="74" y2="126" marker-end="url(#p40-ar13)"/>
+    <line class="edge" x1="76" y1="136" x2="176" y2="136" marker-end="url(#p40-ar14)"/>
+    <line class="edge" x1="604" y1="150" x2="584" y2="206" marker-end="url(#p40-ar15)"/>
+    <line class="edge" x1="268" y1="162" x2="380" y2="206" marker-end="url(#p40-ar16)"/>
+  </g>
+  <text class="lbl-s" x="150" y="42">'*'</text>
+  <text class="lbl-s" x="26"  y="104">anything else</text>
+  <text class="lbl-s" x="574" y="104">next element</text>
+  <text class="lbl-s" x="596" y="192">count exhausted</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="180" y1="66" x2="120" y2="192" marker-end="url(#p40-ar17)"/>
+    <line class="edge-d" x1="400" y1="70" x2="140" y2="192" marker-end="url(#p40-ar18)"/>
+    <line class="edge-d" x1="620" y1="76" x2="160" y2="192" marker-end="url(#p40-ar19)"/>
+    <line class="edge-d" x1="200" y1="160" x2="150" y2="194" marker-end="url(#p40-ar20)"/>
+  </g>
+  <text class="lbl-s" x="14" y="176">bad count &middot; not '$' &middot; bad length &middot; missing CRLF &middot; unbalanced quotes &middot; header line &gt; 128 B</text>
+
+  <text class="lbl-s" x="14" y="272">A short read is NOT an error state: bufio blocks until more of the segment arrives and parsing resumes exactly where it stopped.</text>
+  <text class="lbl-s" x="14" y="288">The only unbounded thing a client controls is how much it sends &mdash; every prefix it declares is checked against a constant BEFORE</text>
+  <text class="lbl-s" x="14" y="304">a single byte is allocated for it, which is what makes "*2000000\r\n" three bytes of work instead of an out-of-memory kill.</text>
+  <defs>
+    <marker id="p40-ar8"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar9"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Every transition out of this machine is either "more bytes, keep going" or "close the
+connection". There is no third option, and that is the design.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/resp/reader.go &mdash; the element loop, with every check that matters<span class="lang">go</span></div>
+<pre><code class="lang-go">	count, err := strconv.Atoi(string(line))
+	if err != nil || count &gt; MaxMultiBulkLength {
+		return nil, protoErrorf("invalid multibulk length")
+	}
+	if count &lt;= 0 {
+		// "*0\r\n" and "*-1\r\n" are legal no-ops. redis-cli --pipe emits them.
+		return Command{}, nil
+	}
+
+	args := make(Command, 0, count)
+	for i := 0; i &lt; count; i++ {
+		typ, err := r.br.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if typ != TypeBulkString {
+			return nil, protoErrorf("expected '$', got '%c'", printable(typ))
+		}
+		line, err := r.readLine(maxHeaderLine, "too big bulk count string")
+		if err != nil {
+			return nil, err
+		}
+		length, err := strconv.Atoi(string(line))
+		if err != nil || length &lt; 0 || length &gt; MaxBulkSize {
+			return nil, protoErrorf("invalid bulk length")
+		}
+		// Read the payload plus its CRLF in one shot. io.ReadFull is what makes
+		// partial reads a non-issue: it keeps pulling until it has every byte.
+		buf := make([]byte, length+2)
+		if _, err := io.ReadFull(r.br, buf); err != nil {
+			return nil, err
+		}
+		if buf[length] != '\r' || buf[length+1] != '\n' {
+			return nil, protoErrorf("expected CRLF after bulk payload")
+		}
+		// Three-index slice so a later append cannot scribble over the CRLF
+		// bytes that are still inside the same allocation.
+		args = append(args, buf[:length:length])
+	}</code></pre>
+</div>
+
+<p>Read <code>if err != nil || length &lt; 0 || length &gt; MaxBulkSize</code> as the security control
+it is. <code>make([]byte, length+2)</code> is the one place where a remote peer picks an allocation
+size, and the guard sits directly above it &mdash; <em>before</em> the allocation, because a Go
+allocation of 3&nbsp;GiB does not fail gracefully, it takes the process down.</p>
+
+<div class="box gotcha">
+  <span class="bt">Never trust a length prefix &mdash; and "trust" includes the count, the header, and the line</span>
+  <p>Three separate unbounded quantities hide in a RESP request and all three need a lid:</p>
+  <ul>
+    <li><strong>The element count.</strong> <code>*2000000\r\n</code> is 11 bytes; without
+    <code>MaxMultiBulkLength</code>, <code>make(Command, 0, count)</code> turns them into 16&nbsp;MB
+    of slice headers, and a few hundred connections doing that concurrently is an OOM kill.</li>
+    <li><strong>The payload length.</strong> Bounded by <code>MaxBulkSize</code> before the
+    allocation.</li>
+    <li><strong>The header line itself.</strong> The subtle one. <code>readLine</code> loops on
+    <code>bufio.ErrBufferFull</code> to assemble a line longer than the 16&nbsp;KiB buffer, so
+    without a cap a client sending <code>"*"</code> and an endless stream of digits with no newline
+    grows <code>r.line</code> forever. Hence <code>readLine(maxHeaderLine, &hellip;)</code>.</li>
+  </ul>
+  <p>A negative bulk length is rejected too: <code>$-1</code> is a <em>reply</em> construct.
+  Accepting it in a request would mean <code>make([]byte, -1+2)</code> and an index into
+  <code>buf[-1]</code> &mdash; a panic any client could trigger at will.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The three-index slice is not stylistic</span>
+  <p><code>args = append(args, buf[:length:length])</code>. The payload and its CRLF live in one
+  allocation. A two-index <code>buf[:length]</code> carries capacity <code>length+2</code>, so a
+  later <code>append</code> to that argument &mdash; handlers do append, e.g.
+  <code>strconv.AppendInt(v.str[:0], next, 10)</code> &mdash; writes into bytes another part of the
+  code still believes are a frame terminator. Capping capacity forces a copy instead.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>readLine</code>'s result aliases a reusable buffer</span>
+  <p>It returns a slice of <code>r.line</code>, the Reader's scratch, which the next read overwrites:
+  <em>"callers must parse or copy it immediately"</em>. Hence
+  <code>strconv.Atoi(string(line))</code> at every call site &mdash; the <code>string()</code> is the
+  copy &mdash; and hence <code>Command.Copy()</code>: the AOF keeps commands after the connection
+  buffer has been recycled. Skip it and the log fills with the <em>next</em> command's bytes.</p>
+</div>
+
+<p>Once framing is lost there is nothing to do but hang up. The parser signals it with a distinct
+type, so the connection loop can tell "you sent nonsense" from "you hung up":</p>
+
+<div class="codewrap">
+<div class="codehead">the protocol-error type, and what the connection does with it<span class="lang">go</span></div>
+<pre><code class="lang-go">// ProtocolError is returned by the Reader when the peer sent something that is
+// not valid RESP. The connection handler replies with the error text and then
+// closes the connection: once framing is lost there is no way to resynchronise
+// the stream, so continuing to read would be guesswork.
+type ProtocolError struct {
+	Msg string
+}
+
+// ... and in internal/server/conn.go:
+		args, err := c.r.ReadCommand()
+		if err != nil {
+			if resp.IsProtocolError(err) {
+				// Framing is lost: tell the client why, then hang up. Trying to
+				// resynchronise a RESP stream is guesswork.
+				c.w.WriteError("ERR " + err.Error())
+				_ = c.w.Flush()
+			}
+			return
+		}</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="bt">Inline mode makes every non-RESP byte stream a command</span>
+  <p>Anything not starting with <code>*</code> is an inline command &mdash; what real Redis does, and
+  why "cross-protocol scripting" is a Redis CVE class: a browser tricked into POSTing to port 6379
+  produces lines like <code>POST&nbsp;/&nbsp;HTTP/1.1</code> that the server happily parses, letting
+  the attacker smuggle a <code>CONFIG&nbsp;SET&nbsp;dir</code> in the body. Real Redis now
+  hard-closes a connection whose first inline word is <code>POST</code> or <code>Host:</code>. This
+  server does not, and has no authentication &mdash; hence the <code>127.0.0.1</code> default.</p>
+</div>
+
+<p>The reply side has one idea worth stealing. <code>resp.Writer</code> is <strong>sticky</strong>:
+after the first failure every write is a no-op and the error is latched until <code>Flush</code>
+reports it. Seventy handlers that would otherwise be half error-handling become straight-line code,
+and the socket-is-broken discovery lands where it can be acted on.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/resp/writer.go &mdash; error latching, and why the count is the contract<span class="lang">go</span></div>
+<pre><code class="lang-go">func (w *Writer) writeBytes(b []byte) {
+	if w.err != nil {
+		return
+	}
+	if _, err := w.bw.Write(b); err != nil {
+		w.err = err
+	}
+}
+
+// WriteArrayLen writes an array header. The caller must then write exactly n
+// elements; RESP has no terminator, the count is the contract.
+func (w *Writer) WriteArrayLen(n int) error {
+	w.writeHeader(TypeArray, int64(n))
+	return w.err
+}
+
+// WriteFloat writes a float as a bulk string using Redis's formatting rules.
+// RESP2 has no float type, which is why ZSCORE returns a bulk string.
+func (w *Writer) WriteFloat(f float64) error {
+	return w.WriteBulkString(FormatFloat(f))
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Declare <code>n</code>, write <code>n</code> &mdash; a miscount desynchronises the client forever</span>
+  <p>There is no closing bracket in RESP. A handler writing <code>WriteArrayLen(3)</code> and
+  emitting two elements leaves the client blocking for a third it then takes from the <em>next
+  command's reply</em>. Every reply on that connection is off by one from then on. Build the slice,
+  take its length, then write &mdash; never count and emit in two passes over data that can change
+  between them.</p>
+</div>
+
+<h2>Concurrency: what we traded away</h2>
+
+<p>Real Redis executes every command on a single thread. That is not a performance compromise; it is
+the source of its strongest guarantee. Nothing interleaves with a running command, so every command
+&mdash; <code>INCR</code>, <code>SINTERSTORE</code>, a whole Lua script &mdash; is atomic for free,
+with no locks and no data races. It works because the bottleneck is the network, not the CPU.</p>
+
+<p>Rebuilding that in Go means rebuilding an event loop and discarding the reason to use Go. So we
+take the idiomatic shape &mdash; goroutine per connection &mdash; and pay for it with a keyspace split
+into independently locked shards. The trade is written down where it is made:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/store.go &mdash; the package comment is the design document<span class="lang">go</span></div>
+<pre><code class="lang-go">// This server instead runs one goroutine per connection over a keyspace split
+// into N independently locked shards. The trade is explicit:
+//
+//   - We keep atomicity per command, because every command that touches one key
+//     holds that key's shard lock for its whole duration. INCR is still safe.
+//   - We give up atomicity across keys. A multi-key command in real Redis sees
+//     one consistent snapshot; here a DEL of two keys in different shards is two
+//     separate atomic steps. MULTI/EXEC and Lua would need a global lock.
+//   - We gain real parallelism on multi-core machines, which is the point of
+//     writing this in Go. Goroutine-per-connection is the idiomatic Go server
+//     shape, and sharding is the idiomatic way to keep the shared map from
+//     becoming the single contended lock that erases that parallelism.
+//
+// Shard count is a power of two so that the shard index is a mask of the hash
+// rather than a division.</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 236" role="img" aria-label="Three connection goroutines hashing keys to shards: two commands on different shards run in parallel while two on the same shard serialise on its mutex">
+  <text class="lbl-b" x="14" y="18">shard = FNV-1a(key) &amp; mask &mdash; a pure function of the key, computed without allocating</text>
+
+  <rect class="node" x="14" y="34" width="128" height="38" rx="6"/>
+  <rect class="node" x="14" y="80" width="128" height="38" rx="6"/>
+  <rect class="node" x="14" y="126" width="128" height="38" rx="6"/>
+  <text class="mono" x="78" y="58"  text-anchor="middle">INCR hits</text>
+  <text class="mono" x="78" y="104" text-anchor="middle">LPUSH queue</text>
+  <text class="mono" x="78" y="150" text-anchor="middle">INCR hits</text>
+  <text class="lbl-s" x="14" y="182">three connection</text>
+  <text class="lbl-s" x="14" y="196">goroutines</text>
+
+  <rect class="node-i" x="212" y="72" width="150" height="54" rx="7"/>
+  <text class="lbl-b" x="287" y="94" text-anchor="middle">hashKey &amp; mask</text>
+  <text class="lbl-s" x="287" y="112" text-anchor="middle">no lock, no allocation</text>
+
+  <rect class="node-o" x="440" y="34" width="180" height="56" rx="7"/>
+  <text class="lbl-b" x="530" y="56" text-anchor="middle">shard 5 &middot; mutex FREE</text>
+  <text class="lbl-s" x="530" y="74" text-anchor="middle">LPUSH runs now</text>
+
+  <rect class="node-w" x="440" y="106" width="180" height="80" rx="7"/>
+  <text class="lbl-b" x="530" y="128" text-anchor="middle">shard 11 &middot; mutex HELD</text>
+  <text class="lbl-s" x="530" y="146" text-anchor="middle">first INCR runs</text>
+  <text class="lbl-s" x="530" y="164" text-anchor="middle">second INCR BLOCKS here</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="144" y1="52"  x2="208" y2="86"  marker-end="url(#p40-ar21)"/>
+    <line class="edge" x1="144" y1="98"  x2="208" y2="98"  marker-end="url(#p40-ar22)"/>
+    <line class="edge" x1="144" y1="144" x2="208" y2="112" marker-end="url(#p40-ar23)"/>
+    <line class="edge" x1="364" y1="88"  x2="436" y2="62"  marker-end="url(#p40-ar24)"/>
+    <line class="edge" x1="364" y1="106" x2="436" y2="140" marker-end="url(#p40-ar25)"/>
+  </g>
+
+  <text class="lbl-s" x="648" y="56">Kept: per-command atomicity.</text>
+  <text class="lbl-s" x="648" y="72">The read-modify-write of INCR</text>
+  <text class="lbl-s" x="648" y="88">is inside one Lock/Unlock.</text>
+  <text class="lbl-s" x="648" y="118">Lost: cross-key atomicity.</text>
+  <text class="lbl-s" x="648" y="134">DEL a b takes shard(a) then</text>
+  <text class="lbl-s" x="648" y="150">shard(b) &mdash; two atomic steps,</text>
+  <text class="lbl-s" x="648" y="166">with a visible gap between.</text>
+
+  <text class="lbl-s" x="212" y="216">BenchmarkShardContention measures exactly this: run it with -cpu 1,2,4,8 and compare shards=1 against shards=256.</text>
+  <defs>
+    <marker id="p40-ar21" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar23" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar24" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar25" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Sharding does not remove the lock, it removes the <em>contention</em>. With 16 shards and
+a uniform key distribution, two random commands collide one time in sixteen instead of every time.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">the whole of shard selection &mdash; and the cost, made explicit<span class="lang">go</span></div>
+<pre><code class="lang-go">// hashKey is FNV-1a. It is inlined here rather than used through hash/fnv's
+// interface so that hashing a key allocates nothing.
+func hashKey(key string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i &lt; len(key); i++ {
+		h ^= uint64(key[i])
+		h *= prime64
+	}
+	return h
+}
+
+func (s *Store) shardFor(key string) *shard {
+	return s.shards[hashKey(key)&amp;s.mask]
+}
+
+// Delete removes keys and returns how many existed.
+//
+// Each key is removed under its own shard lock, one at a time. That is the
+// visible cost of sharding: a two-key DEL is not one atomic step. Locking every
+// shard up front would restore atomicity and reintroduce the global lock we
+// sharded to avoid.</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>Real Redis (single thread)</th><th>This server (sharded locks)</th></tr></thead>
+<tbody>
+<tr><td><code>INCR k</code> read-modify-write</td><td>Atomic &mdash; nothing else runs</td><td>Atomic &mdash; one <code>Lock</code>/<code>Unlock</code> around the whole operation</td></tr>
+<tr><td><code>DEL a b</code></td><td>One atomic step</td><td><strong>Two</strong> steps when <code>a</code> and <code>b</code> hash to different shards; a concurrent <code>EXISTS a b</code> can see one gone and one present</td></tr>
+<tr><td><code>MULTI</code>/<code>EXEC</code>, Lua</td><td>Free, by construction</td><td>Not implemented &mdash; needs a global lock or a fixed-order multi-lock protocol</td></tr>
+<tr><td><code>KEYS</code> / <code>SCAN</code> / <code>ForEachEntry</code></td><td>Consistent snapshot (and a multi-second stall)</td><td>Per-shard consistency only; a write to an already-visited shard will not appear</td></tr>
+<tr><td>Throughput on 8 cores</td><td>One core, plus I/O threads</td><td>Scales until the shard distribution or the socket becomes the bottleneck</td></tr>
+<tr><td>Cost of a slow command</td><td>Blocks <em>every</em> client</td><td>Blocks only clients whose keys land in that shard</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Adding <code>MSET</code> is where you discover you cannot lock two shards</span>
+  <p>Looping the pairs and locking each key's shard in turn is not <code>MSET</code>; it is N
+  independent <code>SET</code>s with observable intermediate states. Holding every relevant lock at
+  once deadlocks as soon as two clients issue <code>MSET a b</code> and <code>MSET b a</code> across
+  two shards. The safe version takes locks in a <strong>fixed global order</strong> (ascending shard
+  index, deduplicated), the discipline in
+  <span class="xref">sync internals</span>.
+  <code>MULTI</code>/<code>EXEC</code> is the same problem at full scale.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A value that escapes the lock is a race, and the race detector will not always catch it</span>
+  <p>The store never hands out a live slice:</p>
+<div class="codewrap"><pre><code class="lang-go">// Get returns the string stored at key, or nil when the key is missing.
+//
+// The result is a copy. Handing out the live slice would let a command handler
+// read it after the shard lock is released, racing with a concurrent APPEND
+// that reallocates the backing array.</code></pre></div>
+  <p>Same reason <code>exportEntry</code> deep-copies for the persistence layer. Returning
+  <code>v.str</code> directly passes <code>make test</code>, passes <code>make race</code> on a
+  single-client test, and corrupts data under <code>redis-benchmark</code>.</p>
+</div>
+
+<h2>One representation per type, chosen on purpose</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Here</th><th>Real Redis</th><th>Why this choice</th></tr></thead>
+<tbody>
+<tr><td>string</td><td><code>[]byte</code></td><td>int / embstr / raw</td><td>Binary safe and already the shape the wire hands us. <code>INCR</code> reformats in place with <code>strconv.AppendInt(v.str[:0], &hellip;)</code></td></tr>
+<tr><td>list</td><td>Doubly linked list of <code>[]byte</code></td><td>quicklist (linked list of listpacks)</td><td>Push/pop/index/range have the same complexity either way &mdash; O(1) at the ends, O(N) in the middle. The quicklist's value is <em>memory density</em>, not asymptotics</td></tr>
+<tr><td>hash</td><td><code>map[string][]byte</code></td><td>listpack &rarr; hashtable</td><td>O(1) field access; Go's Swiss-table map (1.24) is already a good hash table</td></tr>
+<tr><td>set</td><td><code>map[string]struct{}</code></td><td>intset / listpack / hashtable</td><td>Zero-width value type, so membership costs a key and nothing else</td></tr>
+<tr><td>zset</td><td><strong>skip list + <code>map[string]float64</code></strong></td><td>listpack &rarr; skiplist + dict</td><td>The two queries a sorted set must answer need two structures &mdash; see below</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>Value</code> is a tagged union rather than an interface, which is a memory-layout decision:
+eviction sampling reads <code>lru</code>, <code>lfu</code> and <code>size</code> on thousands of
+candidate keys a second and must not chase a pointer to do it.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/store.go &mdash; the entry, with eviction metadata inline<span class="lang">go</span></div>
+<pre><code class="lang-go">// Value is one keyspace entry. Only the field matching typ is populated; the
+// others stay nil. A tagged union costs a few words of memory per key compared
+// to an interface, but avoids an allocation and a type assertion on every
+// access, and it keeps the eviction metadata (lru/lfu/size) inline where the
+// sampling loop can read it without chasing a pointer.
+type Value struct {
+	typ  ValueType
+	str  []byte
+	list *List
+	hash map[string][]byte
+	set  map[string]struct{}
+	zset *ZSet
+
+	// expireAt is an absolute Unix time in milliseconds; 0 means "no TTL".
+	// Absolute rather than relative is what makes AOF replay and snapshots
+	// correct: a key written an hour ago must still expire at the same wall
+	// clock instant after a restart.
+	expireAt int64</code></pre>
+</div>
+
+<h3>The skip list, properly</h3>
+
+<p>A sorted set answers two questions that want opposite structures: <code>ZSCORE key member</code>
+is a point lookup, <code>ZRANGEBYSCORE key 10 20</code> an ordered range. A hash does the first in
+O(1) and the second not at all; a tree does both in O(log&nbsp;N) and makes the common case slower.
+Redis uses <em>both</em>, kept in lockstep by every mutation, and so do we.</p>
+
+<p>A skip list is a linked list with express lanes: level 0 links every node in order, level 1
+roughly every fourth (<code>p = 0.25</code>), level 2 every sixteenth. A search runs forward while
+the next node is smaller than the target, then drops a level. Node height is chosen by coin flips,
+so there is <strong>no rebalancing code at all</strong> &mdash; a few dozen lines instead of a
+red-black tree's few hundred.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="A four-level skip list over the members 3, 6, 9, 12, 17, 21, 25, showing the express lanes, the search path down to member 17, and the span on each forward pointer">
+  <text class="lbl-b" x="14" y="18">Skip list over scores 3 6 9 12 17 21 25 &mdash; searching for 17, and the spans that make ZRANK O(log N)</text>
+
+  <text class="mono" x="14" y="52">L3</text>
+  <text class="mono" x="14" y="92">L2</text>
+  <text class="mono" x="14" y="132">L1</text>
+  <text class="mono" x="14" y="172">L0</text>
+
+  <rect class="node-i" x="40" y="34" width="40" height="24" rx="4"/>
+  <rect class="node-i" x="40" y="74" width="40" height="24" rx="4"/>
+  <rect class="node-i" x="40" y="114" width="40" height="24" rx="4"/>
+  <rect class="node-i" x="40" y="154" width="40" height="24" rx="4"/>
+  <text class="lbl-s" x="60" y="171" text-anchor="middle">head</text>
+
+  <rect class="node" x="120" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="142" y="171" text-anchor="middle">3</text>
+
+  <rect class="node" x="192" y="114" width="44" height="24" rx="4"/>
+  <rect class="node" x="192" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="214" y="171" text-anchor="middle">6</text>
+
+  <rect class="node-o" x="264" y="74" width="44" height="24" rx="4"/>
+  <rect class="node-o" x="264" y="114" width="44" height="24" rx="4"/>
+  <rect class="node-o" x="264" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="286" y="171" text-anchor="middle">9</text>
+
+  <rect class="node" x="336" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="358" y="171" text-anchor="middle">12</text>
+
+  <rect class="node-a" x="408" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="430" y="171" text-anchor="middle">17</text>
+
+  <rect class="node" x="480" y="34" width="44" height="24" rx="4"/>
+  <rect class="node" x="480" y="74" width="44" height="24" rx="4"/>
+  <rect class="node" x="480" y="114" width="44" height="24" rx="4"/>
+  <rect class="node" x="480" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="502" y="171" text-anchor="middle">21</text>
+
+  <rect class="node" x="552" y="114" width="44" height="24" rx="4"/>
+  <rect class="node" x="552" y="154" width="44" height="24" rx="4"/>
+  <text class="mono" x="574" y="171" text-anchor="middle">25</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="80" y1="46"  x2="476" y2="46"  marker-end="url(#p40-ar26)"/>
+    <line class="edge" x1="524" y1="46" x2="620" y2="46"  marker-end="url(#p40-ar27)"/>
+    <line class="edge" x1="308" y1="86" x2="476" y2="86"  marker-end="url(#p40-ar28)"/>
+    <line class="edge" x1="524" y1="86" x2="620" y2="86"  marker-end="url(#p40-ar29)"/>
+    <line class="edge" x1="80"  y1="126" x2="188" y2="126" marker-end="url(#p40-ar30)"/>
+    <line class="edge" x1="236" y1="126" x2="260" y2="126" marker-end="url(#p40-ar31)"/>
+    <line class="edge" x1="308" y1="126" x2="476" y2="126" marker-end="url(#p40-ar32)"/>
+    <line class="edge" x1="524" y1="126" x2="548" y2="126" marker-end="url(#p40-ar33)"/>
+    <line class="edge" x1="596" y1="126" x2="620" y2="126" marker-end="url(#p40-ar34)"/>
+    <line class="edge" x1="80"  y1="166" x2="116" y2="166" marker-end="url(#p40-ar35)"/>
+    <line class="edge" x1="164" y1="166" x2="188" y2="166" marker-end="url(#p40-ar36)"/>
+    <line class="edge" x1="236" y1="166" x2="260" y2="166" marker-end="url(#p40-ar37)"/>
+    <line class="edge" x1="308" y1="166" x2="332" y2="166" marker-end="url(#p40-ar38)"/>
+    <line class="edge" x1="380" y1="166" x2="404" y2="166" marker-end="url(#p40-ar39)"/>
+    <line class="edge" x1="452" y1="166" x2="476" y2="166" marker-end="url(#p40-ar40)"/>
+    <line class="edge" x1="524" y1="166" x2="548" y2="166" marker-end="url(#p40-ar41)"/>
+    <line class="edge" x1="596" y1="166" x2="620" y2="166" marker-end="url(#p40-ar42)"/>
+  </g>
+  <text class="lbl-s" x="626" y="50">nil</text>
+  <text class="lbl-s" x="626" y="90">nil</text>
+  <text class="lbl-s" x="626" y="130">nil</text>
+  <text class="lbl-s" x="626" y="170">nil</text>
+
+  <text class="lbl-s" x="278" y="42"  text-anchor="middle">span 6</text>
+  <text class="lbl-s" x="392" y="82"  text-anchor="middle">span 3</text>
+  <text class="lbl-s" x="172" y="82"  text-anchor="middle">span 3 (head&rarr;9)</text>
+  <text class="lbl-s" x="392" y="122" text-anchor="middle">span 3</text>
+
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 60 58 L 60 74" marker-end="url(#p40-ar43)"/>
+    <path class="edge-a" d="M 60 98 L 60 114 M 286 98 L 286 114" marker-end="url(#p40-ar44)"/>
+    <path class="edge-a" d="M 286 138 L 286 154" marker-end="url(#p40-ar45)"/>
+  </g>
+
+  <text class="lbl-s" x="14" y="210">Search for 17: at L3 the next node is 21 &gt; 17, so drop. At L2 step head&rarr;9, next is 21, drop. At L1 next is 21, drop. At L0 step 9&rarr;12&rarr;17. Four</text>
+  <text class="lbl-s" x="14" y="226">comparisons instead of six, and the gap widens as log N does. Expected O(log N) for search, insert and delete, with zero rebalancing code.</text>
+  <text class="lbl-s" x="14" y="250">span = how many level-0 steps a forward pointer skips. ZRANK 21: at L3 the single hop head&rarr;21 carries span 6, so the answer is 6 &mdash; in one</text>
+  <text class="lbl-s" x="14" y="266">comparison. Summing spans along the search path is what turns rank queries from O(N) into O(log N), and it is the one addition over a</text>
+  <text class="lbl-s" x="14" y="282">textbook skip list. It is also the thing that is easy to get subtly wrong on insert and delete, which is why the tests re-verify every span.</text>
+  <defs>
+    <marker id="p40-ar26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar27" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar28" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar29" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar30" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar31" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar32" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar33" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar34" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar35" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar36" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar37" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar38" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar39" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar40" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar41" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar42" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar43" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar44" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p40-ar45" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>The express lanes are not maintained &mdash; they are <em>gambled</em> into existence, one
+coin flip per node, and the expected shape is good enough that nobody has to rebalance anything.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/store/zset.go &mdash; levels, and the total order<span class="lang">go</span></div>
+<pre><code class="lang-go">const (
+	zskiplistMaxLevel = 32   // enough for 2^64 elements at p=0.25
+	zskiplistP        = 0.25 // probability of promoting a node one more level
+)
+
+// randomLevel returns 1 with probability 0.75, 2 with probability 0.75*0.25,
+// and so on. math/rand/v2's top-level functions are safe for concurrent use,
+// and we only ever get here holding a shard lock anyway.
+func randomLevel() int {
+	level := 1
+	for level &lt; zskiplistMaxLevel &amp;&amp; rand.Float64() &lt; zskiplistP {
+		level++
+	}
+	return level
+}
+
+// less orders nodes by score, breaking ties by member bytes. The tie-break is
+// part of the contract: ZRANGE on equal scores returns members in lexicographic
+// order, and ZRANGEBYLEX depends on it entirely.
+func less(scoreA float64, memberA string, scoreB float64, memberB string) bool {
+	if scoreA != scoreB {
+		return scoreA &lt; scoreB
+	}
+	return memberA &lt; memberB
+}</code></pre>
+</div>
+
+<p>Insert is a search that remembers where it turned. <code>update[i]</code> is the last node visited
+at level <code>i</code>, <code>rank[i]</code> is that node's rank, and the two together are exactly
+what the span arithmetic needs.</p>
+
+<div class="codewrap">
+<div class="codehead">insert: the update vector, then splitting the spans<span class="lang">go</span></div>
+<pre><code class="lang-go">	var (
+		update [zskiplistMaxLevel]*zslNode // last node visited at each level
+		rank   [zskiplistMaxLevel]int      // rank of that node, for span maths
+	)
+
+	x := zsl.head
+	for i := zsl.level - 1; i &gt;= 0; i-- {
+		if i == zsl.level-1 {
+			rank[i] = 0
+		} else {
+			rank[i] = rank[i+1]
+		}
+		for x.level[i].forward != nil &amp;&amp;
+			less(x.level[i].forward.score, x.level[i].forward.member, score, member) {
+			rank[i] += x.level[i].span
+			x = x.level[i].forward
+		}
+		update[i] = x
+	}
+
+	level := randomLevel()
+	// ... head becomes the predecessor at any newly created levels ...
+
+	x = &amp;zslNode{member: member, score: score, level: make([]zslLevel, level)}
+	for i := 0; i &lt; level; i++ {
+		x.level[i].forward = update[i].level[i].forward
+		update[i].level[i].forward = x
+		// The predecessor's old span covered the gap that now contains x, so
+		// split it: everything the predecessor skipped past x's position stays
+		// on x, the rest (plus x itself) stays on the predecessor.
+		x.level[i].span = update[i].level[i].span - (rank[0] - rank[i])
+		update[i].level[i].span = (rank[0] - rank[i]) + 1
+	}
+	// Levels above the new node just gained one more node underneath them.
+	for i := level; i &lt; zsl.level; i++ {
+		update[i].level[i].span++
+	}</code></pre>
+</div>
+
+<div class="box iv">
+  <span class="bt">Why a skip list beats a balanced tree here</span>
+  <p>Not asymptotics &mdash; both are O(log&nbsp;N) &mdash; but four practical properties.
+  <strong>(1)</strong> No rotations: insert and delete are local pointer surgery, without the case
+  analysis that makes red-black trees error-prone. <strong>(2)</strong> Level 0 <em>is</em> a sorted
+  linked list with back pointers, so <code>ZRANGE</code> and <code>ZREVRANGE</code> are "find the
+  start, then walk". <strong>(3)</strong> <code>span</code> is one integer per forward pointer;
+  subtree sizes in a tree must be fixed by every rotation. <strong>(4)</strong> Range boundaries
+  fall out of the same descent &mdash; <code>firstInRange</code> and <code>lastInRange</code> differ
+  only in the comparison.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Re-scoring is delete + insert, and the dict must move with it</span>
+  <p>Position is a function of score, so <code>ZADD</code> on an existing member cannot patch in
+  place &mdash; it deletes at the old score, inserts at the new one, then updates the dict. Miss the
+  dict update and <code>ZSCORE</code> disagrees with <code>ZRANGE</code> forever; miss the delete and
+  the member appears twice. <code>Add</code> also separates <em>added</em> from <em>changed</em>, so
+  a re-add at an identical score returns 0 and leaves the command clean &mdash; which keeps it out of
+  the AOF. And <code>ZINCRBY</code> rejects <code>inf + -inf</code>: a NaN score makes every
+  comparison in <code>less</code> ill-defined.</p>
+</div>
+
+<h2>Memory accounting</h2>
+
+<p>Eviction needs a number to act on, and the Go heap is not it &mdash; it includes connection buffers,
+the AOF buffer and allocator slack. So every mutation maintains a cached per-entry size and a
+per-shard atomic total, making <code>MemoryUsed</code> O(shards) instead of O(keyspace).</p>
+
+<div class="codewrap">
+<div class="codehead">the cost model &mdash; approximate, but symmetric<span class="lang">go</span></div>
+<pre><code class="lang-go">// Per-entry overheads, in bytes. These are estimates of what the Go runtime
+// actually spends: a map bucket slot, the Value header, a slice header, a list
+// or skiplist node. They do not have to be exact -- eviction only needs a
+// consistent, monotonic measure so that "delete keys until we are under the
+// limit" terminates -- but they must be charged and refunded symmetrically,
+// which VerifyMemoryAccounting checks.
+const (
+	entryOverhead    = 64
+	sliceOverhead    = 24
+	mapEntryOverhead = 48
+	listNodeOverhead = 48
+	zsetNodeOverhead = 96
+)
+
+func baseCost(key string) int64     { return entryOverhead + int64(len(key)) }
+func stringCost(b []byte) int64     { return sliceOverhead + int64(len(b)) }
+func zsetMemberCost(m string) int64 { return mapEntryOverhead + zsetNodeOverhead + 2*int64(len(m)) }</code></pre>
+</div>
+
+<p><code>zsetMemberCost</code> charges the member string <em>twice</em>, once for the dict entry and
+once for the skip list node &mdash; the honest answer for a structure that stores every member in two
+places, and worth knowing before you put ten million members in a leaderboard. Mutation sites then
+adjust by deltas: <code>sh.grow(v, stringCost(v.str)-before)</code> in <code>IncrBy</code>,
+<code>sh.grow(v, -zsetMemberCost(m))</code> in <code>ZRem</code>.</p>
+
+<div class="box gotcha">
+  <span class="bt">Incremental accounting rots silently &mdash; so make it a test</span>
+  <p>One code path that charges on insert and forgets to refund on delete, and the counter drifts
+  upward until eviction runs continuously on a nearly empty keyspace. Drift the other way and
+  eviction never fires at all. Neither shows up as a failing assertion anywhere near the bug. The
+  defence is a full recomputation, called after randomised workloads:</p>
+<div class="codewrap"><pre><code class="lang-go">// VerifyMemoryAccounting recomputes every entry's size from scratch and reports
+// the first shard whose incremental total has drifted. Tests call it after
+// randomised workloads: incremental accounting is exactly the kind of code that
+// rots silently, and a drifting counter would make eviction either never fire
+// or never stop.
+func (s *Store) VerifyMemoryAccounting() error {</code></pre></div>
+  <p>And note what <code>MemoryUsed</code> is <em>not</em>: <em>"This is the dataset, not the Go
+  heap"</em>. Redis's <code>used_memory</code> has the same character, which is why it never matches
+  RSS.</p>
+</div>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>RESP2 is five type bytes, CRLF framing and no aggregate terminator &mdash; the declared count is
+  the contract. Emit fewer elements than you declared and that connection is desynchronised
+  permanently, with the symptom surfacing in unrelated code.</li>
+  <li>Every length a client sends is an attack surface. Bound the element count (1&nbsp;M), the
+  payload length (512&nbsp;MiB) <em>and</em> the header line (128&nbsp;B) before allocating &mdash;
+  the header cap is the forgotten one, because <code>readLine</code> loops past
+  <code>bufio.ErrBufferFull</code> by design.</li>
+  <li>Streaming comes free from the goroutine-per-connection model: "the command arrived in three
+  TCP segments" is a blocking read inside <code>bufio</code>, not saved parser state.</li>
+  <li>A protocol error is not a command error. Reply, flush, close &mdash; hence
+  <code>ProtocolError</code> as a distinct type the connection loop tests for.</li>
+  <li>Sharded locks buy multi-core parallelism and cost cross-key atomicity. Per-command atomicity
+  survives because a command holds one shard lock throughout; <code>DEL a b</code> and
+  <code>MSET</code> do not, and the fix is a fixed global lock order.</li>
+  <li>Nothing owned by a shard may outlive its lock: <code>Get</code> copies,
+  <code>exportEntry</code> deep-copies, and the three-index slice stops an <code>append</code>
+  reaching bytes someone else owns.</li>
+  <li>A sorted set is two structures in lockstep, and the skip list's edge over a balanced tree is
+  engineering rather than complexity: no rotations, level 0 is already the range iterator, and one
+  extra int per pointer buys O(log&nbsp;N) <code>ZRANK</code>.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="index.html"><span class="lb">Previous</span>Mini-Redis: an in-memory store in Go</a>
+  <a href="02-implementation.html"><span class="lb">Next</span>Expiry, eviction &amp; persistence</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

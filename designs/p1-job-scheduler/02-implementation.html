@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Implementation walkthrough &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Distributed Job Scheduler &amp; Workflow Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Implementation walkthrough</h1>
+<p class="lede">A file-by-file reading of the scaffold, following the decisions rather than the
+packages: why the claim is one transaction and not two, why the cron lock is transaction-scoped,
+why the worker never claims a row it cannot start, and what the arithmetic between the heartbeat
+and the lease actually has to satisfy.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">distributed queue</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The mental model for the whole codebase</span>
+  <p>Every instance runs all five loops and PostgreSQL alone arbitrates: <strong>row locks decide who
+  owns work, an advisory lock decides who materialises cron occurrences, a timestamp decides who is
+  alive</strong>. The Java is thin. Every class below either opens the right transaction, or handles
+  what happens <em>after</em> a claim succeeds and its owner then fails.</p>
+</div>
+
+<h2>The five loops, and what each one touches</h2>
+
+<figure>
+<svg viewBox="0 0 820 292" role="img" aria-label="Map of the five scheduled loops in one instance, the SQL statement each one issues, and the table it touches">
+  <text class="lbl-b" x="14" y="18">One instance. All five loops run on every instance &mdash; there is no scheduler tier.</text>
+
+  <rect class="node-a" x="14"  y="30" width="192" height="36" rx="6"/>
+  <rect class="node-a" x="14"  y="74" width="192" height="36" rx="6"/>
+  <rect class="node-a" x="14"  y="118" width="192" height="36" rx="6"/>
+  <rect class="node-a" x="14"  y="162" width="192" height="36" rx="6"/>
+  <rect class="node-a" x="14"  y="206" width="192" height="36" rx="6"/>
+
+  <text class="lbl-b" x="24" y="46">CronTicker</text>
+  <text class="lbl-s" x="24" y="60">@Scheduled 1s &middot; @Transactional</text>
+  <text class="lbl-b" x="24" y="90">WorkerLoop.pollOnce</text>
+  <text class="lbl-s" x="24" y="104">@Scheduled 500ms</text>
+  <text class="lbl-b" x="24" y="134">WorkerLoop.heartbeatOnce</text>
+  <text class="lbl-s" x="24" y="148">@Scheduled 5s</text>
+  <text class="lbl-b" x="24" y="178">OrphanSweeper.sweep</text>
+  <text class="lbl-s" x="24" y="192">@Scheduled 10s &middot; @Transactional</text>
+  <text class="lbl-b" x="24" y="222">DagResolver</text>
+  <text class="lbl-s" x="24" y="236">@Scheduled 2s &middot; @Transactional</text>
+
+  <rect class="node" x="252" y="30"  width="322" height="36" rx="6"/>
+  <rect class="node" x="252" y="74"  width="322" height="36" rx="6"/>
+  <rect class="node" x="252" y="118" width="322" height="36" rx="6"/>
+  <rect class="node" x="252" y="162" width="322" height="36" rx="6"/>
+  <rect class="node" x="252" y="206" width="322" height="36" rx="6"/>
+
+  <text class="mono"  x="262" y="46">pg_try_advisory_xact_lock(k)</text>
+  <text class="lbl-s" x="262" y="60">then INSERT &hellip; ON CONFLICT (idempotency_key) DO NOTHING</text>
+  <text class="mono"  x="262" y="90">SELECT &hellip; FOR UPDATE SKIP LOCKED &rarr; UPDATE status='RUNNING'</text>
+  <text class="lbl-s" x="262" y="104">both inside ONE REQUIRES_NEW transaction</text>
+  <text class="mono"  x="262" y="134">UPDATE SET heartbeat_at=now() WHERE claimed_by=me</text>
+  <text class="lbl-s" x="262" y="148">scoped to the ids this JVM believes are in flight</text>
+  <text class="mono"  x="262" y="178">SELECT &hellip; heartbeat_at &lt; cutoff FOR UPDATE SKIP LOCKED</text>
+  <text class="lbl-s" x="262" y="192">then RetryPolicy.recordFailure on each row</text>
+  <text class="mono"  x="262" y="222">UPDATE &hellip; NOT EXISTS ( &hellip; NOT EXISTS ( &hellip; ) )</text>
+  <text class="lbl-s" x="262" y="236">set-based, so concurrent resolvers cannot race</text>
+
+  <rect class="node-i" x="620" y="30"  width="186" height="124" rx="6"/>
+  <rect class="node-i" x="620" y="162" width="186" height="80" rx="6"/>
+  <text class="lbl-b" x="713" y="60"  text-anchor="middle">job_execution</text>
+  <text class="lbl-s" x="713" y="78"  text-anchor="middle">THE QUEUE</text>
+  <text class="lbl-s" x="713" y="98"  text-anchor="middle">idx_job_execution_claim</text>
+  <text class="lbl-s" x="713" y="114" text-anchor="middle">(status, run_at) WHERE PENDING</text>
+  <text class="lbl-s" x="713" y="134" text-anchor="middle">idx_job_execution_heartbeat</text>
+  <text class="lbl-b" x="713" y="190" text-anchor="middle">job_dependency</text>
+  <text class="lbl-s" x="713" y="208" text-anchor="middle">edges: child &rarr; parent</text>
+  <text class="lbl-s" x="713" y="226" text-anchor="middle">+ processed_execution ledger</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="208" y1="48"  x2="248" y2="48"  marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="208" y1="92"  x2="248" y2="92"  marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="208" y1="136" x2="248" y2="136" marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="208" y1="180" x2="248" y2="180" marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="208" y1="224" x2="248" y2="224" marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="576" y1="48"  x2="616" y2="60"  marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="576" y1="92"  x2="616" y2="86"  marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="576" y1="136" x2="616" y2="112" marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="576" y1="180" x2="616" y2="140" marker-end="url(#p11-ar1)"/>
+    <line class="edge" x1="576" y1="224" x2="616" y2="200" marker-end="url(#p11-ar1)"/>
+  </g>
+
+  <text class="lbl-s" x="14" y="266">Redis holds one sorted set of live node ids for the stats endpoint. Nothing on the correctness path touches it,</text>
+  <text class="lbl-s" x="14" y="282">and its health indicator is disabled so a Redis outage cannot pull an instance out of the load balancer.</text>
+  <defs>
+    <marker id="p11-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Four of the five loops issue exactly one interesting statement each. The fifth &mdash; the
+heartbeat &mdash; issues the cheapest statement in the system and is the one whose failure is most
+expensive.</figcaption>
+</figure>
+
+<div class="box gotcha">
+  <span class="bt">Spring's default scheduler pool is <em>one</em> thread</span>
+  <p>Five <code>@Scheduled</code> methods on a single-threaded scheduler run in series: a slow cron
+  tick delays the heartbeat, leases expire, the sweeper reclaims healthy work. Hence
+  <code>spring.task.scheduling.pool.size: 6</code>. The same argument sizes Hikari at 20 &mdash; below
+  the 8 worker threads, completions queue behind claims and the instance times out its own live
+  work.</p>
+</div>
+
+<h2>The claim: one transaction, two statements</h2>
+
+<p>Everything rests on this. The query is hand-written native SQL because JPA has no expression for
+<code>FOR UPDATE SKIP LOCKED</code> with a <code>LIMIT</code> &mdash; and because the exact statement
+text <em>is</em> the design.</p>
+
+<div class="codewrap">
+<div class="codehead">JobExecutionRepository.selectDueForUpdate &mdash; step 1 of 2<span class="lang">java</span></div>
+<pre><code class="lang-java">@Query(value = """
+        SELECT e.id
+          FROM job_execution e
+         WHERE e.status = 'PENDING'
+           AND e.run_at &lt;= :now
+         ORDER BY e.run_at
+           FOR UPDATE SKIP LOCKED
+         LIMIT :batchSize
+        """, nativeQuery = true)
+List&lt;UUID&gt; selectDueForUpdate(@Param("now") OffsetDateTime now,
+                              @Param("batchSize") int batchSize);</code></pre>
+</div>
+
+<p>Four decisions in nine lines. <strong><code>FOR UPDATE</code> alone is already correct</strong>
+&mdash; a second worker blocks, re-evaluates after the first commits, finds the rows no longer
+<code>PENDING</code>, returns nothing. <code>SKIP LOCKED</code> is not what makes claiming exact; it
+is what makes it <em>parallel</em>. <strong>Ids, not entities</strong>, so the locked window stays
+short. <strong><code>ORDER BY run_at</code> survives locking</strong> &mdash; PostgreSQL orders
+before it locks and drops locked rows rather than reordering; without it a large backlog starves its
+own head. And <strong><code>OffsetDateTime</code>, not <code>Instant</code></strong>: the driver
+binds the former unambiguously, the latter depends silently on
+<code>hibernate.jdbc.time_zone</code>.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Two workers walking the same run_at-ordered partial index, with worker A holding row locks and worker B skipping over them, and a timeline of the claim transaction">
+  <text class="lbl-b" x="14" y="18">idx_job_execution_claim, walked in run_at order by both workers at once</text>
+
+  <rect class="node-d" x="14"  y="28" width="96" height="34" rx="5"/>
+  <rect class="node-d" x="114" y="28" width="96" height="34" rx="5"/>
+  <rect class="node-d" x="214" y="28" width="96" height="34" rx="5"/>
+  <rect class="node-o" x="314" y="28" width="96" height="34" rx="5"/>
+  <rect class="node-o" x="414" y="28" width="96" height="34" rx="5"/>
+  <rect class="node-o" x="514" y="28" width="96" height="34" rx="5"/>
+  <rect class="node"   x="614" y="28" width="96" height="34" rx="5"/>
+  <rect class="node"   x="714" y="28" width="92" height="34" rx="5"/>
+
+  <text class="lbl-s" x="62"  y="42" text-anchor="middle">run_at 09:00</text>
+  <text class="lbl-s" x="162" y="42" text-anchor="middle">09:01</text>
+  <text class="lbl-s" x="262" y="42" text-anchor="middle">09:02</text>
+  <text class="lbl-s" x="362" y="42" text-anchor="middle">09:03</text>
+  <text class="lbl-s" x="462" y="42" text-anchor="middle">09:04</text>
+  <text class="lbl-s" x="562" y="42" text-anchor="middle">09:05</text>
+  <text class="lbl-s" x="662" y="42" text-anchor="middle">09:06</text>
+  <text class="lbl-s" x="760" y="42" text-anchor="middle">09:07</text>
+  <text class="lbl-s" x="62"  y="56" text-anchor="middle">LOCKED by A</text>
+  <text class="lbl-s" x="162" y="56" text-anchor="middle">LOCKED by A</text>
+  <text class="lbl-s" x="262" y="56" text-anchor="middle">LOCKED by A</text>
+  <text class="lbl-s" x="362" y="56" text-anchor="middle">B takes it</text>
+  <text class="lbl-s" x="462" y="56" text-anchor="middle">B takes it</text>
+  <text class="lbl-s" x="562" y="56" text-anchor="middle">B takes it</text>
+  <text class="lbl-s" x="662" y="56" text-anchor="middle">free</text>
+  <text class="lbl-s" x="760" y="56" text-anchor="middle">free</text>
+
+  <text class="lbl-s" x="14" y="82">B does not wait. It VISITS rows 1&ndash;3, sees they are locked, steps over them, and its LIMIT 3 is filled from 09:03 onward.</text>
+  <text class="lbl-s" x="14" y="98">Without the index this is a seq scan plus a sort: every worker materialises the whole backlog before skipping anything.</text>
+
+  <text class="lbl-b" x="14" y="128">One claim transaction &mdash; ExecutionClaimer.claim, Propagation.REQUIRES_NEW</text>
+
+  <rect class="node"   x="14"  y="140" width="120" height="40" rx="6"/>
+  <rect class="node-w" x="140" y="140" width="230" height="40" rx="6"/>
+  <rect class="node-w" x="376" y="140" width="190" height="40" rx="6"/>
+  <rect class="node-i" x="572" y="140" width="150" height="40" rx="6"/>
+  <rect class="node"   x="728" y="140" width="78"  height="40" rx="6"/>
+
+  <text class="lbl-b" x="74"  y="158" text-anchor="middle">BEGIN</text>
+  <text class="lbl-b" x="255" y="158" text-anchor="middle">SELECT &hellip; FOR UPDATE</text>
+  <text class="lbl-s" x="255" y="172" text-anchor="middle">SKIP LOCKED LIMIT :batch</text>
+  <text class="lbl-b" x="471" y="158" text-anchor="middle">UPDATE &rarr; RUNNING</text>
+  <text class="lbl-s" x="471" y="172" text-anchor="middle">claimed_by, claimed_at, heartbeat_at</text>
+  <text class="lbl-b" x="647" y="158" text-anchor="middle">re-read + snapshot</text>
+  <text class="lbl-s" x="647" y="172" text-anchor="middle">JOIN FETCH job</text>
+  <text class="lbl-b" x="767" y="163" text-anchor="middle">COMMIT</text>
+
+  <rect class="node-d" x="140" y="196" width="582" height="26" rx="4"/>
+  <text class="lbl-b" x="431" y="213" text-anchor="middle">ROW LOCKS HELD &mdash; this is what holds the line</text>
+  <rect class="node-o" x="728" y="196" width="78" height="26" rx="4"/>
+  <text class="lbl-s" x="767" y="213" text-anchor="middle">released</text>
+
+  <text class="lbl-s" x="14" y="248">After COMMIT the locks are gone, but the rows are no longer PENDING, so no peer's claim query will even consider them.</text>
+  <text class="lbl-s" x="14" y="264">Split this into two transactions and the lock ends at the first COMMIT &mdash; two workers then both see the row as PENDING.</text>
+  <text class="lbl-s" x="14" y="286">REQUIRES_NEW so a claim can never be enlisted in a longer caller transaction and rolled back into "RUNNING with nobody running it".</text>
+  <defs>
+    <marker id="p11-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The lock window and the status window overlap by exactly one instant &mdash; COMMIT. That
+overlap is the entire mutual-exclusion argument.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">ExecutionClaimer.claim &mdash; the transaction boundary that makes the pair atomic<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional(propagation = Propagation.REQUIRES_NEW)
+public List&lt;Claimed&gt; claim(String workerId, int batchSize) {
+    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+
+    List&lt;UUID&gt; ids = executions.selectDueForUpdate(now, batchSize);
+    if (ids.isEmpty()) {
+        return List.of();
+    }
+
+    int updated = executions.markRunning(ids, workerId, now);
+    if (updated != ids.size()) {
+        // Cannot happen while we hold the row locks - which is exactly why it is worth
+        // asserting. If this ever fires, someone has added a code path that mutates
+        // job_execution without taking the lock first.
+        log.warn("claim mismatch: locked {} rows but updated {} (workerId={})",
+                ids.size(), updated, workerId);
+    }
+
+    // Re-read after the bulk UPDATE (which cleared the persistence context) so the snapshots
+    // reflect committed-to-be state, with the definition fetch-joined.
+    List&lt;JobExecution&gt; claimed = executions.findAllWithJobByIdIn(ids);
+
+    // An "id IN (:ids)" query makes NO promise about row order - the planner is free to return
+    // a bitmap heap scan in physical order, or an index scan in (random) UUID order. The claim
+    // order that matters was established by ORDER BY run_at in selectDueForUpdate, and the
+    // whole fairness property ("oldest eligible work first") depends on the batch being
+    // dispatched in that order, so re-impose it here instead of inheriting the planner's whim.
+    Map&lt;UUID, JobExecution&gt; byId = new HashMap&lt;&gt;();
+    for (JobExecution execution : claimed) {
+        byId.put(execution.getId(), execution);
+    }
+    List&lt;Claimed&gt; result = ids.stream()
+            .map(byId::get)
+            .filter(Objects::nonNull)
+            .map(ExecutionClaimer::snapshot)
+            .toList();
+    log.debug("worker {} claimed {} execution(s)", workerId, result.size());
+    return result;
+}</code></pre>
+</div>
+
+<p>The re-read is not redundant. <code>markRunning</code> is bulk SQL annotated
+<code>@Modifying(flushAutomatically = true, clearAutomatically = true)</code>, so clearing afterwards
+is what makes the <code>JOIN FETCH</code> see post-UPDATE state rather than cached copies that still
+say <code>PENDING</code>. Rows are then flattened into a <code>Claimed</code> record before the
+transaction closes: handing a managed entity to a pool thread with no session earns a
+<code>LazyInitializationException</code> on the first payload read.</p>
+
+<div class="box gotcha">
+  <span class="bt">The re-read silently throws away <code>ORDER BY run_at</code></span>
+  <p><code>selectDueForUpdate</code> is carefully ordered oldest-first, and then
+  <code>findAllWithJobByIdIn</code> &mdash; a plain <code>WHERE e.id IN :ids</code> with no
+  <code>ORDER BY</code> &mdash; hands the rows back in whatever order the plan produced: physical heap
+  order for a bitmap scan, UUID order for an index scan on the primary key. Neither has anything to do
+  with <code>run_at</code>. Iterating that list straight into <code>dispatch</code> would mean the
+  fairness property is enforced when rows are <em>selected</em> and then discarded when they are
+  <em>run</em>, which is the half that a user actually observes: with eight threads and a batch of
+  sixteen, the second half of the batch waits for a free slot, so batch order <em>is</em> execution
+  order. The fix is the three lines above &mdash; index the re-read by id, then walk <code>ids</code>.
+  <code>filter(Objects::nonNull)</code> guards the case where a row was deleted between the UPDATE and
+  the re-read; a <code>null</code> reaching <code>snapshot</code> would be an NPE inside the claim
+  transaction, i.e. the whole batch rolled back and re-claimed.</p>
+</div>
+
+<h2>Leader election for exactly one tick</h2>
+
+<p><code>AdvisoryLock</code> is 40 lines of code and 50 of javadoc, and the ratio is correct. Three
+reasons force the transaction-scoped family: HikariCP hands out an arbitrary connection, so acquiring
+on one and releasing on another leaks the lock and stops cron materialisation cluster-wide; a session
+lock needs try/finally discipline through every future refactor; and a SIGKILLed JVM must not wedge
+the cluster while TCP keepalive notices the dead client. Transaction scope makes the database's own
+lifecycle the failure detector &mdash; no lease, no TTL, no fencing token.</p>
+
+<div class="codewrap">
+<div class="codehead">AdvisoryLock.tryLock &mdash; the guard is the interesting half<span class="lang">java</span></div>
+<pre><code class="lang-java">public boolean tryLock(long key) {
+    if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+        throw new IllegalStateException(
+                "pg_try_advisory_xact_lock(" + key + ") was called outside a transaction. "
+                        + "A transaction-scoped advisory lock is released at COMMIT, so in "
+                        + "autocommit mode it is released by the very statement that takes it "
+                        + "and provides no mutual exclusion. Annotate the calling method with "
+                        + "@Transactional (and make sure the call is not a self-invocation "
+                        + "that bypasses the proxy).");
+    }
+    Boolean acquired = jdbc.queryForObject(
+            "SELECT pg_try_advisory_xact_lock(?)", Boolean.class, key);
+    return Boolean.TRUE.equals(acquired);
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The bug this guard exists to prevent is invisible in testing</span>
+  <p>In autocommit mode the lock is acquired and released by the same statement, so it returns
+  <code>true</code> every time on every instance. One instance in dev: <em>works perfectly</em>.
+  Three in production: all three are the leader, every tick, forever. The unique constraint on
+  <code>idempotency_key</code> still prevents duplicate <em>runs</em>, so you do not even get failed
+  jobs &mdash; just triple the transactions and a constraint violation logged every second.</p>
+</div>
+
+<p>Hence the second trap. <code>@Transactional</code> is proxy-based, so a call from inside the bean
+never reaches the proxy: had <code>scheduledTick()</code> simply called <code>tick()</code>, no
+transaction would start and the guard above would fire every second. <code>CronTicker</code> and
+<code>OrphanSweeper</code> both route through an <code>ObjectProvider</code> of their own type, which
+also avoids the circular dependency that direct self-injection creates.</p>
+
+<div class="codewrap">
+<div class="codehead">CronTicker &mdash; routing back through the container, and the tick itself<span class="lang">java</span></div>
+<pre><code class="lang-java">@Scheduled(fixedDelayString = "${scheduler.cron.tick-interval}")
+public void scheduledTick() {
+    if (!props.cron().enabled()) {
+        return;
+    }
+    try {
+        self.getObject().tick();           // through the proxy, so @Transactional applies
+    } catch (RuntimeException ex) {
+        // Never let an exception escape a @Scheduled method: Spring's scheduler cancels the
+        // task on an uncaught throwable, and the cron ticker would be silently dead until the
+        // next restart.
+        log.error("cron tick failed", ex);
+    }
+}
+
+@Transactional
+public int tick() {
+    // A losing instance discovers it lost in microseconds and does no further work. This is
+    // the whole leader election: no heartbeats, no term numbers, no split brain, because the
+    // lock is held by a database transaction rather than by a process's belief about itself.
+    if (!advisoryLock.tryLock(props.cron().advisoryLockKey())) {
+        log.trace("another instance holds the cron lock this tick; skipping");
+        return 0;
+    }
+    ...
+}</code></pre>
+</div>
+
+<p>Materialisation is resumable and bounded. The cursor starts at <code>MAX(scheduled_for)</code>, not
+at <code>now()</code>, so a restart catches up missed occurrences instead of dropping them &mdash;
+while a job seen for the first time starts at <code>now</code> rather than backfilling from
+<code>created_at</code>. Catch-up is capped at <code>max-occurrences-per-tick: 16</code>: a
+one-second cron job down for a day would otherwise write 86,400 rows in one transaction and saturate
+every worker the instant it commits.</p>
+
+<div class="codewrap">
+<div class="codehead">CronTicker.materializeOccurrences &mdash; the resumable cursor<span class="lang">java</span></div>
+<pre><code class="lang-java">CronExpression cron = CronExpression.parse(job.getCronExpr());
+
+Instant cursorInstant = executions.findLatestScheduledFor(job.getId()).orElse(now);
+ZonedDateTime cursor = cursorInstant.atZone(ZoneOffset.UTC);
+
+int created = 0;
+for (int i = 0; i &lt; props.cron().maxOccurrencesPerTick(); i++) {
+    ZonedDateTime next = cron.next(cursor);
+    if (next == null) {
+        // CronExpression returns null when the expression can never match again, e.g.
+        // "0 0 0 30 2 *" - 30 February.
+        log.warn("cron expression '{}' on job '{}' has no further occurrences",
+                job.getCronExpr(), job.getName());
+        break;
+    }
+    Instant nextInstant = next.toInstant();
+    if (nextInstant.isAfter(horizonEnd)) {
+        break;
+    }
+    created += materializer.materializeRun(job, nextInstant).size();
+    cursor = next;
+}</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Spring cron has six fields, not five</span>
+  <p><code>CronExpression.parse</code> expects <code>second minute hour dom month dow</code>. A
+  five-field Unix expression is rejected by the API at create time rather than silently never
+  firing. The seed job's <code>*/10 * * * * *</code> is every ten seconds, not every ten minutes.</p>
+</div>
+
+<h2>The worker loop: backpressure is the whole point</h2>
+
+<p><code>WorkerLoop</code> never claims work it cannot start. A claimed row is <code>RUNNING</code>
+with a lease already ticking, so from any peer's point of view a row queued behind eight busy threads
+is indistinguishable from one being actively worked on.</p>
+
+<div class="codewrap">
+<div class="codehead">WorkerLoop &mdash; the pool, the permits, and why AbortPolicy<span class="lang">java</span></div>
+<pre><code class="lang-java">int threads  = props.worker().threads();      // 8
+int capacity = props.worker().capacity();     // threads * 2 = 16
+this.slots = new Semaphore(capacity);
+
+// AbortPolicy, not CallerRunsPolicy. CallerRuns would execute the job on the @Scheduled
+// thread, blocking every other scheduled task - including the heartbeat that keeps this
+// instance's leases alive. Rejection is handled explicitly in dispatch() by returning the
+// row to the queue; silently running it here would be far worse.
+this.pool = new ThreadPoolExecutor(
+        threads, threads,
+        0L, TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue&lt;&gt;(Math.max(1, capacity - threads)),
+        factory,
+        new ThreadPoolExecutor.AbortPolicy());</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">pollOnce and dispatch &mdash; min(batch, free slots), and the rejection path<span class="lang">java</span></div>
+<pre><code class="lang-java">public int pollOnce() {
+    int capacity = slots.availablePermits();
+    if (capacity &lt;= 0) {
+        log.debug("worker at capacity; skipping poll");
+        return 0;
+    }
+
+    int batchSize = Math.min(props.worker().claimBatchSize(), capacity);
+    List&lt;ExecutionClaimer.Claimed&gt; claimed = claimer.claim(props.nodeId(), batchSize);
+
+    for (ExecutionClaimer.Claimed execution : claimed) {
+        dispatch(execution);
+    }
+    return claimed.size();
+}
+
+private void dispatch(ExecutionClaimer.Claimed execution) {
+    // This acquire cannot block: only pool threads release permits and only this single
+    // @Scheduled thread acquires them, so the permit count measured in pollOnce() can have
+    // grown but never shrunk. The blocking form is used anyway so that a future change which
+    // adds a second acquirer degrades into waiting rather than into over-claiming.
+    slots.acquireUninterruptibly();
+    inFlight.add(execution.executionId());
+    try {
+        pool.execute(() -&gt; runSafely(execution));
+    } catch (RejectedExecutionException ex) {
+        inFlight.remove(execution.executionId());
+        slots.release();
+        // We hold a RUNNING row we cannot execute. Put it straight back rather than letting
+        // the lease expire, which would cost 30 seconds of latency for nothing.
+        executions.releaseToPending(List.of(execution.executionId()), props.nodeId(),
+                OffsetDateTime.now(ZoneOffset.UTC));
+        log.warn("execution {} rejected by the pool and returned to PENDING",
+                execution.executionId());
+    }
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Remove the <code>min()</code> and you get self-inflicted duplicate execution</span>
+  <p>Claim <code>claimBatchSize</code> unconditionally and <code>dispatch</code> blocks on
+  <code>slots.acquireUninterruptibly()</code>, on the poll thread, holding the rest of the batch in a
+  local <code>List</code>. Those rows are <code>RUNNING</code> in the database and <em>not yet in
+  <code>inFlight</code></em>, so the heartbeat does not cover them. Thirty seconds later the sweeper
+  reclaims them, a peer runs them, and then this instance gets a permit and runs them too. The
+  interval between a claim's COMMIT and <code>inFlight.add</code> is the only un-heartbeated window
+  in the system; backpressure keeps it at microseconds.</p>
+</div>
+
+<h2>Heartbeat, lease, and orphan reclaim</h2>
+
+<p>Liveness is a timestamp, not a membership protocol. Two scopes carry the safety argument: the SQL
+is scoped to <code>claimed_by = :workerId</code>, so a paused instance cannot stomp on a new owner's
+lease; the Java is scoped to <code>inFlight</code>, so a finished handler or a dead thread stops
+being heartbeated at once.</p>
+
+<div class="codewrap">
+<div class="codehead">the heartbeat: one statement, scoped twice<span class="lang">java</span></div>
+<pre><code class="lang-java">// JobExecutionRepository
+@Query(value = """
+        UPDATE job_execution
+           SET heartbeat_at = :now
+         WHERE id IN (:ids)
+           AND status = 'RUNNING'
+           AND claimed_by = :workerId
+        """, nativeQuery = true)
+int heartbeat(...);
+
+// WorkerLoop.heartbeatOnce - only rows this JVM believes it is executing
+Set&lt;UUID&gt; ids = Set.copyOf(inFlight);
+if (ids.isEmpty()) {
+    return 0;
+}
+int renewed = executions.heartbeat(ids, props.nodeId(), OffsetDateTime.now(ZoneOffset.UTC));
+if (renewed &lt; ids.size()) {
+    // We think we own more rows than the database agrees we own. Usually this means a row
+    // was reclaimed by the sweeper while we were still working on it - the exact situation
+    // the idempotency ledger is there to make survivable.
+    log.warn("heartbeat renewed {} of {} in-flight lease(s); some rows were reclaimed",
+            renewed, ids.size());
+}</code></pre>
+</div>
+
+<p>Refreshing "all rows where <code>claimed_by = me</code>" instead would keep leases alive for work
+nobody is doing, and the sweeper would never fire. The arithmetic between the intervals is the
+tuning surface:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Constant</th><th>Default</th><th>What it buys</th><th>Constraint it must satisfy</th></tr></thead>
+<tbody>
+<tr><td><code>heartbeat-interval</code></td><td>5&nbsp;s</td><td>Resolution of the liveness signal; one extra UPDATE per instance per interval</td><td>Comfortably above the p99 latency of a single UPDATE plus its wait for a Hikari connection</td></tr>
+<tr><td><code>lease-timeout</code></td><td>30&nbsp;s</td><td>Tolerance for GC pauses, transient DB slowness and scheduler-thread queueing</td><td><strong>Strictly &gt; <code>heartbeat-interval</code></strong>, enforced at startup. 30/5 = six consecutive missed beats before anyone acts</td></tr>
+<tr><td><code>sweeper.interval</code></td><td>10&nbsp;s</td><td>How often expiry is even checked</td><td>Adds to recovery latency: worst case <code>lease-timeout + sweeper.interval</code> = 40&nbsp;s, plus a jittered backoff of up to <code>capFor(1)</code> = 2&nbsp;s</td></tr>
+<tr><td><code>poll-interval</code></td><td>500&nbsp;ms</td><td>Scheduling latency floor for a due row</td><td>Independent of the lease; each poll is a bounded, indexed query</td></tr>
+<tr><td><code>shutdown-grace</code></td><td>20&nbsp;s</td><td>Time for in-flight handlers to finish on SIGTERM before rows are handed back</td><td>Should be &lt; <code>lease-timeout</code>, so a graceful stop always beats a reclaim to the punch</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">SchedulerProperties &mdash; refusing to start on a configuration that reclaims live work<span class="lang">java</span></div>
+<pre><code class="lang-java">public SchedulerProperties {
+    if (nodeId == null || nodeId.isBlank()) {
+        throw new IllegalArgumentException("scheduler.node-id must not be blank");
+    }
+    if (worker.leaseTimeout().compareTo(worker.heartbeatInterval()) &lt;= 0) {
+        throw new IllegalArgumentException(
+                "scheduler.worker.lease-timeout (" + worker.leaseTimeout()
+                        + ") must be strictly greater than scheduler.worker.heartbeat-interval ("
+                        + worker.heartbeatInterval()
+                        + "); otherwise the orphan sweeper reclaims work that is still running");
+    }
+}</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 288" role="img" aria-label="Timeline of a worker heartbeating every five seconds, dying, its lease expiring after thirty seconds, and the sweeper reclaiming the row up to ten seconds later, alongside a second lane showing a slow but alive worker producing a duplicate">
+  <text class="lbl-b" x="14" y="18">Lane 1 &mdash; the honest case: the owner is genuinely dead</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="14" y1="60" x2="800" y2="60" marker-end="url(#p11-ar3)"/>
+  </g>
+  <line class="dash" x1="70"  y1="44" x2="70"  y2="76"/>
+  <line class="dash" x1="130" y1="44" x2="130" y2="76"/>
+  <line class="dash" x1="190" y1="44" x2="190" y2="76"/>
+  <text class="lbl-s" x="70"  y="40" text-anchor="middle">beat</text>
+  <text class="lbl-s" x="130" y="40" text-anchor="middle">beat</text>
+  <text class="lbl-s" x="190" y="40" text-anchor="middle">beat</text>
+  <text class="lbl-s" x="46"  y="92">t0 claim</text>
+  <text class="lbl-s" x="106" y="92">+5s</text>
+  <text class="lbl-s" x="166" y="92">+10s</text>
+
+  <rect class="node-d" x="214" y="46" width="28" height="28" rx="4"/>
+  <text class="lbl-b" x="228" y="65" text-anchor="middle">&times;</text>
+  <text class="lbl-s" x="214" y="92">SIGKILL at +12s &mdash; nothing in the database changes</text>
+
+  <rect class="node-w" x="242" y="46" width="326" height="28" rx="4"/>
+  <text class="lbl-s" x="405" y="65" text-anchor="middle">lease still valid: heartbeat_at + 30s not yet reached</text>
+
+  <rect class="node-o" x="572" y="46" width="150" height="28" rx="4"/>
+  <text class="lbl-s" x="647" y="65" text-anchor="middle">next sweep &le; 10s later</text>
+  <text class="lbl-s" x="572" y="92">+42s: expired, reclaimed</text>
+  <rect class="node-i" x="726" y="46" width="80" height="28" rx="4"/>
+  <text class="lbl-s" x="766" y="65" text-anchor="middle">PENDING</text>
+
+  <text class="lbl-b" x="14" y="126">Lane 2 &mdash; the race the design cannot win, only survive: the owner is slow, not dead</text>
+
+  <rect class="node-a" x="14"  y="140" width="330" height="34" rx="6"/>
+  <text class="lbl-b" x="179" y="157" text-anchor="middle">node-a: handler still running at +35s</text>
+  <text class="lbl-s" x="179" y="170" text-anchor="middle">a 40s GC pause, or sleepMs &gt; lease-timeout</text>
+
+  <rect class="node-d" x="360" y="140" width="200" height="34" rx="6"/>
+  <text class="lbl-b" x="460" y="157" text-anchor="middle">sweeper reclaims it</text>
+  <text class="lbl-s" x="460" y="170" text-anchor="middle">attempt 0 &rarr; 1, run_at += jitter</text>
+
+  <rect class="node-a" x="576" y="140" width="230" height="34" rx="6"/>
+  <text class="lbl-b" x="691" y="157" text-anchor="middle">node-b claims and runs it</text>
+  <text class="lbl-s" x="691" y="170" text-anchor="middle">the side effect happens a second time</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="344" y1="157" x2="356" y2="157" marker-end="url(#p11-ar4)"/>
+    <line class="edge-d" x1="560" y1="157" x2="572" y2="157" marker-end="url(#p11-ar4)"/>
+  </g>
+
+  <rect class="node-o" x="14" y="192" width="792" height="46" rx="6"/>
+  <text class="lbl-b" x="410" y="210" text-anchor="middle">What actually saves you: processed_execution</text>
+  <text class="lbl-s" x="410" y="228" text-anchor="middle">whichever completion commits second finds the key present, writes no ledger row, and marks itself a no-op &mdash; but the SIDE EFFECT already ran twice</text>
+
+  <text class="lbl-s" x="14" y="262">This is why JobHandler's contract is "be idempotent", not "we guarantee once". Fencing every downstream side effect is the only</text>
+  <text class="lbl-s" x="14" y="278">alternative, and it is not something a scheduler can impose on code it does not own.</text>
+  <defs>
+    <marker id="p11-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p11-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Reclaim cannot distinguish "dead" from "paused". Making the lease longer shrinks the race
+and lengthens recovery; there is no setting that removes it.</figcaption>
+</figure>
+
+<p>The sweep loads entities rather than issuing one bulk UPDATE, deliberately: reclaim reuses the same
+<code>RetryPolicy</code> as any other failure, so the backoff formula lives in exactly one place.
+Duplicating it in SQL would guarantee the two drift apart, and sweep volumes are tiny by definition
+&mdash; if this list is ever large, N+1 queries are the least of your problems.</p>
+
+<div class="codewrap">
+<div class="codehead">OrphanSweeper.sweep &mdash; a lease expiry IS a failed attempt<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional
+public int sweep() {
+    Instant now = Instant.now();
+    OffsetDateTime cutoff = now.minus(props.worker().leaseTimeout()).atOffset(ZoneOffset.UTC);
+
+    List&lt;UUID&gt; expired = executions.selectExpiredLeasesForUpdate(
+            cutoff, props.sweeper().batchSize());
+    if (expired.isEmpty()) {
+        return 0;
+    }
+
+    List&lt;JobExecution&gt; rows = executions.findAllWithJobByIdIn(expired);
+
+    for (JobExecution row : rows) {
+        String previousOwner = row.getClaimedBy();
+        Instant lastBeat = row.getHeartbeatAt();
+        String message = "lease expired: owner '" + previousOwner + "' last heartbeat at "
+                + lastBeat + ", lease timeout " + props.worker().leaseTimeout();
+
+        retryPolicy.recordFailure(row, message, now, true);
+
+        log.warn("reclaimed execution {} of job '{}' from '{}' -&gt; {} (attempt {}/{})",
+                row.getId(), row.getJob().getName(), previousOwner, row.getStatus(),
+                row.getAttempt(), row.getJob().getMaxAttempts());
+    }
+
+    executions.saveAll(rows);
+    return rows.size();
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Charging an attempt on reclaim is not bookkeeping pedantry</span>
+  <p>A handler that reliably wedges its process would otherwise be reclaimed and re-run forever,
+  cycling <code>RUNNING &rarr; PENDING &rarr; RUNNING</code> and killing an instance each time while
+  every dashboard shows healthy throughput. Charging the attempt makes it reach
+  <code>DEAD_LETTER</code> and become visible. Graceful shutdown is the deliberate exception:
+  <code>releaseToPending</code> charges nothing, or a rolling deploy across three instances would
+  dead-letter a three-attempt job with no real failure at all.</p>
+</div>
+
+<h2>Retry: full jitter and the attempt ledger</h2>
+
+<p>The formula is <code>cap = min(max-delay, base-delay &times; 2^attempt)</code>, then
+<code>delay = uniform(0, cap)</code>. Plain exponential backoff does not spread load, it delays a
+thundering herd: 500 jobs that failed in the same second all retry at exactly
+<code>base &times; 2</code> seconds later, hitting the recovering dependency with the same spike that
+knocked it over, in lockstep. Of the AWS taxonomy &mdash; no jitter, equal jitter
+(<code>cap/2 + random(0, cap/2)</code>), full jitter (<code>random(0, cap)</code>) &mdash; full
+jitter gives the widest spread and the lowest total work under contention. Its cost is that a single
+retry may return almost immediately; across a herd that is a feature, since early probes are how
+recovery gets discovered.</p>
+
+<div class="codewrap">
+<div class="codehead">RetryPolicy.capFor &mdash; repeated doubling, not a shift<span class="lang">java</span></div>
+<pre><code class="lang-java">public Duration capFor(int attempt) {
+    long base = Math.max(1L, props.retry().baseDelay().toMillis());
+    long max  = Math.max(base, props.retry().maxDelay().toMillis());
+
+    long cap = base;
+    for (int i = 0; i &lt; attempt &amp;&amp; cap &lt; max; i++) {
+        cap = cap * 2;
+    }
+    if (cap &gt; max || cap &lt;= 0) {
+        cap = max;
+    }
+    return Duration.ofMillis(cap);
+}
+
+public Duration nextDelay(int attempt) {
+    long cap = capFor(attempt).toMillis();
+    // nextLong(bound) is exclusive, so +1 makes the cap itself reachable.
+    return Duration.ofMillis(ThreadLocalRandom.current().nextLong(cap + 1));
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>base &lt;&lt; attempt</code> is wrong twice over</span>
+  <p>Java masks the shift distance to the low six bits, so <code>1L &lt;&lt; 64</code> is
+  <code>1</code>, not <code>0</code>: a job on attempt 64 gets a <em>one millisecond</em> backoff
+  &mdash; the tightest possible retry loop, on precisely the job that has failed most. The loop above
+  exits once the value reaches the cap, and <code>RetryBackoffTest</code> asserts
+  <code>capFor(64)</code> and <code>capFor(1_000)</code> for exactly that reason.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>attempt</th><th><code>capFor(attempt)</code></th><th>jitter window</th><th>note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>1&nbsp;s</td><td>[0, 1&nbsp;s]</td><td><code>base-delay</code> itself</td></tr>
+<tr><td>1</td><td>2&nbsp;s</td><td>[0, 2&nbsp;s]</td><td>after the first failure</td></tr>
+<tr><td>3</td><td>8&nbsp;s</td><td>[0, 8&nbsp;s]</td><td>doubling</td></tr>
+<tr><td>8</td><td>256&nbsp;s</td><td>[0, 256&nbsp;s]</td><td>last value below the ceiling</td></tr>
+<tr><td>9</td><td>300&nbsp;s</td><td>[0, 5&nbsp;min]</td><td>1&nbsp;s &times; 2<sup>9</sup> = 512&nbsp;s &gt; <code>max-delay</code>, so it clamps</td></tr>
+<tr><td>64</td><td>300&nbsp;s</td><td>[0, 5&nbsp;min]</td><td>the clamp holds where a shift would wrap</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>attempt</code> counts attempts that have already finished and failed, so it is 0 on the first
+run and <code>max_attempts = 3</code> means three executions in total: after the third failure
+<code>3 &gt;= 3</code> holds and the row dead-letters. The off-by-one grants every job a silent extra
+run, or dead-letters a three-attempt job after two.</p>
+
+<div class="codewrap">
+<div class="codehead">RetryPolicy.recordFailure &mdash; the three outcomes<span class="lang">java</span></div>
+<pre><code class="lang-java">public void recordFailure(JobExecution execution, String error, Instant now, boolean retryable) {
+    int attempt = execution.getAttempt() + 1;
+    execution.setAttempt(attempt);
+    execution.setError(truncate(error));
+    // Must happen before the status is set to anything non-RUNNING, and must happen at all:
+    // the job_execution_running_is_owned CHECK constraint only permits RUNNING rows to carry
+    // an owner, so leaving claimed_by set on a PENDING row is not merely untidy, the sweeper
+    // and the heartbeat would both misattribute it.
+    execution.releaseClaim();
+
+    int maxAttempts = execution.getJob().getMaxAttempts();
+
+    if (!retryable) {
+        execution.setStatus(ExecutionStatus.FAILED);
+        execution.setFinishedAt(now);
+        return;
+    }
+    if (attempt &gt;= maxAttempts) {
+        execution.setStatus(ExecutionStatus.DEAD_LETTER);
+        execution.setFinishedAt(now);
+        return;
+    }
+    execution.setStatus(ExecutionStatus.PENDING);
+    execution.setRunAt(now.plus(nextDelay(attempt)));
+    // started_at is deliberately LEFT ALONE. It records when this occurrence first began, not
+    // when the current attempt began, which is what makes ExecutionResponse.lagMillis ("how
+    // late did this occurrence start?") comparable across a retried and a first-time execution.
+    // Clearing it here would also make the COALESCE(started_at, :now) in the claim UPDATE dead
+    // code: the column would be NULL at every claim, so each retry would overwrite the true
+    // start time and end-to-end latency including retries would be unrecoverable.
+    // "Is it in progress?" is answered by status, which is PENDING from here.
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Clearing <code>started_at</code> on retry quietly deletes your lag metric</span>
+  <p>It reads like tidying up &mdash; the row is not running any more, so null the column that says
+  when it started. It is not tidying up, it is a data loss. <code>markRunning</code> writes
+  <code>started_at = COALESCE(started_at, :now)</code> precisely so a retried row <em>keeps</em> its
+  first start; null the column on the way out and the COALESCE can never see a non-null value, so it
+  becomes dead code and every claim stamps a new timestamp.
+  <code>ExecutionResponse.lagMillis</code> is
+  <code>between(scheduled_for, started_at)</code>, so it would stop meaning "how late did the 09:00
+  run start?" and start meaning "how late did attempt 4 start?" &mdash; a number that <em>shrinks</em>
+  as a job retries harder, on the one dashboard you would use to notice. Nothing else needs the
+  column: "is it in progress?" is <code>status = 'RUNNING'</code>, and it is enforced by the
+  <code>job_execution_running_is_owned</code> CHECK. <code>started_at</code> is therefore written
+  exactly once per occurrence, at the first claim.</p>
+</div>
+
+<p>Note what retry <em>is not</em>: a sleep in the worker. Sleeping occupies a thread and keeps the
+lease alive, pinning capacity for the whole backoff. Pushing <code>run_at</code> forward frees the
+slot instantly and lets <em>any</em> instance take the work when it comes due. <code>FAILED</code>
+and <code>DEAD_LETTER</code> stay distinct so you can tell "we gave up after trying" from "trying was
+never going to help".</p>
+
+<h2>DAG eligibility: universal quantification in SQL</h2>
+
+<p>A <code>BLOCKED</code> execution of job J for occurrence S becomes <code>PENDING</code> when
+<em>every</em> parent of J has a <code>SUCCEEDED</code> execution for that same S. SQL has
+<code>EXISTS</code> but no <code>FOR ALL</code>, so the rule is written as its double negation: there
+is no parent for which no successful execution exists.</p>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="A diamond DAG with extract at the top, two transform steps, and a fan-in load step, alongside the double-negated NOT EXISTS predicate that evaluates eligibility">
+  <text class="lbl-b" x="14" y="18">The diamond &mdash; a chain would pass even with a broken "ANY parent succeeded" rule</text>
+
+  <rect class="node-o" x="120" y="30"  width="130" height="34" rx="6"/>
+  <rect class="node-o" x="30"  y="96"  width="130" height="34" rx="6"/>
+  <rect class="node-w" x="212" y="96"  width="130" height="34" rx="6"/>
+  <rect class="node-d" x="120" y="162" width="130" height="34" rx="6"/>
+  <text class="lbl-b" x="185" y="47"  text-anchor="middle">extract</text>
+  <text class="lbl-s" x="185" y="60"  text-anchor="middle">SUCCEEDED</text>
+  <text class="lbl-b" x="95"  y="113" text-anchor="middle">transform-a</text>
+  <text class="lbl-s" x="95"  y="126" text-anchor="middle">SUCCEEDED</text>
+  <text class="lbl-b" x="277" y="113" text-anchor="middle">transform-b</text>
+  <text class="lbl-s" x="277" y="126" text-anchor="middle">RUNNING</text>
+  <text class="lbl-b" x="185" y="179" text-anchor="middle">load</text>
+  <text class="lbl-s" x="185" y="192" text-anchor="middle">stays BLOCKED</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="150" y1="66" x2="105" y2="92" marker-end="url(#p11-ar5)"/>
+    <line class="edge" x1="220" y1="66" x2="266" y2="92" marker-end="url(#p11-ar5)"/>
+    <line class="edge" x1="105" y1="132" x2="150" y2="158" marker-end="url(#p11-ar5)"/>
+    <line class="edge" x1="266" y1="132" x2="220" y2="158" marker-end="url(#p11-ar5)"/>
+  </g>
+  <text class="lbl-s" x="14" y="222">All four rows share one scheduled_for &mdash; that equality</text>
+  <text class="lbl-s" x="14" y="238">IS the run correlation key. No run_id column exists.</text>
+
+  <rect class="node" x="392" y="30" width="414" height="150" rx="7"/>
+  <text class="lbl-b" x="404" y="50">the predicate, read outside-in</text>
+  <text class="mono"  x="404" y="72">NOT EXISTS (            &larr; no parent is unsatisfied</text>
+  <text class="mono"  x="404" y="90">&nbsp;&nbsp;SELECT 1 FROM job_dependency d</text>
+  <text class="mono"  x="404" y="108">&nbsp;&nbsp;WHERE d.job_id = e.job_id</text>
+  <text class="mono"  x="404" y="126">&nbsp;&nbsp;&nbsp;&nbsp;AND NOT EXISTS (      &larr; this parent has no success</text>
+  <text class="mono"  x="404" y="144">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SELECT 1 FROM job_execution p</text>
+  <text class="mono"  x="404" y="162">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;WHERE &hellip; p.scheduled_for = e.scheduled_for</text>
+  <text class="lbl-s" x="392" y="200">load has two parents. transform-b has no SUCCEEDED row for this scheduled_for, so the</text>
+  <text class="lbl-s" x="392" y="216">inner NOT EXISTS is true for that parent, the outer NOT EXISTS is false, and load waits.</text>
+  <text class="lbl-s" x="392" y="238">Backed by idx_job_execution_dag_lookup (job_id, scheduled_for, status).</text>
+  <defs>
+    <marker id="p11-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Only a fan-in distinguishes <em>all</em> from <em>any</em>. Every DAG test in the project is
+built on this diamond because a chain <code>A&rarr;B&rarr;C</code> passes with the wrong rule.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">DagResolver.promoteAllEligible &mdash; one set-based statement<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional
+public int promoteAllEligible() {
+    return jdbc.update("""
+            UPDATE job_execution e
+               SET status = 'PENDING',
+                   run_at = now()
+             WHERE e.status = 'BLOCKED'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM job_dependency d
+                    WHERE d.job_id = e.job_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM job_execution p
+                           WHERE p.job_id = d.depends_on_job_id
+                             AND p.scheduled_for = e.scheduled_for
+                             AND p.status = 'SUCCEEDED'
+                      )
+               )
+            """);
+}</code></pre>
+</div>
+
+<p>The obvious Java implementation &mdash; load blocked rows, loop, query each one's parents &mdash; is
+O(blocked &times; parents) round trips <em>and</em> races with itself across instances. Set-based,
+concurrent resolvers just update the same rows to the same value. <code>run_at = now()</code> rather
+than the materialised value, because a step's occurrence time is already past by the time its parents
+finish; <code>scheduled_for</code> is untouched, so the step still reports its run.</p>
+
+<p>Two entry points share that predicate. <code>promoteChildrenOf</code> is the fast path, called
+from <code>completeSuccess</code> and scoped to one parent's direct children in one run &mdash; the
+difference between millisecond DAG latency and a whole <code>scheduler.dag.interval</code>. It still
+applies the full "all parents" test. Critically it runs <em>after</em> the completion transaction
+commits: inside it, the <code>SUCCEEDED</code> row it is looking for would not yet be visible. The
+periodic sweep is the safety net for a crash in that millisecond.</p>
+
+<div class="box warn">
+  <span class="bt">Cancellation propagates one level per pass, on purpose</span>
+  <p><code>cancelUnreachable</code> inspects only <em>direct</em> parents, so the 2-second sweep walks
+  the graph one layer per pass to a fixed point &mdash; two passes for a diamond, which the tests
+  assert. A transitive closure in one statement needs another recursive CTE for no gain. Without
+  cancellation, a dead-lettered root leaves its whole downstream graph <code>BLOCKED</code> forever:
+  invisible in failed dashboards and running ones alike.</p>
+</div>
+
+<h2>Idempotency: what the ledger closes, and what it does not</h2>
+
+<p>Every execution carries a deterministic key,
+<code>idempotencyKey = jobId + "@" + ISO_INSTANT(scheduledFor)</code>, truncated to microseconds
+because that is <code>timestamptz</code>'s resolution: build it from a nanosecond-precision
+<code>Instant</code> while storing the truncated value and a database round trip regenerates a
+<em>different</em> key, so the collision you were counting on never happens. A random UUID here
+compiles, passes every single-instance test, and duplicates every cron job the moment you scale to
+two replicas.</p>
+
+<div class="codewrap">
+<div class="codehead">ProcessedExecutionRepository.markProcessed &mdash; the whole enforcement mechanism<span class="lang">java</span></div>
+<pre><code class="lang-java">public boolean markProcessed(String idempotencyKey) {
+    int inserted = jdbc.update("""
+            INSERT INTO processed_execution (idempotency_key, processed_at)
+            VALUES (?, now())
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """, idempotencyKey);
+    return inserted == 1;
+}</code></pre>
+</div>
+
+<p>A plain <code>JdbcTemplate</code> repository, not an entity, precisely so Hibernate cannot turn
+<code>ON CONFLICT DO NOTHING</code> into a SELECT-then-INSERT &mdash; the very race being eliminated.
+Two workers on one key cannot both insert; the loser gets 0 rows and knows it is the duplicate.</p>
+
+<div class="codewrap">
+<div class="codehead">WorkerLoop &mdash; the pre-flight check and the atomic completion<span class="lang">java</span></div>
+<pre><code class="lang-java">// In run(), BEFORE the handler is invoked:
+if (processed.isProcessed(execution.idempotencyKey())) {
+    duplicatesSuppressed.incrementAndGet();
+    log.info("execution {} (key {}) already processed; completing as a no-op",
+            execution.executionId(), execution.idempotencyKey());
+    completeSuccess(execution, true);
+    return;
+}
+
+// completeSuccess: both writes in ONE transaction.
+txTemplate.executeWithoutResult(status -&gt; {
+    boolean firstCompleter = processed.markProcessed(execution.idempotencyKey());
+
+    JobExecution row = executions.findWithJobById(execution.executionId()).orElse(null);
+    if (row == null) {
+        log.warn("execution {} vanished before completion", execution.executionId());
+        return;
+    }
+    row.setStatus(ExecutionStatus.SUCCEEDED);
+    row.setFinishedAt(Instant.now());
+    row.releaseClaim();
+    if (duplicate || !firstCompleter) {
+        row.setError("completed as a no-op: idempotency key already present in the ledger");
+    } else {
+        row.setError(null);
+    }
+    executions.save(row);
+});</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The asymmetry is the point &mdash; and so is the window it leaves open</span>
+  <p>A <code>SUCCEEDED</code> execution with no ledger row is harmless &mdash; a duplicate simply
+  re-runs the handler. A ledger row with no <code>SUCCEEDED</code> execution is poisonous: the
+  legitimate retry of a genuinely-unfinished job is suppressed as a duplicate, silently and forever.
+  Hence one transaction, not two adjacent writes.</p>
+  <p>What it cannot fix: the marker is written <em>after</em> the side effect, so it closes the
+  "completion write was lost" window, not the "side effect happened twice" window. Genuinely-once
+  needs both in one transaction, which only works if the side effect lives in this database. Hence
+  <code>JobHandler</code>'s contract opening with "be idempotent", and hence never pruning the ledger
+  faster than <code>lease-timeout + max retry backoff</code>.</p>
+</div>
+
+<h2>What the tests prove</h2>
+
+<p>All four classes run against a real PostgreSQL 16 via a Testcontainers singleton, not H2: every
+mechanism here <em>is</em> a PostgreSQL feature, and a suite that passes on an emulation while
+production behaviour is wrong is worse than no suite. All five <code>@Scheduled</code> loops are
+disabled and the tests call <code>claim()</code>, <code>sweep()</code>, <code>tick()</code> and
+<code>pollOnce()</code> directly, so each assertion is about a mechanism rather than about whether a
+timer fired.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Test</th><th>Setup</th><th>What it would catch</th></tr></thead>
+<tbody>
+<tr><td><code>ClaimConcurrencyTest</code></td><td>6 threads, 400 executions, batch size 7 (deliberately not a divisor), one start latch</td><td>Removing <code>SKIP LOCKED</code>, splitting the SELECT and UPDATE across transactions, or dropping <code>@Transactional</code>. Assertions are set disjointness and total conservation, not "no exception"</td></tr>
+<tr><td><code>RetryBackoffTest</code></td><td>2,000 jitter draws at attempt 5; then a <code>failAlways</code> job driven to <code>DEAD_LETTER</code></td><td>A constant delay masquerading as jitter, the shift-masking overflow, and the <code>max_attempts</code> off-by-one in both directions</td></tr>
+<tr><td><code>OrphanReclaimTest</code></td><td>Real claim, then <code>ageHeartbeat</code> to fake death &mdash; and a control case that does not</td><td>Over-eager reclaim, which duplicates live work; also that a heartbeat from the wrong node cannot renew someone else's lease</td></tr>
+<tr><td><code>DagEligibilityTest</code></td><td>A diamond, two runs an hour apart</td><td>"Any parent" instead of "all parents"; runs leaking into each other; a diamond materialised twice; a graph stranded by a terminal failure</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">ClaimConcurrencyTest &mdash; the assertions that matter<span class="lang">java</span></div>
+<pre><code class="lang-java">// 1. No execution was handed to two workers. This is the SKIP LOCKED guarantee.
+assertThat(doubleClaims.get())
+        .as("an execution was claimed by more than one worker")
+        .isZero();
+
+// 2. Conservation: exactly the rows we created, no more and no fewer.
+assertThat(owners.keySet())
+        .as("the union of all claims must be exactly the queue")
+        .containsExactlyInAnyOrderElementsOf(expected);
+
+// 5. The work actually spread across workers. If SKIP LOCKED were replaced by plain
+//    FOR UPDATE the test above would still pass - it would just serialise - so assert
+//    that more than one worker got a share.
+Set&lt;String&gt; distinctWorkers = new HashSet&lt;&gt;(owners.values());
+assertThat(distinctWorkers)
+        .as("claiming should be spread over several workers, not serialised onto one")
+        .hasSizeGreaterThan(1);</code></pre>
+</div>
+
+<p>Assertion 5 is the subtle one, and it is why deleting <code>SKIP LOCKED</code> and re-running is
+such an instructive exercise: correctness survives, throughput does not.
+<code>DagEligibilityTest</code> makes the equivalent point for the fan-in rule:</p>
+
+<div class="codewrap">
+<div class="codehead">DagEligibilityTest &mdash; the assertion the whole class exists for<span class="lang">java</span></div>
+<pre><code class="lang-java">// ---- ONE parent succeeds: the assertion this whole test exists for ---------------
+setStatus(transformARun, ExecutionStatus.SUCCEEDED);
+
+assertThat(dagResolver.isEligible(load.getId(), runAt))
+        .as("one of two parents is not enough - this is 'all', not 'any'")
+        .isFalse();
+assertThat(dagResolver.promoteAllEligible()).isZero();
+assertThat(statusOf(loadRun)).isEqualTo(ExecutionStatus.BLOCKED);</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Java 17, deliberately</span>
+  <p><code>spring.threads.virtual.enabled: false</code> is explicit and the pool is a plain
+  <code>ThreadPoolExecutor</code> of eight platform threads. On Java 21 you would size concurrency by
+  connections rather than threads, but the backpressure argument is unchanged: the bound is still
+  "rows whose lease I can keep alive", and a virtual thread renews a heartbeat no faster than a
+  platform one.</p>
+</div>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>The claim is exact because one transaction spans the locking SELECT and the UPDATE. Row locks
+  hold the line until COMMIT; after COMMIT the <code>status</code> column does. Split them and two
+  workers both see the row as <code>PENDING</code>.</li>
+  <li><code>FOR UPDATE</code> buys correctness, <code>SKIP LOCKED</code> buys parallelism, and the
+  <em>partial</em> index on <code>(status, run_at) WHERE status = 'PENDING'</code> buys both once
+  history outgrows the backlog. Without it every worker scans the whole backlog before skipping
+  anything.</li>
+  <li>Transaction-scoped advisory locks need no lease, TTL or unlock path &mdash; the transaction
+  lifecycle is the failure detector. The session-scoped variant leaks through a connection pool, and
+  either one outside a transaction always returns <code>true</code>, which is why
+  <code>AdvisoryLock</code> throws rather than lying.</li>
+  <li>Never claim a row you cannot immediately start. The heartbeat covers exactly
+  <code>inFlight</code>, so the gap between a claim's COMMIT and <code>inFlight.add</code> is the one
+  un-heartbeated window. <code>min(claimBatchSize, availablePermits)</code> keeps it at microseconds;
+  removing it produces real duplicate execution, not just latency.</li>
+  <li>Lease and heartbeat are one number with two names: 30&nbsp;s over 5&nbsp;s is six missed beats
+  before anyone acts, worst-case recovery <code>lease + sweeper.interval</code> = 40&nbsp;s. A lease
+  shorter than the heartbeat reclaims live work, so the app refuses to start on it.</li>
+  <li>Full jitter is <code>uniform(0, min(max-delay, base &times; 2^attempt))</code>, by repeated
+  doubling because <code>base &lt;&lt; attempt</code> wraps at 64. Retry means "push
+  <code>run_at</code> forward and release the slot", never "sleep in the worker" &mdash; sleeping
+  keeps the lease alive and pins capacity for the whole backoff.</li>
+  <li>The ledger closes the lost-completion window, not the duplicate-side-effect window. Status and
+  ledger row must share a transaction; the dangerous direction is a ledger row with no
+  <code>SUCCEEDED</code> execution, which suppresses a legitimate retry forever.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="01-design.html"><span class="lb">Previous</span>Design &amp; data model</a>
+  <a href="03-running.html"><span class="lb">Next</span>Running, testing &amp; exercises</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

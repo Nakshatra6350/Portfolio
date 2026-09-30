@@ -1,0 +1,900 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Running, testing &amp; exercises &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Mini-Redis: an in-memory store in Go</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Running, testing &amp; exercises</h1>
+<p class="lede">Build the server, point the real <code>redis-cli</code> at it, and then push on every
+mechanism until it shows itself: watch keys expire, fill the store past <code>maxmemory</code> and
+compare LRU against LFU under a scanning workload, kill the process and replay the AOF, and measure
+the whole thing against Redis 8 with <code>redis-benchmark</code> &mdash; including where it loses,
+and why.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24.6</span>
+  <span class="tag v">Redis 8 (redis-cli)</span>
+  <span class="tag">run &amp; measure</span>
+</div>
+
+<h2>Build it and start it</h2>
+
+<p>There are no dependencies to fetch &mdash; <code>go.mod</code> declares the module and nothing
+else &mdash; so the first run is a compile and a bind.</p>
+
+<div class="codewrap">
+<div class="codehead">from the code directory<span class="lang">bash</span></div>
+<pre><code class="lang-bash">cd 10-projects/p4-mini-redis-go/code
+
+go build -o bin/miniredis ./cmd/miniredis    # or: make build
+go vet ./...                                  # clean, and it stays clean
+
+# Port 6380 on purpose: it cannot collide with a real Redis on 6379, which
+# matters the moment you start comparing the two side by side.
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -dir ./data -appendonly -appendfsync everysec
+
+# The same thing, with every knob already wired up:
+make run PORT=6380 MAXMEMORY=4mb POLICY=allkeys-lru LOGLEVEL=debug</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">what a healthy start looks like<span class="lang">text</span></div>
+<pre><code class="lang-text">       _      _              _ _
+ _ __ (_)_ _ (_)_ _ ___ __| (_)___
+| '  \| | ' \| | '_/ -_) _' | (_-&lt;   0.1.0-miniredis
+|_|_|_|_|_||_|_|_| \___\__,_|_/__/   RESP2, Go go1.24.6
+
+  listening on   127.0.0.1:6380
+  shards         16
+  maxmemory      unlimited (noeviction)
+  appendonly     true (everysec)
+  snapshot       dump.mrdb
+
+time=... level=INFO msg="miniredis ready" addr=127.0.0.1:6380 shards=16 maxmemory=0 policy=noeviction aof=true</code></pre>
+</div>
+
+<p>The banner is printed by <code>printBanner</code> in <code>cmd/miniredis/main.go</code> after the
+listener is bound and before the signal handler is installed &mdash; deliberately, so a port conflict
+comes out as a plain startup error rather than a half-started server:</p>
+
+<div class="codewrap">
+<div class="codehead">cmd/miniredis/main.go &mdash; bind first, then trap signals<span class="lang">go</span></div>
+<pre><code class="lang-go">// Bind before installing the signal handler so that a port conflict is
+// reported as a plain startup error rather than a half-started server.
+ln, err := net.Listen("tcp", cfg.Addr)
+if err != nil {
+    return fmt.Errorf("listen %s: %w", cfg.Addr, err)
+}
+printBanner(cfg, ln.Addr().String())</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A container cannot reach <code>127.0.0.1:6380</code></span>
+  <p>The default listen address is loopback. If your <code>redis-cli</code> lives in Docker, the
+  container's loopback is its own, and the connection is refused with no useful message. Bind the
+  bridge instead and reach the host by name:</p>
+<div class="codewrap"><pre><code class="lang-bash">go run ./cmd/miniredis -addr 0.0.0.0:6380 -dir ./data -appendonly
+
+docker run --rm -it redis:8 redis-cli -h host.docker.internal -p 6380
+docker run --rm    redis:8 redis-benchmark -h host.docker.internal -p 6380 -t get -n 100000</code></pre></div>
+  <p>Then remember what you just did: this server has no <code>AUTH</code>, no ACLs and no TLS.
+  <code>0.0.0.0</code> on a machine with a routable interface is an open, unauthenticated database.
+  Real Redis ships with protected mode on for exactly this reason. Bind it for the duration of the
+  experiment and put it back.</p>
+</div>
+
+<h2>A full session through the real client</h2>
+
+<p>The point of the whole exercise is this: an unmodified <code>redis-cli</code> connects, negotiates,
+and cannot tell the difference. On connect it sends <code>COMMAND DOCS</code> and
+<code>CLIENT SETINFO</code>; both are answered in <code>internal/commands/server.go</code> purely so
+the client does not print a warning on every session.</p>
+
+<div class="codewrap">
+<div class="codehead">one command from every type, plus the introspection that proves the mechanism<span class="lang">text</span></div>
+<pre><code class="lang-text">$ redis-cli -p 6380
+127.0.0.1:6380&gt; PING
+PONG
+127.0.0.1:6380&gt; SET greeting "hello world" EX 60
+OK
+127.0.0.1:6380&gt; GET greeting
+"hello world"
+127.0.0.1:6380&gt; TTL greeting
+(integer) 60
+127.0.0.1:6380&gt; OBJECT ENCODING greeting
+"embstr"
+127.0.0.1:6380&gt; SET counter 1 KEEPTTL
+OK
+127.0.0.1:6380&gt; INCRBY counter 41
+(integer) 42
+127.0.0.1:6380&gt; OBJECT ENCODING counter
+"int"
+127.0.0.1:6380&gt; RPUSH queue a b c
+(integer) 3
+127.0.0.1:6380&gt; LRANGE queue 0 -1
+1) "a"
+2) "b"
+3) "c"
+127.0.0.1:6380&gt; HSET user:1 name ada role admin
+(integer) 2
+127.0.0.1:6380&gt; HGETALL user:1
+1) "name"
+2) "ada"
+3) "role"
+4) "admin"
+127.0.0.1:6380&gt; SADD tags go redis cache
+(integer) 3
+127.0.0.1:6380&gt; SISMEMBER tags redis
+(integer) 1
+127.0.0.1:6380&gt; ZADD board 10 alice 5 bob 20 carol
+(integer) 3
+127.0.0.1:6380&gt; ZRANGEBYSCORE board 5 15 WITHSCORES
+1) "bob"
+2) "5"
+3) "alice"
+4) "10"
+127.0.0.1:6380&gt; ZRANK board carol
+(integer) 2
+127.0.0.1:6380&gt; TYPE board
+zset
+127.0.0.1:6380&gt; LPUSH board x
+(error) WRONGTYPE Operation against a key holding the wrong kind of value
+127.0.0.1:6380&gt; SCAN 0 COUNT 10 MATCH 'user:*'
+1) "163841"
+2) 1) "user:1"
+127.0.0.1:6380&gt; COMMAND COUNT
+(integer) 71
+127.0.0.1:6380&gt; DBSIZE
+(integer) 6
+127.0.0.1:6380&gt; INFO keyspace
+# Keyspace
+db0:keys=6,expires=1,avg_ttl=0</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">That cursor is not a bucket index</span>
+  <p><code>SCAN</code> returned <code>163841</code>, not <code>1</code>. The cursor packs a shard
+  index into the low bits and a slot position into the high bits &mdash;
+  <code>cursor = (slot &lt;&lt; shardBits) | shardIndex</code> &mdash; because Go's map exposes no
+  bucket handle, so Redis's reverse-binary walk is unavailable. <code>internal/store/scan.go</code>
+  documents the one hole this leaves: a shard compaction during an in-flight iteration can shift slot
+  positions downward and skip keys. Exercise 11 in the README is to close it.</p>
+</div>
+
+<h2>Verifying RESP compatibility</h2>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Data flow of one command from the TCP socket through the RESP reader, dispatcher, store shard and AOF and back to the writer">
+  <text class="lbl-b" x="14" y="18">One command, socket to socket &mdash; and the two places it can be refused before a handler ever runs</text>
+
+  <rect class="node"   x="14"  y="30" width="110" height="46" rx="6"/>
+  <text class="lbl-b"  x="69"  y="50" text-anchor="middle">TCP socket</text>
+  <text class="lbl-s"  x="69"  y="66" text-anchor="middle">NoDelay set</text>
+
+  <rect class="node-i" x="146" y="30" width="140" height="46" rx="6"/>
+  <text class="lbl-b"  x="216" y="50" text-anchor="middle">resp.Reader</text>
+  <text class="lbl-s"  x="216" y="66" text-anchor="middle">multibulk or inline</text>
+
+  <rect class="node-a" x="308" y="30" width="180" height="46" rx="6"/>
+  <text class="lbl-b"  x="398" y="50" text-anchor="middle">Dispatcher.Execute</text>
+  <text class="lbl-s"  x="398" y="66" text-anchor="middle">lookup &rarr; arity &rarr; OOM gate</text>
+
+  <rect class="node"   x="510" y="30" width="140" height="46" rx="6"/>
+  <text class="lbl-b"  x="580" y="50" text-anchor="middle">cmd.Handler</text>
+  <text class="lbl-s"  x="580" y="66" text-anchor="middle">commands/*.go</text>
+
+  <rect class="node-o" x="672" y="30" width="134" height="46" rx="6"/>
+  <text class="lbl-b"  x="739" y="50" text-anchor="middle">shard.mu</text>
+  <text class="lbl-s"  x="739" y="66" text-anchor="middle">key &rarr; hash &amp; mask</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="126" y1="53" x2="142" y2="53" marker-end="url(#p42-ar1)"/>
+    <line class="edge" x1="288" y1="53" x2="304" y2="53" marker-end="url(#p42-ar1)"/>
+    <line class="edge" x1="490" y1="53" x2="506" y2="53" marker-end="url(#p42-ar1)"/>
+    <line class="edge" x1="652" y1="53" x2="668" y2="53" marker-end="url(#p42-ar1)"/>
+  </g>
+
+  <rect class="node-d" x="308" y="106" width="180" height="42" rx="6"/>
+  <text class="lbl-b"  x="398" y="124" text-anchor="middle">refusals happen here</text>
+  <text class="lbl-s"  x="398" y="140" text-anchor="middle">unknown cmd &middot; bad arity &middot; OOM</text>
+  <g color="var(--dang)">
+    <line class="edge-d" x1="398" y1="78" x2="398" y2="102" marker-end="url(#p42-ar2)"/>
+  </g>
+
+  <rect class="node-w" x="510" y="106" width="296" height="42" rx="6"/>
+  <text class="lbl-b"  x="658" y="124" text-anchor="middle">ctx.Dirty &gt; 0 ?</text>
+  <text class="lbl-s"  x="658" y="140" text-anchor="middle">a vetoed SET or a DEL of nothing never reaches the log</text>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="580" y1="78" x2="580" y2="102" marker-end="url(#p42-ar1)"/>
+  </g>
+
+  <rect class="node-i" x="510" y="170" width="296" height="42" rx="6"/>
+  <text class="lbl-b"  x="658" y="188" text-anchor="middle">persist.AOF.Append &mdash; RESP bytes</text>
+  <text class="lbl-s"  x="658" y="204" text-anchor="middle">write(2) always; fsync per appendfsync</text>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="658" y1="150" x2="658" y2="166" marker-end="url(#p42-ar1)"/>
+  </g>
+
+  <rect class="node-a" x="146" y="170" width="320" height="42" rx="6"/>
+  <text class="lbl-b"  x="306" y="188" text-anchor="middle">resp.Writer &mdash; buffered, sticky on error</text>
+  <text class="lbl-s"  x="306" y="204" text-anchor="middle">flush when r.Buffered()==0 or w.Buffered() &ge; 64 KiB</text>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="510" y1="191" x2="470" y2="191" marker-end="url(#p42-ar3)"/>
+    <line class="edge-a" x1="146" y1="191" x2="69"  y2="191" marker-end="url(#p42-ar3)"/>
+    <line class="edge-a" x1="69"  y1="191" x2="69"  y2="80"  marker-end="url(#p42-ar3)"/>
+  </g>
+
+  <text class="lbl-s" x="14" y="240">The flush condition is the single biggest throughput lever in the server: under `redis-benchmark -P 16` it is the</text>
+  <text class="lbl-s" x="14" y="256">difference between one write syscall per command and one per batch. It is also why a pipelined burst and a</text>
+  <text class="lbl-s" x="14" y="272">chatty single-command client produce numbers an order of magnitude apart on the same code.</text>
+  <text class="lbl-s" x="14" y="292">Propagation is decided by the dirty counter, never by the command name &mdash; that is what keeps the AOF honest.</text>
+  <defs>
+    <marker id="p42-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p42-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p42-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Nothing between the reader and the writer knows about sockets, and nothing below the
+dispatcher knows about RESP. That is why the AOF can <em>be</em> a RESP stream without a second
+encoder existing anywhere.</figcaption>
+</figure>
+
+<p>Compatibility is easy to assert and easy to check. Drive the socket by hand and read the bytes:</p>
+
+<div class="codewrap">
+<div class="codehead">both dialects, and what a lost frame does<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># The inline dialect: this is what you get when you type into telnet, and it is
+# also what makes `redis-cli --pipe` work with a plain text file of commands.
+printf 'SET k "hello world"\r\nGET k\r\n' | nc 127.0.0.1 6380
+# +OK
+# $11
+# hello world
+
+# The multibulk dialect a real client sends.
+printf '*2\r\n$3\r\nGET\r\n$1\r\nk\r\n' | nc 127.0.0.1 6380
+# $11
+# hello world
+
+# A bulk length that lies. Framing is lost, so the server explains and hangs up
+# rather than trying to resynchronise by guesswork.
+printf '*2\r\n$3\r\nGET\r\n$99\r\nk\r\n' | nc 127.0.0.1 6380
+# -ERR Protocol error: expected CRLF after bulk payload
+
+# RESP3 is refused with the code clients look for before falling back.
+redis-cli -3 -p 6380 PING
+# NOPROTO this server speaks RESP2 only</code></pre>
+</div>
+
+<div class="box iv">
+  <span class="bt">Protocol errors are a distinct type for one reason</span>
+  <p><code>resp.IsProtocolError</code> exists so <code>Conn.serve</code> can tell "the client went
+  away" from "the byte stream no longer makes sense". The first is routine and logged at debug; the
+  second gets an error reply and an immediate close, because a RESP stream that has lost its framing
+  cannot be recovered &mdash; every subsequent byte would be interpreted against the wrong grammar.
+  Any protocol implementation that tries to skip forward to the next plausible <code>*</code> is
+  building a security bug.</p>
+</div>
+
+<h2>Expiry, watched from the outside</h2>
+
+<p>Two halves, and you can see each one separately. Passive expiry is what makes an expired key
+invisible; active expiry is what makes it stop costing memory.</p>
+
+<div class="codewrap">
+<div class="codehead">the passive half: TTL sentinels and invisibility<span class="lang">text</span></div>
+<pre><code class="lang-text">127.0.0.1:6380&gt; SET session:9 abc PX 1500
+OK
+127.0.0.1:6380&gt; PTTL session:9
+(integer) 1487
+127.0.0.1:6380&gt; TTL nosuchkey
+(integer) -2            &lt;- the key does not exist
+127.0.0.1:6380&gt; SET permanent v
+OK
+127.0.0.1:6380&gt; TTL permanent
+(integer) -1            &lt;- exists, no TTL
+127.0.0.1:6380&gt; EXPIRE session:9 -1
+(integer) 1             &lt;- a deadline in the past is a synonym for DEL
+127.0.0.1:6380&gt; EXISTS session:9
+(integer) 0</code></pre>
+</div>
+
+<p>The active half only shows up in aggregate. Write a hundred thousand keys that all die within a
+few seconds, then watch <code>DBSIZE</code> fall <em>without anyone reading them</em> &mdash; that is
+the cron goroutine sampling twenty volatile keys per shard per round and resampling while more than
+a quarter of the sample comes back dead.</p>
+
+<div class="codewrap">
+<div class="codehead">the active cycle, from the client side<span class="lang">bash</span></div>
+<pre><code class="lang-bash"># 100k keys, all expiring 5 seconds from now. --pipe streams them in one connection.
+seq 1 100000 | awk '{printf "SET vol:%d x PX 5000\n", $1}' | redis-cli -p 6380 --pipe
+
+watch -n1 'redis-cli -p 6380 dbsize; redis-cli -p 6380 info stats | grep -E "expired|cycles"'
+
+# dbsize drops from 100000 toward 0 over a couple of seconds with no reads at all,
+# and expired_keys climbs to match. Run the server with -loglevel debug to see
+# "active expiry reclaimed keys keys=N" once per cron tick (10 ticks/second at -hz 10).</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The active cycle is bounded per call &mdash; that bound is visible</span>
+  <p><code>activeExpireMaxRounds = 16</code> caps the rounds per shard per cycle, so with 16 shards
+  one tick reclaims at most 16&nbsp;&times;&nbsp;16&nbsp;&times;&nbsp;20 = 5120 keys. At
+  <code>-hz 10</code> that is ~51k keys per second of reclamation ceiling. Expire a million keys at
+  the same instant and <code>DBSIZE</code> takes roughly twenty seconds to drain &mdash; and
+  <code>used_memory</code> stays high the whole time even though every one of those keys is already
+  invisible to clients. Raising <code>-hz</code> raises the ceiling and the idle CPU cost together;
+  real Redis bounds the same loop with a time budget instead, which is the better shape and a fair
+  thing to change here.</p>
+</div>
+
+<h2>Filling it past <code>maxmemory</code></h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Run it like this</th><th>What it makes visible</th><th>Where to look</th></tr></thead>
+<tbody>
+<tr><td><code>-maxmemory 4mb -maxmemory-policy noeviction</code></td><td>The OOM gate: writes are refused, reads and <code>DEL</code> still work</td><td><code>dispatch.go</code>, <code>FlagDenyOOM</code></td></tr>
+<tr><td><code>-maxmemory 4mb -maxmemory-policy allkeys-lru</code></td><td>Sampled LRU: <code>evicted_keys</code> climbs, <code>used_memory</code> pins to the limit</td><td><code>evict.go</code>, <code>sampleVictims</code></td></tr>
+<tr><td><code>-maxmemory 4mb -maxmemory-policy allkeys-lfu -lfu-log-factor 10</code></td><td>Logarithmic counters: <code>OBJECT FREQ</code> on a hot key vs a cold one</td><td><code>lfuLogIncr</code>, <code>lfuDecay</code></td></tr>
+<tr><td><code>-maxmemory 4mb -maxmemory-policy volatile-ttl</code></td><td>Nothing is evicted at all if no key has a TTL &mdash; you get <code>OOM</code> instead</td><td><code>EvictIfNeeded</code> returning <code>ErrOOM</code></td></tr>
+<tr><td><code>-shards 1</code> vs <code>-shards 256</code></td><td>The contention the design exists to avoid</td><td><code>BenchmarkShardContention</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">fill it and watch keys start disappearing<span class="lang">bash</span></div>
+<pre><code class="lang-bash">go run ./cmd/miniredis -addr 127.0.0.1:6380 -maxmemory 4mb \
+    -maxmemory-policy allkeys-lru -maxmemory-samples 5 -loglevel debug
+
+# 200k keys with a 200-byte value each: far more than 4mb of accounted memory.
+seq 1 200000 | awk '{printf "SET key:%d %0200d\n", $1, $1}' | redis-cli -p 6380 --pipe
+
+redis-cli -p 6380 info memory
+# used_memory:4193920
+# used_memory_human:4.00MB
+# maxmemory:4194304
+# maxmemory_policy:allkeys-lru
+redis-cli -p 6380 info stats | grep evicted
+# evicted_keys:181447
+redis-cli -p 6380 dbsize
+# (integer) 18553      &lt;- the store held exactly as many as fit, and no more</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>used_memory</code> is accounted bytes, not RSS &mdash; and eviction only runs on writes</span>
+  <p>Two surprises, both real. First, <code>maxmemory 4mb</code> bounds the store's own per-entry
+  accounting (key length, value bytes, per-entry overhead), not the Go heap. Expect RSS several times
+  higher: map buckets, skip list towers, the AOF buffer and GC headroom are all outside it. That is
+  true of real Redis too &mdash; <code>used_memory</code> is not RSS there either &mdash; but here the
+  gap is wider because there are no listpack or intset encodings. Second:</p>
+<div class="codewrap"><pre><code class="lang-go">// dispatch.go
+if cmd.IsWrite() {
+    // Free memory before the write, not after: the point of maxmemory is
+    // that the server never exceeds it, so the room has to be made first.
+    evicted, err := d.store.EvictIfNeeded()
+    d.propagateEvictions(evicted)
+    ...
+}</code></pre></div>
+  <p>Eviction is driven <em>only</em> by write commands. Lower <code>maxmemory</code> with
+  <code>CONFIG SET</code> on an idle server and nothing at all happens &mdash;
+  <code>used_memory</code> stays above the limit until the next write arrives. It looks like the
+  setting was ignored. It was not; there was simply no write to hang the eviction on.</p>
+</div>
+
+<h3>LRU against LFU, under a scan</h3>
+
+<p>The interesting comparison is not "which evicts the oldest key" &mdash; both do what they say. It
+is the workload that breaks one of them: a small hot working set plus a long stream of keys that are
+touched exactly once. That stream is the newest thing in the store at every moment, so recency says
+keep it and frequency says throw it away.</p>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="Comparison of sampled LRU and LFU victim selection under a scanning workload, showing why LRU evicts the hot working set and LFU does not">
+  <text class="lbl-b" x="14" y="18">Workload: 1000 hot keys read constantly, plus cold:N written once each and never read again</text>
+
+  <rect class="node-o" x="14" y="30" width="180" height="60" rx="6"/>
+  <text class="lbl-b" x="104" y="50" text-anchor="middle">hot:0 &hellip; hot:999</text>
+  <text class="lbl-s" x="104" y="66" text-anchor="middle">read every few ms</text>
+  <text class="lbl-s" x="104" y="82" text-anchor="middle">this is the working set</text>
+
+  <rect class="node-w" x="14" y="102" width="180" height="60" rx="6"/>
+  <text class="lbl-b" x="104" y="122" text-anchor="middle">cold:0 &hellip; cold:N</text>
+  <text class="lbl-s" x="104" y="138" text-anchor="middle">written once, never read</text>
+  <text class="lbl-s" x="104" y="154" text-anchor="middle">always the most recent</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="196" y1="96" x2="240" y2="96" marker-end="url(#p42-ar4)"/>
+  </g>
+  <rect class="node-a" x="244" y="66" width="150" height="60" rx="6"/>
+  <text class="lbl-b" x="319" y="86" text-anchor="middle">sampleVictims(5)</text>
+  <text class="lbl-s" x="319" y="102" text-anchor="middle">random shard start,</text>
+  <text class="lbl-s" x="319" y="118" text-anchor="middle">&le; n/2+1 per shard</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="396" y1="80" x2="440" y2="56" marker-end="url(#p42-ar4)"/>
+    <line class="edge" x1="396" y1="112" x2="440" y2="200" marker-end="url(#p42-ar4)"/>
+  </g>
+
+  <rect class="node-d" x="444" y="26" width="362" height="112" rx="6"/>
+  <text class="lbl-b" x="625" y="46" text-anchor="middle">allkeys-lru &mdash; score = idleSeconds(now, v.lru)</text>
+  <text class="lbl-s" x="625" y="66" text-anchor="middle">cold keys were just written, so their idle time is 0</text>
+  <text class="lbl-s" x="625" y="82" text-anchor="middle">a hot key not read in the last second scores 1 or more</text>
+  <text class="lbl-s" x="625" y="102" text-anchor="middle">VICTIM: a hot key. The scan flushes the working set.</text>
+  <text class="lbl-s" x="625" y="124" text-anchor="middle">Worse: the clock is second-resolution, so inside one second every score ties.</text>
+
+  <rect class="node-o" x="444" y="164" width="362" height="112" rx="6"/>
+  <text class="lbl-b" x="625" y="184" text-anchor="middle">allkeys-lfu &mdash; score = 255 &minus; lfuDecay(v)</text>
+  <text class="lbl-s" x="625" y="204" text-anchor="middle">a cold key sits at the init value 5, forever</text>
+  <text class="lbl-s" x="625" y="220" text-anchor="middle">a hot key climbs logarithmically: 5 &rarr; 20 &rarr; 60 &rarr; &hellip;</text>
+  <text class="lbl-s" x="625" y="240" text-anchor="middle">VICTIM: a cold key. The working set survives the scan.</text>
+  <text class="lbl-s" x="625" y="262" text-anchor="middle">Cost: decay must run, or a once-hot key outranks everything forever.</text>
+
+  <text class="lbl-s" x="14" y="200">Both policies use the same</text>
+  <text class="lbl-s" x="14" y="216">sampler and the same loop.</text>
+  <text class="lbl-s" x="14" y="232">The only thing that differs</text>
+  <text class="lbl-s" x="14" y="248">is one function: Store.score.</text>
+  <text class="lbl-s" x="14" y="272">That is the whole reason it is</text>
+  <text class="lbl-s" x="14" y="288">worth reading &mdash; eight policies,</text>
+  <text class="lbl-s" x="14" y="304">one switch statement.</text>
+  <defs>
+    <marker id="p42-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>A scanning workload is the textbook case where recency is the wrong signal. It is also
+the case that turns a healthy cache into a 0&nbsp;% hit rate overnight when a nightly export job
+starts running.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">the experiment, run twice with only the policy changed<span class="lang">bash</span></div>
+<pre><code class="lang-bash">POLICY=allkeys-lru   # then repeat with allkeys-lfu
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -maxmemory 8mb -maxmemory-policy $POLICY &amp;
+
+# 1. Establish the working set and make it genuinely hot.
+seq 0 999 | awk '{printf "SET hot:%d %0200d\n", $1, $1}' | redis-cli -p 6380 --pipe
+for round in $(seq 1 50); do
+  seq 0 999 | awk '{printf "GET hot:%d\n", $1}' | redis-cli -p 6380 --pipe &gt;/dev/null
+done
+
+# 2. The scan: 100k single-touch keys, spread over ~30s so the LRU clock ticks.
+seq 1 100000 | awk '{printf "SET cold:%d %0200d\n", $1, $1}' \
+  | pv -L 4000 -q | redis-cli -p 6380 --pipe
+
+# 3. How much of the working set survived?
+survived=0
+for i in $(seq 0 999); do
+  [ "$(redis-cli -p 6380 exists hot:$i)" = "1" ] &amp;&amp; survived=$((survived+1))
+done
+echo "$POLICY: $survived / 1000 hot keys survived"
+
+redis-cli -p 6380 object freq hot:0     # LFU only: a high counter
+redis-cli -p 6380 object freq cold:99999
+redis-cli -p 6380 object idletime hot:0 # LRU only: seconds since last access</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Policy</th><th>Hot keys surviving the scan</th><th>Signal it ranks on</th><th>Where it fails</th></tr></thead>
+<tbody>
+<tr><td><code>allkeys-lru</code>, samples 5</td><td>low &mdash; the scan pushes the working set out</td><td><code>idleSeconds(lruNow, v.lru)</code>, 1&nbsp;s resolution</td><td>Scans, backups, any once-through pass over the keyspace</td></tr>
+<tr><td><code>allkeys-lru</code>, samples 10</td><td>still low &mdash; a better approximation of the <em>wrong</em> signal</td><td>same</td><td>Raising samples fixes accuracy, never the policy choice</td></tr>
+<tr><td><code>allkeys-lfu</code>, factor 10</td><td>high &mdash; cold keys sit at the init value 5</td><td><code>255 &minus; lfuDecay(v)</code></td><td>Working sets that genuinely shift; needs decay tuned to the shift rate</td></tr>
+<tr><td><code>allkeys-random</code></td><td>proportional to the hot set's share of the keyspace</td><td>none</td><td>Always mediocre; useful only as the control in this experiment</td></tr>
+<tr><td><code>volatile-lru</code></td><td>1000 / 1000 &mdash; but only because nothing has a TTL</td><td>same as LRU, over <code>sh.expires</code> only</td><td>With no volatile keys it evicts nothing and returns <code>OOM</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Fill it in under a second and LRU degenerates into random</span>
+  <p>The stamp is coarse on purpose:</p>
+<div class="codewrap"><pre><code class="lang-go">// lruClock returns the coarse second-resolution clock stored on each value.
+// Second resolution is deliberate: it is all the precision an approximated LRU
+// needs, and it keeps the per-object metadata small.
+func (s *Store) lruClock() uint32 { return uint32(s.now() / 1000) }</code></pre></div>
+  <p>A <code>--pipe</code> load that finishes in 400&nbsp;ms stamps every key with the same second, so
+  <code>idleSeconds</code> returns 0 for every candidate, every score ties, and
+  <code>evictOne</code> keeps <code>sample[0]</code> &mdash; whichever key the map iteration happened
+  to yield first. Your LRU experiment measures Go's map randomisation. Spread the load over tens of
+  seconds (the <code>pv -L</code> above) or the result is noise. The same trap exists in real Redis,
+  which is why its LRU test suites all use timed loads.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Switching policy at runtime leaves the other metric stale</span>
+  <p><code>Store.touch</code> updates <em>one</em> field &mdash; the LFU counter under an LFU policy,
+  the LRU stamp otherwise. So <code>CONFIG SET maxmemory-policy allkeys-lfu</code> on a server that
+  has been running LRU for an hour leaves every existing key at <code>lfuInitVal = 5</code>: for the
+  next few minutes LFU has no information and its evictions are arbitrary. Real Redis says the same
+  thing in the error text <code>OBJECT FREQ</code> returns under the wrong policy, and this server
+  copies that message verbatim. Change the policy at startup when you can; when you cannot, expect a
+  warm-up.</p>
+</div>
+
+<h2>Kill it, restart it, replay the log</h2>
+
+<p>The AOF is a RESP stream of the commands that actually changed something. Two properties make the
+replay trustworthy, and both are visible in the file itself.</p>
+
+<div class="codewrap">
+<div class="codehead">what is really on disk<span class="lang">bash</span></div>
+<pre><code class="lang-bash">redis-cli -p 6380 SET user:1 ada
+redis-cli -p 6380 SET user:1 ada NX      # vetoed: nothing changed
+redis-cli -p 6380 DEL nosuchkey          # removed nothing
+redis-cli -p 6380 EXPIRE user:1 600      # relative
+redis-cli -p 6380 INCR hits
+
+cat -A data/appendonly.aof | tr -d '$'   # or: xxd data/appendonly.aof | head</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">data/appendonly.aof &mdash; note what is absent, and what was rewritten<span class="lang">text</span></div>
+<pre><code class="lang-text">*3\r\n
+3\r\nSET\r\n
+6\r\nuser:1\r\n
+3\r\nada\r\n
+*3\r\n                       &lt;- the NX-vetoed SET is NOT here (ctx.Dirty stayed 0)
+3\r\nPEXPIREAT\r\n           &lt;- EXPIRE 600 was rewritten to an ABSOLUTE deadline
+6\r\nuser:1\r\n
+13\r\n1756800600000\r\n
+*2\r\n                       &lt;- the DEL of a missing key is NOT here either
+3\r\nINCR\r\n
+4\r\nhits\r\n</code></pre>
+</div>
+
+<div class="box iv">
+  <span class="bt">Why <code>PEXPIREAT</code> is the only expiry form the log ever contains</span>
+  <p>From <code>commands/keyspace.go</code>: propagating <code>EXPIRE key 60</code> verbatim
+  "would give the key a fresh minute of life on every restart, which is one of the classic ways a
+  cache turns into a leak." Because the log only carries absolute deadlines, a replay reconstructs
+  the same instant the key originally had &mdash; which is also why this server can get away with
+  <em>not</em> propagating expiry <code>DEL</code>s at all, and why it must still propagate eviction
+  <code>DEL</code>s. Expiry is a decision time made; eviction is a decision the server made.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">crash and recover<span class="lang">bash</span></div>
+<pre><code class="lang-bash">redis-cli -p 6380 dbsize          # (integer) 2
+kill -9 $(pgrep -f 'miniredis -addr')   # no graceful path, no final snapshot
+
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -dir ./data -appendonly
+# level=INFO msg="aof loaded" commands=3 keys=2 took=1ms
+redis-cli -p 6380 TTL user:1      # (integer) 583  &lt;- NOT 600. The deadline survived.
+
+# Now simulate a crash *during* a write by lopping off the tail.
+truncate -s -8 data/appendonly.aof
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -dir ./data -appendonly
+# level=WARN msg="aof ends with a partial command; the tail was ignored" commands=2
+
+# And compaction: 500 INCRs collapse into one SET.
+for i in $(seq 1 500); do echo "INCR hits"; done | redis-cli -p 6380 --pipe
+wc -c data/appendonly.aof         # ~14 KB
+redis-cli -p 6380 BGREWRITEAOF
+wc -c data/appendonly.aof         # ~120 bytes</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>kill -9</code> with <code>appendfsync everysec</code> loses nothing; a power cut loses a second</span>
+  <p><code>AOF.Append</code> calls <code>a.w.Flush()</code> on every command regardless of policy,
+  with the comment: "Keeping them in a user-space buffer would mean a clean process kill (not even a
+  crash) could lose commands the client was told had succeeded." So the bytes are always in the page
+  cache and <code>kill -9</code> is survivable under all three policies. What
+  <code>appendfsync</code> buys is survival of the <em>machine</em> dying. Testing durability with
+  <code>kill -9</code> therefore proves nothing about <code>always</code> vs <code>everysec</code>
+  &mdash; you need to pull the power, or run the server in a VM you can hard-reset.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">A rewrite blocks every write for its whole duration</span>
+  <p><code>Server.RewriteAOF</code> takes the propagation lock for writing, so during a rewrite every
+  write command queues behind it. On a million-key dataset that is a multi-second stall your clients
+  see as a timeout. Real Redis forks and gets a copy-on-write snapshot for free; Go has no fork. The
+  auto-rewrite trigger (<code>-auto-aof-rewrite-percentage 100</code>, floor 64&nbsp;MiB) means this
+  can fire on its own at 3&nbsp;a.m. Building the fork-free equivalent &mdash; snapshot shard by
+  shard, buffer arriving commands, drain the buffer before the swap &mdash; is the headline exercise
+  in the README.</p>
+</div>
+
+<h2>The benchmarks</h2>
+
+<p>Every benchmark in <code>bench/</code> uses the Go 1.24 <code>for b.Loop()</code> form, which
+resets the timer on first call and keeps the loop's inputs alive so the optimiser cannot delete the
+work &mdash; both persistent footguns in the older <code>for i := 0; i &lt; b.N; i++</code> shape. The
+one exception is <code>BenchmarkShardContention</code>, which needs <code>RunParallel</code> and so
+still calls <code>b.ResetTimer</code> by hand.</p>
+
+<div class="codewrap">
+<div class="codehead">the four worth running first<span class="lang">bash</span></div>
+<pre><code class="lang-bash">go test ./bench -run '^$' -bench . -benchmem              # everything, with allocations
+go test ./bench -bench ShardContention -cpu 1,2,4,8       # the case for sharding
+go test ./bench -bench ScanVsKeys                         # the case for SCAN
+go test ./bench -bench AOFAppend                          # the price of durability
+go test ./bench -bench 'ServerRoundTrip|ServerPipelined'  # the price of syscalls</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">shape of the results (8-core laptop, Go 1.24.6, loopback &mdash; ratios matter, absolutes do not)<span class="lang">text</span></div>
+<pre><code class="lang-text">BenchmarkShardContention/shards=1-8       ~6x slower than shards=256, and gets WORSE with -cpu 8
+BenchmarkShardContention/shards=256-8     scales roughly linearly to 8 cores
+
+BenchmarkScanVsKeys/scan-single-page-8    bounded: cost is a function of COUNT, not of DBSIZE
+BenchmarkScanVsKeys/keys-glob-8           ~100k keys walked per call, every call
+
+BenchmarkAOFAppend/no-8                   1x     (one write syscall)
+BenchmarkAOFAppend/everysec-8             ~1x    (same syscall; one fsync per second, off the path)
+BenchmarkAOFAppend/always-8               100-1000x slower (a disk flush per command)
+
+BenchmarkServerRoundTrip-8                dominated by two syscalls + a scheduler hop
+BenchmarkServerPipelined-8                divide ns/op by 16: an order of magnitude less per command
+
+BenchmarkZSetAdd/size=1000 vs size=100000 only a little more per op: that is what O(log n) looks like
+BenchmarkPersistenceLoad/snapshot-load    several times faster than aof-replay for the same dataset</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Set <code>GOMAXPROCS</code> yourself in a container</span>
+  <p>Go 1.24 is <strong>not</strong> container-aware: it gives you one P per host core regardless of
+  the cgroup CPU quota. Benchmark this server in a 2-CPU container on a 32-core host and you get 32
+  Ps fighting over 2 cores' worth of quota, CFS throttling, and numbers that look like lock
+  contention but are scheduler starvation. Container awareness landed in Go 1.25; on 1.24.6 pass
+  <code>GOMAXPROCS</code> explicitly.</p>
+</div>
+
+<h2>Against the real thing, honestly</h2>
+
+<div class="codewrap">
+<div class="codehead">both servers, same tool, same flags<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker run --rm -d --name redis8 -p 6379:6379 redis:8 \
+    redis-server --save '' --appendonly no
+
+go run ./cmd/miniredis -addr 0.0.0.0:6380 -shards 16   # no AOF, to match
+
+for port in 6379 6380; do
+  echo "=== port $port ==="
+  redis-benchmark -p $port -t set,get,lpush,lpop,sadd,zadd -n 200000 -c 50 -q
+  redis-benchmark -p $port -t get -n 500000 -c 50 -P 16 -q     # pipelined
+done</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Case</th><th>Which wins</th><th>The mechanism behind it</th></tr></thead>
+<tbody>
+<tr><td><code>-c 1</code>, no pipeline (latency)</td><td><strong>Redis 8</strong>, comfortably</td><td>Its event loop reads, executes and writes on one thread with no handoff. Here every command costs a netpoller wakeup and a goroutine schedule.</td></tr>
+<tr><td><code>-c 50 -P 1</code> (typical)</td><td>Redis 8, by a smaller margin</td><td>Redis's parser and reply builder are hand-tuned C with no per-argument allocation. Ours copies every bulk argument out of the read buffer so it stays valid after the next read.</td></tr>
+<tr><td><code>-c 50 -P 16</code> (pipelined)</td><td>Close &mdash; miniredis can pull ahead on &ge;8 cores</td><td>Syscalls amortise for both, and this is where sharded parallelism actually pays: 16 shards, 50 goroutines, real cores. Redis 8 is one thread for command execution.</td></tr>
+<tr><td>Memory per key</td><td><strong>Redis 8</strong>, by a wide margin</td><td>listpack, intset, embstr and shared integer objects. Here there is one representation per type, so a 3-field hash costs a Go map.</td></tr>
+<tr><td>Multi-key atomicity</td><td><strong>Redis 8</strong></td><td>Single-threaded execution is the guarantee. <code>DEL a b</code> across two shards here is two atomic steps, not one.</td></tr>
+<tr><td>Restart time on a big dataset</td><td>Roughly comparable</td><td>Both replay a command log or load a binary image; the snapshot path here skips parsing entirely, which is the same trick RDB uses.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Two of those gaps are the code's fault rather than the design's, and a profile finds them
+immediately. Command lookup upper-cases the name on every single command:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/resp/types.go &mdash; two allocations per command, on the hot path<span class="lang">go</span></div>
+<pre><code class="lang-go">// Name returns the upper-cased command name (argv[0]), or "" for an empty
+// command. Redis command lookup is case insensitive.
+func (c Command) Name() string {
+    if len(c) == 0 {
+        return ""
+    }
+    return strings.ToUpper(string(c[0]))
+}</code></pre>
+</div>
+
+<p><code>string(c[0])</code> copies, and <code>strings.ToUpper</code> copies again unless the name is
+already upper-case. At a million commands a second that is two million allocations a second handed to
+the GC for no result &mdash; and <code>BenchmarkCommandLookup</code> exists precisely so you can see
+it next to the dispatch numbers. Fixing it without changing behaviour is exercise 1.</p>
+
+<h2>Run it under <code>-race</code></h2>
+
+<p>The race detector is not optional here, and the Makefile says why: "the store is a sharded,
+mutex-protected map read and written by one goroutine per connection plus the cron goroutine. A data
+race here is a correctness bug, not a performance note."</p>
+
+<div class="codewrap">
+<div class="codehead">the whole suite, plus a live server under load<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make race                       # go test -race -count=1 ./...
+go test -race -count=1 ./internal/store -run 'Concurrent|Active|Evict'
+
+# The detector only sees code that actually executes, so drive a RACE-INSTRUMENTED
+# SERVER with real traffic while the cron goroutine and eviction are both busy:
+go run -race ./cmd/miniredis -addr 127.0.0.1:6380 -hz 100 \
+    -maxmemory 8mb -maxmemory-policy allkeys-lfu &amp;
+redis-benchmark -p 6380 -t set,get -n 300000 -c 50 -P 8 -q
+seq 1 50000 | awk '{printf "SET vol:%d x PX 800\n", $1}' | redis-cli -p 6380 --pipe
+
+# -race costs roughly 2-20x CPU and ~5-10x memory. Never benchmark under it, and
+# never compare a -race number with a clean one.</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A clean <code>-race</code> run is evidence, not proof</span>
+  <p>It reports a race only when two conflicting accesses actually happen, on this run, with no
+  happens-before edge between them &mdash; never on a path you did not execute. Three interleavings
+  are worth forcing because the tests cannot easily reach them: eviction firing while the cron cycle
+  holds a different shard, an AOF rewrite (which takes <code>propMu</code> for writing) racing
+  pipelined writes, and <code>Server.Close</code> arriving with fifty connections mid-command. Send
+  <code>SIGINT</code> during the <code>redis-benchmark</code> above and watch the graceful path
+  unwind under instrumentation.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<p>Roughly in order of difficulty. Each is a real feature with a real design question inside it, and
+the package boundaries were drawn so that none of them needs a rewrite.</p>
+
+<ol>
+<li><strong>Profile it and kill the dispatch-path allocations.</strong> Add
+<code>net/http/pprof</code> behind a <code>-pprof-addr</code> flag, run
+<code>redis-benchmark -t get -n 1000000 -P 16</code>, then
+<code>go tool pprof -alloc_space http://localhost:6060/debug/pprof/heap</code> and
+<code>-http=: http://localhost:6060/debug/pprof/profile?seconds=30</code>. You will find
+<code>Command.Name</code> and the reply path. Fix the lookup with a case-insensitive comparison over
+the existing <code>[]byte</code> (no allocation) or a small perfect-hash table, and prove it with
+<code>benchstat</code> over <code>BenchmarkDispatch</code> and <code>BenchmarkCommandLookup</code>.</li>
+
+<li><strong><code>MULTI</code>/<code>EXEC</code>/<code>DISCARD</code>.</strong> Queue commands on the
+connection, then execute them as a unit. The design question is the one
+<code>store.go</code>'s package comment already names: cross-key atomicity is exactly what sharding
+gave away. Either take every shard lock in a fixed index order (deadlock-free, but it serialises the
+whole server for the duration of the transaction) or offer a weaker guarantee and write down what it
+is. Do not offer the strong one and implement the weak one.</li>
+
+<li><strong><code>WATCH</code> and optimistic locking.</strong> Needs a per-key version counter
+bumped inside <code>shard.drop</code> and every mutation path, plus a per-connection watch list
+checked at <code>EXEC</code>. Decide what happens when a watched key is evicted or expires &mdash;
+real Redis aborts the transaction, and getting that right means eviction has to bump the version
+too.</li>
+
+<li><strong>Pub/Sub: <code>SUBSCRIBE</code>, <code>UNSUBSCRIBE</code>,
+<code>PUBLISH</code>, <code>PSUBSCRIBE</code>.</strong> The connection loop in
+<code>conn.go</code> only ever writes in response to a read, so a published message has nowhere to
+go. The Go-shaped answer is a buffered outbox channel per connection plus a writer goroutine; a
+mutex around <code>resp.Writer</code> also works and is worse. Then answer the hard part: what
+happens when a subscriber stops reading and its outbox fills? Block the publisher, drop the message,
+or disconnect the slow client &mdash; Redis picks the third, via
+<code>client-output-buffer-limit</code>.</li>
+
+<li><strong>Keyspace notifications.</strong> Built on the previous one:
+<code>__keyspace@0__:&lt;key&gt;</code> and <code>__keyevent@0__:&lt;event&gt;</code> channels, with a
+<code>notify-keyspace-events</code> flag string selecting classes. The interesting part is where the
+hook goes. Emitting from inside a shard lock means a channel send under a mutex; emitting from the
+dispatcher means the event has no access to <em>which</em> key changed unless the handler reports it.
+The <code>ctx.Dirty</code> pattern already shows the shape of the answer.</li>
+
+<li><strong>RESP3.</strong> <code>HELLO 3</code> currently returns <code>NOPROTO</code>. Add maps
+(<code>%</code>), sets (<code>~</code>), doubles (<code>,</code>), nulls (<code>_</code>) and push
+messages (<code>&gt;</code>) to <code>internal/resp</code>, a per-connection protocol version, and
+make the reply helpers in <code>commands/context.go</code> emit the right shape for both. If that
+touches more than those two files, the boundaries were drawn in the wrong place &mdash; that is the
+real point of the exercise. <code>redis-cli -3</code> is your test harness.</li>
+
+<li><strong>Blocking commands: <code>BLPOP</code>, <code>BRPOP</code>,
+<code>BLMOVE</code>.</strong> A goroutine parked until a key gains an element, with a timeout, correct
+behaviour when the key is deleted or retyped, and no lost wakeups when a push and a block interleave.
+The trap: you cannot hold the shard lock while waiting. Use a per-key waiter registry outside the
+lock and re-check the condition after acquiring it.</li>
+
+<li><strong>Lua via a Go VM.</strong> Wire in a pure-Go Lua interpreter (<code>yuin/gopher-lua</code>
+is the usual choice) behind <code>EVAL</code>, <code>EVALSHA</code> and <code>SCRIPT LOAD</code>, with
+<code>KEYS</code>/<code>ARGV</code> and a <code>redis.call</code> bridge back into the dispatcher.
+Two hard requirements, both of which real Redis enforces: the script must be
+<strong>deterministic</strong> (no wall clock, no unseeded random, no host I/O) or a replayed AOF
+diverges from the original run; and it must be <strong>atomic</strong>, which on a sharded store means
+it inherits the whole of exercise 2. Note this is the first exercise where the project's central
+trade-off actually stops you.</li>
+
+<li><strong>A Streams type.</strong> <code>XADD</code>, <code>XLEN</code>, <code>XRANGE</code>,
+<code>XREAD</code>, and <code>XADD ... MAXLEN ~</code>. A new <code>ValueType</code>, a new arm in the
+tagged union, a new case in <code>writeEntryCommands</code> and in the snapshot encoder, and a new
+memory-accounting path that <code>VerifyMemoryAccounting</code> must still agree with. The ID
+allocator (<code>&lt;ms&gt;-&lt;seq&gt;</code>, monotonic even when the clock steps backwards) is a
+nice self-contained problem. Consumer groups are a second exercise, not part of this one.</li>
+
+<li><strong>Replication: <code>REPLICAOF</code>, full sync, then a command stream.</strong> The
+replica connects, the primary sends a snapshot (you already have the binary format), then keeps
+streaming propagated commands from the point the snapshot was taken &mdash; which means a replication
+backlog buffer and the same "no command may slip between the snapshot and the stream" problem
+<code>propMu</code> already solves for the AOF rewrite. Then the rule <code>expire.go</code> already
+warns about: <strong>a replica must never expire a key on its own initiative.</strong> It serves the
+key as missing but waits for the primary's <code>DEL</code>, or the two diverge. Test it by pointing
+a real <code>redis-cli --stat</code> at both.</li>
+
+<li><strong>Consistent hashing across N independent nodes.</strong> A client-side or proxy-side ring
+with virtual nodes, so that adding a fifth server moves ~1/5 of the keys instead of rehashing
+everything. Measure the actual movement with a script that records key&rarr;node before and after.
+Then find the limitation yourself: <code>MGET</code> across the ring is now N round trips, and there
+is no <code>MOVED</code> to tell a confused client where a key went.</li>
+
+<li><strong>Cluster-style hash slots with <code>MOVED</code> redirects.</strong> 16384 slots,
+<code>CRC16(key) mod 16384</code>, hash tags (<code>{user:1}:profile</code>), a slot&rarr;node map,
+and a <code>-MOVED &lt;slot&gt; &lt;host&gt;:&lt;port&gt;</code> error for anything not owned locally.
+Add <code>CLUSTER SLOTS</code> and <code>redis-cli -c</code> follows the redirects for you, which is
+the moment this stops being a toy. Then reshard: <code>ASK</code> redirects and the
+<code>MIGRATING</code>/<code>IMPORTING</code> states, which exist because a slot in motion has keys
+on two nodes at once.</li>
+
+<li><strong>Put it together.</strong> Three primaries by slot range from exercise 12, one replica
+each from exercise 10, and a failover in which the replica is promoted, the slot map updated, and
+clients learn about it through <code>MOVED</code>. You are now face to face with why real Redis
+Cluster needs gossip and a majority vote &mdash; and why it refuses multi-key commands spanning
+slots.</li>
+</ol>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>An unmodified <code>redis-cli</code>, <code>redis-cli --pipe</code> and
+  <code>redis-benchmark</code> all work against this server, and that is the compatibility test that
+  matters. Supporting the inline dialect as well as multibulk is what makes <code>--pipe</code> with a
+  plain text file of commands work at all.</li>
+  <li>Eviction runs only on write commands, and <code>used_memory</code> is the store's own
+  accounting rather than RSS. Lowering <code>maxmemory</code> on an idle server appears to do nothing
+  until the next write &mdash; check <code>evicted_keys</code> in <code>INFO stats</code> before
+  concluding the setting was ignored.</li>
+  <li>LRU's clock is second-resolution, so any eviction experiment that loads its data in under a
+  second is measuring Go's map iteration order, not the policy. Spread the load, then compare
+  policies &mdash; and under a scanning workload expect LFU to keep the working set that LRU throws
+  away.</li>
+  <li>The AOF contains only commands that changed something (<code>ctx.Dirty &gt; 0</code>) and only
+  absolute deadlines (<code>PEXPIREAT</code>). That pair is what makes a replay reconstruct the same
+  database instead of one where every TTL restarted. Evicted keys are propagated as explicit
+  <code>DEL</code>s because no client command implies them; expired keys are not, because the
+  absolute deadline already does.</li>
+  <li><code>appendfsync</code> is about surviving the machine, not the process:
+  <code>Append</code> flushes to the OS on every command under all three policies, so
+  <code>kill -9</code> loses nothing regardless. Benchmarking durability with a
+  <code>kill -9</code> proves only that the page cache exists.</li>
+  <li>Against Redis 8 the honest picture is: worse on single-command latency and memory per key
+  (event loop, hand-tuned C, listpack/intset encodings), competitive under deep pipelining on
+  multiple cores (sharded parallelism against one execution thread), and behind on guarantees
+  (no cross-key atomicity). Two of the throughput gaps &mdash; the per-command upper-casing in
+  <code>Command.Name</code> and the per-argument copy in the parser &mdash; are code, not design, and
+  pprof finds them in a minute.</li>
+  <li>Run <code>make race</code> before every commit, and drive a <code>go run -race</code> server
+  with real traffic at least once: the detector only sees the interleavings that actually happen, and
+  the ones worth forcing here are eviction against the cron cycle, a rewrite against pipelined
+  writes, and shutdown against fifty live connections.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="02-implementation.html"><span class="lb">Previous</span>Expiry, eviction &amp; persistence</a>
+  <span class="xref"><span class="lb">Next</span>10 &middot; Projects</span>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

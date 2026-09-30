@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Distributed Rate Limiter &amp; API Gateway &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <strong>Distributed Rate Limiter &amp; API Gateway</strong></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Distributed Rate Limiter &amp; API Gateway</h1>
+<p class="lede">A reverse-proxy gateway in Go that puts a multi-tenant rate limiter in front of a
+set of upstream services, with every limit decision made inside Redis by a Lua script so the limit
+is global across replicas rather than per-process. Around that core sit the things a gateway needs
+to survive contact with production &mdash; per-upstream circuit breakers, bounded timeouts, retries
+that only fire on idempotent methods, request-id propagation and metrics whose cardinality is
+designed rather than accidental.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">project 2</span>
+  <span class="tag">3 documents</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The one hard problem this project exists to teach</span>
+  <p>A rate limit is <strong>shared mutable state that every replica reads and writes on every
+  single request</strong>. Everything difficult here follows from that one sentence.</p>
+  <p>The naive limiter &mdash; <code>GET</code> the counter, decide in Go, <code>SET</code> it back
+  &mdash; is a textbook lost update. Two replicas both read &ldquo;9 tokens left&rdquo;, both allow,
+  and your 100/s limit quietly admits 140/s. It is invisible in every sequential test, it only
+  appears under load, and it appears exactly when the limiter matters most. The fix is to move the
+  entire read&ndash;modify&ndash;write <em>inside</em> Redis, where the single-threaded execution
+  model makes a Lua script a critical section you get for free.</p>
+  <p>That fix immediately creates the second half of the problem: <strong>the limiter is now on the
+  network, on the hot path, in front of everything</strong>. Its latency is added to every request,
+  so three tiers must cost one round trip and not three. Its failure is now your failure, so you
+  must decide in advance whether an unreachable Redis means &ldquo;let everything through&rdquo; or
+  &ldquo;let nothing through&rdquo;. There is no universally correct answer, which is why it is a
+  configuration flag in this codebase and an argument you should be able to make in both
+  directions.</p>
+</div>
+
+<h2>What you will build</h2>
+
+<p>One Go binary that listens on two ports. The <strong>data plane</strong> on <code>:28080</code>
+carries tenant traffic through a middleware chain &mdash; request id, metrics, logging, panic
+recovery, API-key authentication, rate limiting &mdash; and then reverse-proxies whatever survives
+to an upstream chosen by path prefix. The <strong>admin plane</strong> on <code>:29090</code> serves
+<code>/metrics</code>, <code>/healthz</code>, <code>/readyz</code> and <code>/breakers</code>, is
+not rate limited and can be firewalled off, so no tenant can starve your monitoring and no
+Prometheus scrape costs a customer part of their quota.</p>
+
+<p>Each request is checked against three tiers at once &mdash; a per-key burst, a per-key sustained
+rate, and a fleet-wide global ceiling &mdash; by a single <code>EVALSHA</code>. The script evaluates
+every tier before consuming from any of them, so a request rejected by the sustained tier does not
+burn a burst token on its way out.</p>
+
+<figure>
+<svg viewBox="0 0 820 372" role="img" aria-label="One gateway process with a data plane on port 28080 running a middleware chain into a routing registry, a limiter call to Redis running a Lua script, a per-upstream breaker, retry and transport stack feeding two upstreams, and a separate admin plane on port 29090">
+  <text class="lbl-b" x="8" y="18">One process &middot; two listeners &middot; one Redis round trip per request</text>
+
+  <rect class="node" x="8" y="68" width="98" height="48" rx="7"/>
+  <text class="lbl-b" x="57" y="90" text-anchor="middle">client</text>
+  <text class="mono"  x="57" y="107" text-anchor="middle">X-API-Key</text>
+
+  <rect class="node" x="132" y="36" width="400" height="140" rx="8"/>
+  <text class="lbl-b" x="146" y="56">data plane :28080</text>
+
+  <rect class="node" x="140" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="169" y="88" text-anchor="middle">RequestID</text>
+  <rect class="node" x="205" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="234" y="88" text-anchor="middle">Metrics</text>
+  <rect class="node" x="270" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="299" y="88" text-anchor="middle">Logging</text>
+  <rect class="node" x="335" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="364" y="88" text-anchor="middle">Recover</text>
+  <rect class="node" x="400" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="429" y="88" text-anchor="middle">Auth</text>
+  <rect class="node-a" x="465" y="68" width="59" height="32" rx="5"/>
+  <text class="lbl-s" x="494" y="88" text-anchor="middle">RateLimit</text>
+
+  <rect class="node-i" x="140" y="112" width="384" height="30" rx="5"/>
+  <text class="lbl-b" x="332" y="132" text-anchor="middle">Registry &mdash; /alpha, /beta by path prefix</text>
+  <text class="lbl-s" x="146" y="163">limits are checked before routing: a throttled tenant costs no routing work</text>
+
+  <rect class="node" x="560" y="36" width="252" height="140" rx="8"/>
+  <text class="lbl-b" x="574" y="56">per-upstream transport</text>
+  <rect class="node-w" x="574" y="66" width="104" height="30" rx="5"/>
+  <text class="lbl-s" x="626" y="86" text-anchor="middle">breaker</text>
+  <rect class="node" x="574" y="102" width="104" height="30" rx="5"/>
+  <text class="lbl-s" x="626" y="122" text-anchor="middle">retry</text>
+  <rect class="node" x="574" y="138" width="104" height="30" rx="5"/>
+  <text class="mono"  x="626" y="158" text-anchor="middle">http.Transport</text>
+  <text class="lbl-s" x="690" y="80">outside the retry</text>
+  <text class="lbl-s" x="690" y="94">loop: 1 sample</text>
+  <text class="lbl-s" x="690" y="116">idempotent only,</text>
+  <text class="lbl-s" x="690" y="130">full jitter</text>
+  <text class="lbl-s" x="690" y="152">own pool and</text>
+  <text class="lbl-s" x="690" y="166">timeout budget</text>
+
+  <rect class="node-i" x="190" y="248" width="200" height="80" rx="7"/>
+  <text class="lbl-b" x="290" y="272" text-anchor="middle">Redis 8</text>
+  <text class="mono"  x="290" y="291" text-anchor="middle">tokenbucket.lua</text>
+  <text class="lbl-s" x="290" y="310" text-anchor="middle">burst &middot; sustained &middot; global</text>
+
+  <rect class="node" x="8" y="248" width="170" height="80" rx="7"/>
+  <text class="lbl-b" x="93" y="272" text-anchor="middle">admin plane :29090</text>
+  <text class="mono"  x="93" y="291" text-anchor="middle">/metrics /healthz</text>
+  <text class="mono"  x="93" y="310" text-anchor="middle">/readyz /breakers</text>
+  <text class="lbl-s" x="93" y="348" text-anchor="middle">never rate limited</text>
+
+  <rect class="node-o" x="580" y="248" width="110" height="62" rx="7"/>
+  <text class="lbl-b" x="635" y="274" text-anchor="middle">upstream alpha</text>
+  <text class="mono"  x="635" y="294" text-anchor="middle">:28081</text>
+  <rect class="node-o" x="702" y="248" width="110" height="62" rx="7"/>
+  <text class="lbl-b" x="757" y="274" text-anchor="middle">upstream beta</text>
+  <text class="mono"  x="757" y="294" text-anchor="middle">:28082</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="108" y1="92" x2="128" y2="92" marker-end="url(#rlg-ar1)"/>
+    <line class="edge" x1="534" y1="127" x2="556" y2="127" marker-end="url(#rlg-ar1)"/>
+    <path class="edge" d="M 626 178 L 626 244" marker-end="url(#rlg-ar1)"/>
+    <path class="edge" d="M 626 212 L 757 212 L 757 244" marker-end="url(#rlg-ar1)"/>
+    <path class="edge dash" d="M 310 246 L 310 180" marker-end="url(#rlg-ar1)"/>
+  </g>
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 270 178 L 270 244" marker-end="url(#rlg-ar1)"/>
+  </g>
+  <text class="lbl-s" x="326" y="200">1 &times; EVALSHA, 3 tiers</text>
+  <text class="lbl-s" x="326" y="216">allow / deny + X-RateLimit-*</text>
+  <text class="lbl-s" x="326" y="232">nothing is written on a rejection</text>
+
+  <defs>
+    <marker id="rlg-ar1" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The limiter is the only thing on this diagram that every request must wait for, and it
+sits one network hop away. That is the constraint the whole design is built around: three tiers,
+one round trip, and a written decision only when the request is actually admitted.</figcaption>
+</figure>
+
+<h2>The mechanisms</h2>
+
+<p>Each row is a piece of the codebase that exists to make one idea concrete. The right-hand column
+is where that idea was explained in the abstract &mdash; read the module page first if the mechanism
+does not land, or read the file first and use the module page to check your understanding.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Lives in</th><th>The concept it demonstrates</th><th>Where it was taught</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>Atomic multi-tier token bucket</strong></td>
+  <td><code>internal/limiter/tokenbucket.lua</code></td>
+  <td>A read&ndash;modify&ndash;write on shared state made atomic by Redis executing one script on one thread</td>
+  <td><span class="xref">07 &middot; Transactions &amp; scripting</span></td>
+</tr>
+<tr>
+  <td><strong>Sliding-window counter as an alternative</strong></td>
+  <td><code>internal/limiter/slidingwindow.lua</code></td>
+  <td>The memory-versus-accuracy curve: banked burst credit against a smooth rate, O(1) either way</td>
+  <td><span class="xref">07 &middot; Rate limiting with Redis</span></td>
+</tr>
+<tr>
+  <td><strong>Lazy refill, TTL per key, no background job</strong></td>
+  <td><code>internal/limiter/tokenbucket.lua</code></td>
+  <td>State that is cheap to reconstruct can be expired or evicted without consequence</td>
+  <td><span class="xref">07 &middot; Expiry &amp; eviction</span></td>
+</tr>
+<tr>
+  <td><strong><code>EVALSHA</code> with a <code>NOSCRIPT</code> fallback, hash-tagged keys</strong></td>
+  <td><code>internal/limiter/tokenbucket.go</code></td>
+  <td>The script cache, and why multi-key scripts hit <code>CROSSSLOT</code> the day you shard</td>
+  <td><span class="xref">07 &middot; Redis Cluster</span></td>
+</tr>
+<tr>
+  <td><strong>The same lost update, seen in a database</strong></td>
+  <td><code>internal/limiter/tokenbucket_test.go</code></td>
+  <td>Why <code>SELECT &hellip; FOR UPDATE</code> and a Lua script are answers to one question</td>
+  <td><span class="xref">05 &middot; Concurrency patterns in Postgres</span></td>
+</tr>
+<tr>
+  <td><strong>Circuit breaker with a generation counter</strong></td>
+  <td><code>internal/breaker/breaker.go</code></td>
+  <td>Three states, a volume threshold before a ratio means anything, and stale in-flight results that must not close a breaker they no longer belong to</td>
+  <td><span class="xref">08 &middot; Resilience patterns</span></td>
+</tr>
+<tr>
+  <td><strong>Retries on idempotent methods only, full jitter</strong></td>
+  <td><code>internal/proxy/proxy.go</code></td>
+  <td>A retry is a duplicate request; only some requests are safe to duplicate</td>
+  <td><span class="xref">08 &middot; Idempotency</span></td>
+</tr>
+<tr>
+  <td><strong>Fail open vs fail closed when Redis is gone</strong></td>
+  <td><code>internal/middleware/ratelimit.go</code></td>
+  <td>Availability against correctness, decided explicitly and in advance rather than by accident at 03:00</td>
+  <td><span class="xref">08 &middot; CAP and PACELC</span></td>
+</tr>
+<tr>
+  <td><strong>Request id, structured logs, bounded label cardinality</strong></td>
+  <td><code>internal/middleware/{requestid,logging,metrics}.go</code></td>
+  <td>Labels by route and plan, never by tenant or path &mdash; every combination is a permanent time series</td>
+  <td><span class="xref">08 &middot; Distributed observability</span></td>
+</tr>
+<tr>
+  <td><strong>Per-upstream transport, pool and timeout budget</strong></td>
+  <td><code>internal/proxy/registry.go</code></td>
+  <td>Bulkheading in Go&rsquo;s HTTP client: one sick upstream must not consume the connections of a healthy one</td>
+  <td><span class="xref">02 &middot; Production Go</span></td>
+</tr>
+<tr>
+  <td><strong>The <code>X-RateLimit-*</code> and <code>Retry-After</code> contract</strong></td>
+  <td><code>internal/middleware/ratelimit.go</code></td>
+  <td>A 429 that does not say <em>which</em> limit bound and <em>when</em> to come back is an unhelpful error</td>
+  <td><span class="xref">09 &middot; API design</span></td>
+</tr>
+<tr>
+  <td><strong>Two listeners, data plane and admin plane</strong></td>
+  <td><code>cmd/gateway/main.go</code></td>
+  <td>Where a gateway sits, what it must never let tenant traffic starve, and graceful shutdown of both</td>
+  <td><span class="xref">09 &middot; Load balancing &amp; gateways</span></td>
+</tr>
+<tr>
+  <td><strong>50 goroutines, exactly <code>capacity</code> admissions</strong></td>
+  <td><code>internal/limiter/tokenbucket_test.go</code></td>
+  <td>A concurrency test that a correct implementation passes and a plausible one fails, run under <code>-race</code></td>
+  <td><span class="xref">02 &middot; Advanced testing</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2>Repository layout</h2>
+
+<p>Everything lives under <code>code/</code>. It is a single Go module,
+<code>github.com/acme/gateway</code>, with three third-party dependencies: go-redis v9, the
+Prometheus client, and miniredis for the tests.</p>
+
+<div class="codewrap">
+<div class="codehead">10-projects/p2-rate-limiter-gateway/code<span class="lang">text</span></div>
+<pre><code class="lang-text">code/
+├── cmd/
+│   ├── gateway/main.go            the whole object graph in one readable file, no DI
+│   └── upstream/main.go           httpbin-style test upstream with a /control fault switch
+├── internal/
+│   ├── breaker/
+│   │   ├── breaker.go             three-state machine + the generation counter
+│   │   └── breaker_test.go
+│   ├── config/
+│   │   └── config.go              every GATEWAY_* variable, parse errors accumulated
+│   ├── limiter/
+│   │   ├── limiter.go             the Limiter interface, Rule and Decision
+│   │   ├── tokenbucket.lua        the centrepiece -- atomic multi-tier bucket, commented
+│   │   ├── tokenbucket.go         go:embed, EVALSHA + NOSCRIPT fallback, key layout
+│   │   ├── tokenbucket_test.go    50 goroutines, exactly `capacity` admissions
+│   │   ├── slidingwindow.lua      the second algorithm, for comparison
+│   │   ├── slidingwindow.go
+│   │   └── tiers.go               plans, per-tier limits, why two tiers per tenant
+│   ├── middleware/
+│   │   ├── chain.go               ordering as a design decision, reasoned position by position
+│   │   ├── requestid.go           accept an inbound id or mint one, propagate downstream
+│   │   ├── metrics.go             Prometheus collectors; cardinality is the whole design
+│   │   ├── logging.go             structured access log, one line per request
+│   │   ├── recover.go             a panic becomes a 500 that is still logged and counted
+│   │   ├── auth.go                X-API-Key -- tenant + plan, read-only map after construction
+│   │   └── ratelimit.go           fail-open/fail-closed policy, X-RateLimit-* headers
+│   └── proxy/
+│       ├── proxy.go               ReverseProxy with Rewrite, retry policy, bounded buffering
+│       ├── proxy_test.go
+│       └── registry.go            static routing table: path prefix -&gt; upstream
+├── loadtest/
+│   └── README.md                  driving the gateway with `hey`
+├── docker-compose.yml             redis 8 + upstream-alpha + upstream-beta + gateway
+├── Dockerfile                     multi-stage build, `gateway` and `upstream` targets
+├── Makefile                       up / run / smoke / test / bench / metrics / breakers
+├── go.mod                         go 1.24 -- go-redis v9, prometheus, miniredis
+├── go.sum
+└── README.md                      the tour: five things to look at, in order</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Go 1.24 is not container-aware</span>
+  <p>The <code>Dockerfile</code> builds on <code>golang:1.24-alpine</code> and sets no
+  <code>GOMAXPROCS</code>. Under a CPU limit &mdash; a Kubernetes <code>limits.cpu</code>, a compose
+  <code>cpus:</code> &mdash; a Go 1.24 runtime still sizes its scheduler from the host&rsquo;s core
+  count, so a 32-core node with a 1-CPU limit gives you 32 Ps competing for one CPU&rsquo;s worth of
+  quota, and throttled latency spikes on the request path. Automatic container-aware
+  <code>GOMAXPROCS</code> arrives in Go 1.25. On 1.24 you set it yourself, from the limit, at
+  startup.</p>
+</div>
+
+<h2>Quick start</h2>
+
+<p>Docker and Compose v2 for the stack; <code>make</code> from Git Bash or WSL on Windows. The
+tests need neither &mdash; they run the real Lua against miniredis, in process.</p>
+
+<div class="codewrap">
+<div class="codehead">from the repository root<span class="lang">bash</span></div>
+<pre><code class="lang-bash">cd 10-projects/p2-rate-limiter-gateway/code
+
+# 1. dependencies: Redis 8 and the two upstreams, waited until healthy
+make up
+
+# 2. the gateway itself, from source: data plane :28080, admin plane :29090
+make run
+
+# 3. in another terminal -- five 200s on the free plan, then 429s
+make smoke</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">everything in containers, gateway included<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make up-all      # compose brings up redis, both upstreams and the gateway
+make down        # stop the stack and delete its volumes</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">tests, benchmarks and lint -- no Docker required<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test        # go test -race -count=1 ./...
+make bench       # limiter benchmarks with allocation counts
+make lint        # gofmt + go vet (+ golangci-lint if installed)</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">poking at a running gateway<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -s -o /dev/null -H 'X-API-Key: demo-free-key' \
+  -w 'status=%{http_code} rule=%header{X-RateLimit-Rule} remaining=%header{X-RateLimit-Remaining}\n' \
+  http://localhost:28080/alpha/json
+
+curl -s http://localhost:29090/breakers    # per-upstream circuit breaker state
+make metrics                              # the gateway_* series only, no runtime noise</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">without make (Windows PowerShell or cmd)<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker compose up -d --build --wait redis upstream-alpha upstream-beta
+go run ./cmd/gateway</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Separate curl invocations will not trip the limiter</span>
+  <p>The free plan allows 5 requests per second. Twelve <em>separate</em> <code>curl</code>
+  processes take long enough to start that the bucket refills between them, and you will see twelve
+  200s and conclude the limiter is broken. Pass every URL to <strong>one</strong> <code>curl</code>
+  process so the requests are genuinely close together:</p>
+  <div class="codewrap"><pre><code class="lang-bash">URLS=$(for i in $(seq 1 10); do printf 'http://localhost:28080/alpha/json '; done)
+curl -s -o /dev/null -H 'X-API-Key: demo-free-key' -w 'status=%{http_code}\n' $URLS</code></pre></div>
+  <p>This is not a quirk of the demo. It is the token bucket doing exactly what it is for: refilling
+  continuously, so a client that spaces its requests out never notices the limit exists.</p>
+</div>
+
+<h2>Documentation</h2>
+
+<p>Read them in order. The design document is worth finishing before you open the code &mdash; the
+implementation walkthrough assumes you know why the Lua script has two passes.</p>
+
+<div class="grid">
+  <a class="card" href="01-design.html"><span class="n">01</span>
+    <div class="t">Design &amp; algorithms</div>
+    <p class="d">The four rate-limiting algorithms and why this gateway ships two of them, the
+    multi-tier model, two-phase evaluation, the key layout and its Cluster consequences, and the
+    fail-open/fail-closed argument in both directions.</p></a>
+
+  <a class="card" href="02-implementation.html"><span class="n">02</span>
+    <div class="t">Implementation walkthrough</div>
+    <p class="d">The Lua line by line, <code>EVALSHA</code> and the <code>NOSCRIPT</code> fallback,
+    middleware ordering, the breaker&rsquo;s generation counter, the retry policy, and the metric
+    labels that were deliberately not added.</p></a>
+
+  <a class="card" href="03-running.html"><span class="n">03</span>
+    <div class="t">Running, testing &amp; exercises</div>
+    <p class="d">The full configuration surface, the concurrency test that justifies the whole
+    design, load testing, what the breaker looks like when it opens and recovers, and ten exercises
+    from adding a plan to sharding the global tier.</p></a>
+</div>
+
+<div class="nav-bottom">
+  <a href="../../index.html#work"><span class="lb">Back to</span>Portfolio &middot; Projects</a>
+  <a href="01-design.html"><span class="lb">Next</span>Design &amp; algorithms</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,996 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The realtime layer &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Real-time Collaborative Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>The realtime layer</h1>
+<p class="lede">The CRDT is the easy half. This is the other: the validator between a socket and
+the merge algorithm, the heartbeat that tells a dead connection from an idle one, the bounded queue
+that stops one slow phone eating the heap, and the Redis backplane that makes two processes behave
+like one document.</p>
+
+<div class="meta">
+  <span class="tag v">Node 22</span>
+  <span class="tag v">WebSocket</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">transport</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The mental model that matters</span>
+  <p><strong>A WebSocket is a long-lived resource held on behalf of someone you cannot trust and
+  cannot see.</strong> Requests end; connections do not. Each mechanism below answers one question:
+  <em>is this frame safe to act on?</em> (protocol), <em>is the peer there?</em> (heartbeat), <em>is
+  it keeping up?</em> (backpressure), <em>what did the other instances see?</em> (Redis, whose
+  guarantees are weaker than they look).</p>
+</div>
+
+<h2>The wire protocol</h2>
+
+<p>One JSON object per text frame, tagged with <code>t</code>. The rule
+<code>src/transport/protocol.js</code> enforces: nothing from a socket reaches the CRDT unchecked.
+The RGA integrator assumes <code>id.s</code> is a string and <code>ch</code> one character, so
+<code>{c: "banana"}</code> must be rejected at the door, not inside a linked-list walk where the
+failure is a corrupted document instead of an error message.</p>
+
+<p>Two rules follow. Every list has a bound &mdash; ops, ids, names, the whole frame &mdash;
+because an unbounded field on a public socket is a denial of service waiting to happen. And
+validation returns a value rather than throwing: a bad frame costs one error message and one
+counter, not a stack unwind.</p>
+
+<div class="codewrap">
+<div class="codehead">size is checked before anything is parsed<span class="lang">js</span></div>
+<pre><code class="lang-js">function byteLength(raw) {
+  if (typeof raw === 'string') return Buffer.byteLength(raw, 'utf8');
+  if (raw instanceof ArrayBuffer) return raw.byteLength;
+  if (ArrayBuffer.isView(raw)) return raw.byteLength;
+  if (Array.isArray(raw)) return raw.reduce((sum, chunk) =&gt; sum + byteLength(chunk), 0);
+  return 0;
+}
+
+export function decode(raw, limits) {
+  const size = byteLength(raw);
+  if (size &gt; limits.maxMessageBytes) {
+    // ws also enforces maxPayload and will close the socket; this check catches
+    // the case where the limit is configured lower than the socket's.
+    return fail(ERR.TOO_LARGE, `frame of ${size} bytes exceeds the ${limits.maxMessageBytes} byte limit`);
+  }
+  ...</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>String.length</code> is not a size limit</span>
+  <p>String length counts UTF-16 code units; the wire carries UTF-8. 400 copies of
+  <code>&#x3042;</code> are 400 characters and 1,200 bytes, so a naive check turns a 64&nbsp;KiB cap
+  into 192&nbsp;KiB &mdash; worse for four-byte emoji. Measure with
+  <code>Buffer.byteLength(raw, 'utf8')</code>.</p>
+<div class="codewrap"><pre><code class="lang-js">test('the size limit counts BYTES, not characters', () =&gt; {
+  const payload = JSON.stringify({ t: 'presence', docId: 'd', cursor: null, pad: '&#x3042;'.repeat(400) });
+  assert.ok(payload.length &lt; 1024, 'under the limit if you count characters');
+  assert.ok(Buffer.byteLength(payload, 'utf8') &gt; 1024, 'over the limit once encoded');
+  assert.equal(decode(payload, limits).code, ERR.TOO_LARGE);
+});</code></pre></div>
+</div>
+
+<p>Validated ops are <strong>rebuilt</strong>, not passed through: the server persists these
+objects to the Stream and rebroadcasts them verbatim, so a pass-through validator would carry an
+attacker's extra property into every other browser in the document.</p>
+
+<div class="codewrap">
+<div class="codehead">validateOps &mdash; check, then reconstruct<span class="lang">js</span></div>
+<pre><code class="lang-js">if (op.type === 'ins') {
+  const idError = checkId(op.id, `ops[${i}].id`);
+  if (idError) return fail(ERR.BAD_FIELD, idError);
+  if (op.after !== null &amp;&amp; op.after !== undefined) {
+    const afterError = checkId(op.after, `ops[${i}].after`);
+    if (afterError) return fail(ERR.BAD_FIELD, afterError);
+  }
+  if (typeof op.ch !== 'string' || op.ch.length !== 1) {
+    return fail(ERR.BAD_FIELD, `ops[${i}].ch must be a single-character string`);
+  }
+  // Rebuild rather than pass through: this strips any extra properties a
+  // client attached, so nothing unvalidated is ever persisted or rebroadcast.
+  clean[i] = {
+    type: 'ins',
+    id: { s: op.id.s, c: op.id.c },
+    after: op.after == null ? null : { s: op.after.s, c: op.after.c },
+    ch: op.ch,
+  };
+}</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Limit</th><th>Default</th><th>Enforced where</th><th>What it prevents</th></tr></thead>
+<tbody>
+<tr><td><code>MAX_MESSAGE_BYTES</code></td><td>65536</td><td><code>ws</code> <code>maxPayload</code> <em>and</em> <code>decode()</code></td><td>A single frame allocating unbounded memory before you can look at it</td></tr>
+<tr><td><code>MAX_OPS_PER_MESSAGE</code></td><td>512</td><td><code>validateOps</code></td><td>One frame turning into 100k linked-list integrations while the loop is blocked</td></tr>
+<tr><td><code>MAX_MESSAGES_PER_SECOND</code></td><td>200</td><td>Per-connection token bucket</td><td>One client monopolising the event loop</td></tr>
+<tr><td><code>MAX_DOC_ID_LENGTH</code></td><td>64</td><td><code>checkDocId</code> + <code>/^[A-Za-z0-9._-]+$/</code></td><td>Key injection into Redis key names; unbounded key cardinality</td></tr>
+<tr><td><code>LIMITS.SITE_ID_MAX</code></td><td>64</td><td><code>checkSiteId</code></td><td>Client ids double as CRDT site ids &mdash; <code>":"</code> is banned because <code>rga.js</code> builds map keys as <code>${siteId}:${counter}</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Connection lifecycle</h2>
+
+<p>Every socket gets a <code>Connection</code> holding its identity, liveness flag, bounded queue
+and token bucket. Two server settings matter more than they look:</p>
+
+<div class="codewrap">
+<div class="codehead">wsServer.js &mdash; server construction<span class="lang">js</span></div>
+<pre><code class="lang-js">const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  // ws enforces this at the frame level and closes with 1009 before we ever
+  // allocate the full message - the cheapest possible rejection.
+  maxPayload: config.maxMessageBytes,
+  // Compression is off on purpose: permessage-deflate allocates a zlib
+  // context per connection (hundreds of KB) and these frames are small and
+  // frequent, which is the worst case for it.
+  perMessageDeflate: false,
+});</code></pre>
+</div>
+
+<p>A protocol error does not close the socket &mdash; ten of them does. A client sending garbage
+is either an old version or hostile; either way there is a budget.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Close code</th><th>Sent when</th><th>What the client should do</th></tr></thead>
+<tbody>
+<tr><td><code>1001</code> GOING_AWAY</td><td>Graceful shutdown, or a connection arriving after <code>shuttingDown</code> is set</td><td>Reconnect with backoff &mdash; another instance is up</td></tr>
+<tr><td><code>1009</code> TOO_BIG</td><td><code>ws</code> itself, on a frame over <code>maxPayload</code></td><td>Chunk the batch; this is a client bug</td></tr>
+<tr><td><code>4000</code> PROTOCOL_ERROR</td><td>Tenth <code>error</code> frame on one connection</td><td>Stop, do not reconnect in a loop</td></tr>
+<tr><td><code>4001</code> RATE_LIMITED</td><td>Token bucket exhausted repeatedly</td><td>Throttle and back off</td></tr>
+<tr><td><code>4002</code> BACKPRESSURE</td><td>Outbound queue overflowed &mdash; you were too slow to read</td><td>Reconnect and resync from <code>since</code></td></tr>
+<tr><td><code>4003</code> IDLE_TIMEOUT</td><td>No pong within the heartbeat window</td><td>Reconnect; you probably never saw this frame</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Heartbeat, and the zombie connection</h2>
+
+<p><strong>A dead TCP connection is indistinguishable from an idle one.</strong> Both send
+nothing. When a lid closes, when wifi switches to cellular, when a NAT box drops an idle mapping, no
+FIN and no RST arrives, and <code>SO_KEEPALIVE</code> waits two hours before probing. The socket
+sits in <code>readyState === OPEN</code> forever, holding a <code>Connection</code>, a presence
+entry and a broadcast slot.</p>
+
+<p>The fix is to make the peer prove liveness on your schedule. Ping/pong is a protocol-level
+control frame, which is why it beats an application-level <code>{t:'ping'}</code>: every conforming
+client answers automatically, so no client code ships.</p>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="State machine showing the heartbeat liveness flag: a ping sets alive to false, a pong sets it back to true, and a tick that finds the flag still false terminates the socket">
+  <text class="lbl-b" x="14" y="20">One connection, one boolean, one 15 s interval</text>
+
+  <rect class="node-o" x="14" y="36" width="190" height="60" rx="7"/>
+  <text class="lbl-b" x="109" y="60" text-anchor="middle">OPEN &middot; alive = true</text>
+  <text class="lbl-s" x="109" y="78" text-anchor="middle">peer answered the last ping</text>
+
+  <rect class="node-w" x="316" y="36" width="200" height="60" rx="7"/>
+  <text class="lbl-b" x="416" y="60" text-anchor="middle">AWAITING PONG</text>
+  <text class="lbl-s" x="416" y="78" text-anchor="middle">alive = false, ping sent</text>
+
+  <rect class="node-d" x="628" y="36" width="178" height="60" rx="7"/>
+  <text class="lbl-b" x="717" y="60" text-anchor="middle">TERMINATED</text>
+  <text class="lbl-s" x="717" y="78" text-anchor="middle">ws.terminate(), no handshake</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="206" y1="56" x2="314" y2="56" marker-end="url(#p51-ar1)"/>
+  </g>
+  <text class="lbl-s" x="260" y="46" text-anchor="middle">tick</text>
+  <text class="mono" x="260" y="70" text-anchor="middle">alive=false</text>
+  <text class="mono" x="260" y="84" text-anchor="middle">ws.ping()</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="518" y1="56" x2="626" y2="56" marker-end="url(#p51-ar2)"/>
+  </g>
+  <text class="lbl-s" x="572" y="46" text-anchor="middle">next tick and</text>
+  <text class="mono" x="572" y="78" text-anchor="middle">alive === false</text>
+
+  <g color="var(--ok)">
+    <path class="edge-a" d="M 416 100 C 416 150 109 150 109 100" marker-end="url(#p51-ar3)"/>
+  </g>
+  <text class="lbl-s" x="262" y="146" text-anchor="middle">'pong' event &rarr; alive = true, and piggyback the presence heartbeat</text>
+
+  <text class="lbl-s" x="14" y="184">Worst-case detection is TWO intervals (30 s by default): the tick that sends the ping, then the tick that gives up.</text>
+  <text class="lbl-s" x="14" y="202">terminate() rather than close() is deliberate &mdash; close() waits for a close frame from a peer that no longer exists.</text>
+  <text class="lbl-s" x="14" y="226">PRESENCE_TTL_MS (45 s) must exceed this window, or the sweeper evicts clients that are perfectly healthy. config.js refuses to boot otherwise.</text>
+  <defs>
+    <marker id="p51-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p51-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p51-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The heartbeat is not a nicety. Without it the only thing that ever removes a connection
+is a clean close &mdash; and clean closes are exactly the case that was never the problem.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">the whole heartbeat<span class="lang">js</span></div>
+<pre><code class="lang-js">const heartbeat = setInterval(() =&gt; {
+  for (const conn of connections) {
+    if (!conn.alive) {
+      // No pong since the previous tick: the peer is gone even though the
+      // socket still looks open. terminate() skips the close handshake, which
+      // is the point - there is nobody there to complete it.
+      conn.log.info('terminating unresponsive connection', { docId: conn.docId });
+      conn.ws.terminate();
+      continue;
+    }
+    conn.alive = false;
+    try {
+      conn.ws.ping();
+    } catch (err) {
+      conn.log.warn('ping failed', { err });
+    }
+    // Opportunistically drain anything left over from a backpressure episode.
+    conn.flush();
+  }
+}, config.heartbeatIntervalMs);
+heartbeat.unref?.();</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the pong does double duty<span class="lang">js</span></div>
+<pre><code class="lang-js">ws.on('pong', () =&gt; {
+  conn.alive = true;
+  // Piggyback the presence heartbeat on the protocol-level pong: it happens
+  // at exactly the right cadence and costs no extra traffic.
+  if (conn.docId !== null) {
+    presence
+      .heartbeat(conn.docId, conn.presenceRecord())
+      .catch((err) =&gt; conn.log.warn('presence heartbeat failed', { err }));
+  }
+});</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>ws.close()</code> only asks politely</span>
+  <p><code>close()</code> sends a close frame and waits for one back. A peer that is gone never
+  sends it and the socket lingers in <code>CLOSING</code>, so every deliberate close here is backed
+  by a hard timer:</p>
+<div class="codewrap"><pre><code class="lang-js">this.ws.close(code, reason);
+// close() only asks politely. If the peer never replies with a close
+// frame the socket lingers, so back it up with a hard terminate.
+setTimeout(() =&gt; {
+  if (this.ws.readyState !== WebSocket.CLOSED) this.ws.terminate();
+}, 2000).unref?.();</code></pre></div>
+</div>
+
+<h2>Backpressure: the failure mode that eats the heap</h2>
+
+<p><code>ws.send()</code> never blocks and never fails on a slow peer: if the peer stops reading,
+the data piles up in <code>ws.bufferedAmount</code>, in <em>your</em> process memory, with no signal
+to check. Thirty typists produce ~150 <code>ops</code> frames per second at ~150 bytes, so a client
+that stops reading for five minutes holds 6.6&nbsp;MB &mdash; two hundred of them, 1.3&nbsp;GB. The
+symptom is an OOM kill.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Data flow of one outbound message showing the direct send path, the bounded queue path, the drain timer, and the overflow path that closes the connection with code 4002">
+  <text class="lbl-b" x="14" y="20">conn.send(message) &rarr; encode() &rarr; #write(payload)</text>
+
+  <rect class="node" x="14" y="34" width="150" height="54" rx="7"/>
+  <text class="lbl-b" x="89" y="56" text-anchor="middle">#write</text>
+  <text class="lbl-s" x="89" y="74" text-anchor="middle">one decision</text>
+
+  <rect class="node-w" x="216" y="30" width="240" height="62" rx="7"/>
+  <text class="lbl-b" x="336" y="52" text-anchor="middle">queue non-empty</text>
+  <text class="lbl-b" x="336" y="70" text-anchor="middle">OR bufferedAmount &gt; 1 MiB?</text>
+  <text class="lbl-s" x="336" y="86" text-anchor="middle">MAX_BUFFERED_BYTES</text>
+
+  <rect class="node-o" x="540" y="30" width="266" height="62" rx="7"/>
+  <text class="lbl-b" x="673" y="54" text-anchor="middle">NO &rarr; ws.send(payload)</text>
+  <text class="lbl-s" x="673" y="76" text-anchor="middle">the normal path, straight to the socket</text>
+
+  <rect class="node-i" x="216" y="124" width="240" height="62" rx="7"/>
+  <text class="lbl-b" x="336" y="146" text-anchor="middle">YES &rarr; #enqueue</text>
+  <text class="lbl-s" x="336" y="164" text-anchor="middle">bounded array, MAX_OUTBOUND_QUEUE</text>
+  <text class="mono" x="336" y="180" text-anchor="middle">256 frames</text>
+
+  <rect class="node-d" x="540" y="124" width="266" height="62" rx="7"/>
+  <text class="lbl-b" x="673" y="146" text-anchor="middle">queue full &rarr; close(4002)</text>
+  <text class="lbl-s" x="673" y="164" text-anchor="middle">everything it missed is in the op log,</text>
+  <text class="lbl-s" x="673" y="180" text-anchor="middle">so this costs one resync and nothing else</text>
+
+  <rect class="node-a" x="216" y="216" width="240" height="56" rx="7"/>
+  <text class="lbl-b" x="336" y="238" text-anchor="middle">drain timer, 25 ms</text>
+  <text class="lbl-s" x="336" y="256" text-anchor="middle">flush() while bufferedAmount &le; limit</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="166" y1="60" x2="214" y2="60" marker-end="url(#p51-ar4)"/>
+    <line class="edge" x1="458" y1="56" x2="538" y2="56" marker-end="url(#p51-ar5)"/>
+    <line class="edge" x1="336" y1="94" x2="336" y2="122" marker-end="url(#p51-ar6)"/>
+    <line class="edge" x1="336" y1="188" x2="336" y2="214" marker-end="url(#p51-ar7)"/>
+  </g>
+  <g color="var(--dang)">
+    <line class="edge-d" x1="458" y1="152" x2="538" y2="152" marker-end="url(#p51-ar8)"/>
+  </g>
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 216 244 C 120 244 100 140 88 92" marker-end="url(#p51-ar9)"/>
+  </g>
+  <text class="lbl-s" x="14" y="288">Worst case per connection is bounded: 1 MiB in the socket buffer + 256 queued frames. Nothing here can grow without limit.</text>
+  <defs>
+    <marker id="p51-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Disconnecting a slow client sounds harsh. It is the kind thing to do: the client
+reconnects and resyncs in one round trip, and the server survives to serve everyone else.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">the three methods that implement the diagram<span class="lang">js</span></div>
+<pre><code class="lang-js">#write(payload) {
+  if (this.ws.readyState !== WebSocket.OPEN) return false;
+
+  // Once anything is queued, EVERYTHING must queue - otherwise a later
+  // message would overtake an earlier one and the client would see ops out of
+  // order. Ordering is not optional even though the CRDT tolerates reorder:
+  // the sequence numbers would go backwards.
+  if (this.queue.length &gt; 0 || this.ws.bufferedAmount &gt; this.config.maxBufferedBytes) {
+    return this.#enqueue(payload);
+  }
+  this.ws.send(payload);
+  this.metrics.inc('collab_messages_out_total');
+  return true;
+}
+
+#enqueue(payload) {
+  if (this.queue.length &gt;= this.config.maxOutboundQueue) {
+    // The client is hopelessly behind. Everything it is missing is in the op
+    // log, so closing costs it one resync and costs us nothing.
+    this.metrics.inc('collab_backpressure_disconnects_total');
+    this.log.warn('outbound queue overflow, disconnecting slow client', {
+      queued: this.queue.length,
+      bufferedAmount: this.ws.bufferedAmount,
+      docId: this.docId,
+      clientId: this.clientId,
+    });
+    this.close(CLOSE.BACKPRESSURE, 'too slow');
+    return false;
+  }
+  this.queue.push(payload);
+  this.metrics.inc('collab_backpressure_queued_total');
+  this.metrics.add('collab_outbound_queued', 1);
+  this.#scheduleDrain();
+  return true;
+}
+
+/** Move as much of the queue into the socket as its buffer will accept. */
+flush() {
+  if (this.closed || this.ws.readyState !== WebSocket.OPEN) return;
+  while (this.queue.length &gt; 0 &amp;&amp; this.ws.bufferedAmount &lt;= this.config.maxBufferedBytes) {
+    const payload = this.queue.shift();
+    this.metrics.add('collab_outbound_queued', -1);
+    this.ws.send(payload);
+    this.metrics.inc('collab_messages_out_total');
+  }
+  if (this.queue.length &gt; 0) this.#scheduleDrain();
+}</code></pre>
+</div>
+
+<p>Note the two <code>metrics.add('collab_outbound_queued', &plusmn;1)</code> calls. That one is a
+<em>gauge</em>, not a counter: <code>#enqueue</code> raises it and <code>flush()</code> lowers it, so
+the value at scrape time is how many frames are sitting in queues across every connection right now.
+Pair it with the <code>collab_backpressure_queued_total</code> counter next to it &mdash; the counter
+says how often you hit backpressure, the gauge says whether you are still in it.</p>
+
+<div class="box gotcha">
+  <span class="bt">Once anything is queued, everything must queue</span>
+  <p>"Queue only when the buffer is full" reorders the stream: a frame written directly while
+  three sit in the queue arrives <em>first</em>. Ops commute, so the CRDT survives it; the client's
+  <code>lastSeq</code> watermark does not, because it takes <code>Math.max</code> and now believes
+  it has seen 118 when it never received 116. The <code>this.queue.length &gt; 0 ||</code> half of
+  the condition prevents that.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">Alternatives, and why they lose here</span>
+  <p><strong>Drop the oldest frames:</strong> fine for cursors, wrong for ops &mdash; the client
+  cannot detect a hole in a sequence range. <strong>Coalesce into a snapshot:</strong> correct but
+  expensive for a client that may never read again. <strong><code>await</code> the send:</strong>
+  blocking the broadcast loop on one slow socket punishes 29 healthy ones. Only closing bills the
+  client that caused it.</p>
+</div>
+
+<h2>The Redis backplane</h2>
+
+<p>Alice is on instance A, Bob on instance B. Instance A knows Alice's socket and nothing else.
+Without a backplane the system looks healthy and silently splits into two documents: the worst class
+of distributed bug, because there is no error anywhere. Pub/sub is the fix, with two sharp
+edges.</p>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="Architecture showing one keystroke travelling from a browser through instance app1, into the Redis stream and pub/sub channel, out to instance app2 and on to a second browser">
+  <rect class="node-i" x="14"  y="24" width="150" height="44" rx="7"/>
+  <text class="lbl-b" x="89" y="42" text-anchor="middle">browser A</text>
+  <text class="lbl-s" x="89" y="60" text-anchor="middle">RGA replica</text>
+
+  <rect class="node-i" x="656" y="24" width="150" height="44" rx="7"/>
+  <text class="lbl-b" x="731" y="42" text-anchor="middle">browser B</text>
+  <text class="lbl-s" x="731" y="60" text-anchor="middle">RGA replica</text>
+
+  <rect class="node" x="14" y="112" width="230" height="106" rx="7"/>
+  <text class="lbl-b" x="129" y="134" text-anchor="middle">instance app1</text>
+  <text class="mono" x="129" y="154" text-anchor="middle">wsServer &middot; protocol</text>
+  <text class="mono" x="129" y="172" text-anchor="middle">registry.submitOps</text>
+  <text class="mono" x="129" y="190" text-anchor="middle">rga.js (same file)</text>
+  <text class="lbl-s" x="129" y="208" text-anchor="middle">instanceId = inst-a1</text>
+
+  <rect class="node" x="576" y="112" width="230" height="106" rx="7"/>
+  <text class="lbl-b" x="691" y="134" text-anchor="middle">instance app2</text>
+  <text class="mono" x="691" y="154" text-anchor="middle">onBusMessage</text>
+  <text class="mono" x="691" y="172" text-anchor="middle">gap check &rarr; repair</text>
+  <text class="mono" x="691" y="190" text-anchor="middle">rga.js (same file)</text>
+  <text class="lbl-s" x="691" y="208" text-anchor="middle">instanceId = inst-b2</text>
+
+  <rect class="node-a" x="300" y="96" width="220" height="150" rx="7"/>
+  <text class="lbl-b" x="410" y="118" text-anchor="middle">Redis 8</text>
+  <text class="mono" x="410" y="140" text-anchor="middle">:seq   INCR allocator</text>
+  <text class="mono" x="410" y="160" text-anchor="middle">:oplog Stream (durable)</text>
+  <text class="mono" x="410" y="180" text-anchor="middle">:events PubSub (lossy)</text>
+  <text class="mono" x="410" y="200" text-anchor="middle">:presence Hash + ts</text>
+  <text class="mono" x="410" y="220" text-anchor="middle">:snapshot Hash</text>
+  <text class="lbl-s" x="410" y="240" text-anchor="middle">one Lua script makes INCR+XADD atomic</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="89" y1="70" x2="89" y2="110" marker-end="url(#p51-ar10)"/>
+    <line class="edge" x1="246" y1="140" x2="298" y2="140" marker-end="url(#p51-ar11)"/>
+    <line class="edge" x1="246" y1="182" x2="298" y2="182" marker-end="url(#p51-ar12)"/>
+    <line class="edge" x1="522" y1="182" x2="574" y2="182" marker-end="url(#p51-ar13)"/>
+    <line class="edge" x1="731" y1="110" x2="731" y2="70" marker-end="url(#p51-ar14)"/>
+  </g>
+  <text class="lbl-s" x="96" y="94">1. op frame</text>
+  <text class="lbl-s" x="272" y="132" text-anchor="middle">2.</text>
+  <text class="lbl-s" x="272" y="174" text-anchor="middle">4.</text>
+  <text class="lbl-s" x="548" y="174" text-anchor="middle">5.</text>
+  <text class="lbl-s" x="600" y="94">6. ops frame</text>
+
+  <text class="lbl-s" x="14" y="270">2. XADD allocates seq &mdash; durable BEFORE anything else. 3. apply locally + broadcastLocal (author gets an ack, not an echo).</text>
+  <text class="lbl-s" x="14" y="288">4. PUBLISH stamped with instanceId. 5. app2 receives; app1 receives its OWN echo too and drops it on the instanceId check.</text>
+  <text class="lbl-s" x="14" y="306">If step 5 shows seq 118 while app2 sits at 115, it reads 116&ndash;117 from the Stream first. Pub/sub is fanout; the Stream is truth.</text>
+  <defs>
+    <marker id="p51-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Two independent mechanisms with different guarantees: pub/sub gives speed and no
+durability, the Stream gives durability and no push. Each covers exactly the other's gap.</figcaption>
+</figure>
+
+<h3>Edge one: pub/sub echoes to the publisher</h3>
+
+<p>Redis delivers to <em>every</em> subscriber, including the publisher. The originating instance
+already applied and broadcast that message locally, so it must drop its own echo, or every op is
+applied twice and every client receives it twice. The envelope carries the instance id, and
+<code>config.js</code> refuses to boot with a malformed one.</p>
+
+<div class="codewrap">
+<div class="codehead">redisBus.js &mdash; the filter is one line, and it is load-bearing<span class="lang">js</span></div>
+<pre><code class="lang-js">await subscriber.subscribe(channelFor(docId), (raw) =&gt; {
+  let envelope;
+  try {
+    envelope = JSON.parse(raw);
+  } catch (err) {
+    log.error('unparseable bus message', { docId, err });
+    return;
+  }
+  // Drop our own echo - see SELF-FILTERING above.
+  if (envelope.instanceId === config.instanceId) return;
+  metrics.inc('collab_bus_received_total');
+  const current = handlers.get(docId);
+  if (current === undefined) return; // unsubscribed while in flight
+  try {
+    current(envelope);
+  } catch (err) {
+    // A throwing handler must not take down the shared subscriber
+    // connection: one bad document would stop fanout for every document.
+    log.error('bus handler threw', { docId, err });
+  }
+});</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Why a second Redis connection</span>
+  <p>A connection in subscriber mode accepts almost nothing else &mdash; you cannot
+  <code>XADD</code> on it &mdash; so sharing one client deadlocks the first append after the first
+  subscribe. <code>src/index.js</code> uses <code>redis</code> for commands plus
+  <code>redis.duplicate()</code> for <code>SUBSCRIBE</code>, and <code>/healthz</code> reports both.</p>
+</div>
+
+<h3>Edge two: pub/sub has no delivery guarantee at all</h3>
+
+<p>Fire and forget. If a subscriber is disconnected for 200&nbsp;ms &mdash; a failover, a blip, a
+paused event loop &mdash; those messages are gone, queued nowhere, with nothing to tell you. So the
+Stream is the durable record, every envelope carries the sequence it assigned, and a receiver that
+spots a hole reads it back.</p>
+
+<div class="codewrap">
+<div class="codehead">registry.js &mdash; gap detection and repair<span class="lang">js</span></div>
+<pre><code class="lang-js">if (envelope.type === 'ops') {
+  if (envelope.seq &gt; doc.seq + 1) {
+    metrics.inc('collab_oplog_gap_fills_total');
+    log.warn('sequence gap on the bus, repairing from the op log', {
+      docId, have: doc.seq, received: envelope.seq, missing: envelope.seq - doc.seq - 1,
+    });
+    try {
+      const missing = await oplog.range(docId, doc.seq, envelope.seq - doc.seq);
+      for (const logEntry of missing) {
+        const applied = doc.applyOps(logEntry.ops);
+        doc.advanceTo(logEntry.seq);
+        if (applied.length &gt; 0) {
+          // Local sockets missed these too, so replay them downstream.
+          broadcastLocal(docId, opsMessage({ docId, seq: logEntry.seq, ops: logEntry.ops, clientId: logEntry.clientId }));
+        }
+      }
+    } catch (err) {
+      metrics.inc('collab_redis_errors_total');
+      // Not fatal: ops commute, so applying the live message now and
+      // repairing later still converges once the missing ops arrive by any
+      // route (another gap fill, or a client resync).
+      log.error('gap repair failed', { docId, err });
+    }
+  }
+  ...</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The watermark is what makes a dropped op permanent</span>
+  <p>Without gap repair the CRDT does not crash; it is missing a character. The fatal line is
+  <code>doc.advanceTo(envelope.seq)</code>: the watermark jumps past the hole, so no later sync ever
+  asks for those ops and the document is wrong <em>forever</em>. Not "we occasionally drop an edit"
+  but "we permanently corrupt documents in proportion to Redis flappiness".</p>
+</div>
+
+<h3>Sequence numbers, and the race the Lua script closes</h3>
+
+<p>The Stream could assign its own <code>&lt;millis&gt;-&lt;n&gt;</code> ids, but a client would
+then have to echo back an opaque two-part token. Instead <code>INCR</code> allocates a monotonic
+integer used as the stream id, so "everything after 4210" is
+<code>XRANGE key (4210-0 + COUNT n</code> &mdash; O(log n), and trim-proof. The cost is a
+race.</p>
+
+<div class="codewrap">
+<div class="codehead">oplog.js &mdash; INCR and XADD in one atomic script<span class="lang">lua</span></div>
+<pre><code class="lang-lua">-- KEYS[1] = sequence counter, KEYS[2] = stream
+-- ARGV[1] = approximate MAXLEN, ARGV[2] = JSON payload
+local seq = redis.call('INCR', KEYS[1])
+if seq == 1 then
+  -- Reconciliation: the counter is volatile-looking state while the stream is
+  -- durable. If the counter was lost (flushed, expired, restored from an older
+  -- dump) but the stream survived, restarting at 1 would make XADD fail
+  -- forever with "equal or smaller ID". Resume above the last stream id.
+  local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+  if last and last[1] then
+    local lastSeq = tonumber(string.match(last[1][1], '^(%d+)')) or 0
+    if lastSeq &gt;= seq then
+      seq = lastSeq + 1
+      redis.call('SET', KEYS[1], tostring(seq))
+    end
+  end
+end
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], tostring(seq) .. '-0', 'p', ARGV[2])
+return seq</code></pre>
+</div>
+
+<p>Two instances appending at once both <code>INCR</code> &mdash; getting 11 and 12 &mdash; then
+both <code>XADD</code>. If B's (12) lands first, A's (11) is <em>rejected</em>: stream ids must
+strictly increase. Redis runs scripts to completion without interleaving, so ids are allocated and
+used in the same order. A retry loop around <code>XADD *</code> loses the one-id-per-entry property
+clients depend on.</p>
+
+<div class="codewrap">
+<div class="codehead">registry.submitOps &mdash; the ordering IS the design<span class="lang">js</span></div>
+<pre><code class="lang-js">async submitOps(docId, ops, clientId) {
+  const doc = await load(docId);
+
+  // 1. Durable first. This also allocates the sequence number.
+  const seq = await oplog.append(docId, { ops, clientId });
+
+  // 2. Local state.
+  const applied = doc.applyOps(ops);
+  doc.advanceTo(seq);
+  metrics.inc('collab_ops_applied_total', applied.length);
+  metrics.inc('collab_ops_duplicate_total', ops.length - applied.length);
+
+  // 3. Sockets on this instance (the author gets an ack instead of an echo:
+  //    it already applied these ops optimistically).
+  broadcastLocal(docId, opsMessage({ docId, seq, ops, clientId }), clientId);
+
+  // 4. Every other instance. Note we send the full batch, not just what
+  //    changed here - another instance may be missing exactly the ops we
+  //    deduplicated.
+  await bus.publish(docId, { type: 'ops', docId, seq, ops, clientId });
+
+  // 5. Snapshot cadence, off the critical path.
+  this.maybeSnapshot(docId).catch((err) =&gt; log.error('snapshot failed', { docId, err }));
+
+  return { seq, applied: applied.length };
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Swap steps 1 and 4 and every test still passes</span>
+  <p>Publishing before appending is faster and looks harmless. Kill the process between the two
+  and the edit exists in every other browser but not in the log; reload from Redis and it is gone.
+  This presents weeks later as "the document was fine until someone restarted the server", with no
+  way to reconstruct what happened.</p>
+</div>
+
+<h2>Catch-up: delta or snapshot</h2>
+
+<p>The client keeps one number, <code>lastSeq</code>, and sends it as <code>since</code> on every
+join. One decision covers two failures: a client away for four hours wants one 40&nbsp;KB snapshot,
+not 90,000 ops, and a client whose position has been <em>trimmed out</em> of the log cannot be
+served a delta at all, however small the gap looks.</p>
+
+<figure>
+<svg viewBox="0 0 820 280" role="img" aria-label="Decision flow for a reconnecting client: the server compares the requested sequence against the current watermark and the contiguity of the op log to choose between a delta replay and a snapshot">
+  <rect class="node-i" x="14" y="24" width="200" height="58" rx="7"/>
+  <text class="lbl-b" x="114" y="46" text-anchor="middle">join / sync</text>
+  <text class="mono" x="114" y="66" text-anchor="middle">{ since: 4210 }</text>
+
+  <rect class="node-w" x="272" y="18" width="250" height="70" rx="7"/>
+  <text class="lbl-b" x="397" y="40" text-anchor="middle">doc.seq - since</text>
+  <text class="lbl-b" x="397" y="58" text-anchor="middle">&le; MAX_REPLAY_OPS (2000)?</text>
+  <text class="lbl-s" x="397" y="78" text-anchor="middle">is the gap even worth replaying?</text>
+
+  <rect class="node-w" x="272" y="116" width="250" height="70" rx="7"/>
+  <text class="lbl-b" x="397" y="138" text-anchor="middle">entries[0].seq === since + 1?</text>
+  <text class="lbl-s" x="397" y="158" text-anchor="middle">was the log trimmed past this client?</text>
+  <text class="lbl-s" x="397" y="176" text-anchor="middle">an empty range also counts as contiguous</text>
+
+  <rect class="node-o" x="580" y="116" width="226" height="70" rx="7"/>
+  <text class="lbl-b" x="693" y="140" text-anchor="middle">mode: 'delta'</text>
+  <text class="lbl-s" x="693" y="160" text-anchor="middle">ops[], seq = last entry sent</text>
+  <text class="lbl-s" x="693" y="178" text-anchor="middle">never higher than what was sent</text>
+
+  <rect class="node-d" x="580" y="216" width="226" height="56" rx="7"/>
+  <text class="lbl-b" x="693" y="240" text-anchor="middle">mode: 'snapshot'</text>
+  <text class="lbl-s" x="693" y="258" text-anchor="middle">whole RGA state + text, always possible</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="216" y1="52" x2="270" y2="52" marker-end="url(#p51-ar15)"/>
+    <line class="edge" x1="397" y1="90" x2="397" y2="114" marker-end="url(#p51-ar16)"/>
+    <line class="edge" x1="524" y1="150" x2="578" y2="150" marker-end="url(#p51-ar17)"/>
+  </g>
+  <text class="lbl-s" x="410" y="106">yes</text>
+  <text class="lbl-s" x="548" y="142" text-anchor="middle">yes</text>
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 524 52 C 620 52 660 130 690 214" marker-end="url(#p51-ar18)"/>
+    <path class="edge-d" d="M 397 188 C 397 236 520 244 578 244" marker-end="url(#p51-ar19)"/>
+  </g>
+  <text class="lbl-s" x="560" y="46">no &mdash; too far behind</text>
+  <text class="lbl-s" x="470" y="234" text-anchor="middle">no &mdash; log trimmed</text>
+  <defs>
+    <marker id="p51-ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p51-ar19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>Snapshot is the fallback that is always correct, so every branch that cannot prove a
+delta is safe falls into it. Correct-and-expensive beats cheap-and-sometimes-wrong.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">registry.catchUp<span class="lang">js</span></div>
+<pre><code class="lang-js">async catchUp(docId, since) {
+  const doc = await load(docId);
+
+  if (Number.isInteger(since) &amp;&amp; since &gt;= 0 &amp;&amp; doc.seq - since &lt;= config.maxReplayOps) {
+    const entries = await oplog.range(docId, since, config.maxReplayOps);
+    const contiguous = entries.length === 0 || entries[0].seq === since + 1;
+    if (contiguous) {
+      const ops = [];
+      for (const logEntry of entries) ops.push(...logEntry.ops);
+      metrics.inc('collab_sync_delta_total');
+      return {
+        mode: 'delta',
+        // Never claim a higher watermark than the ops we are actually
+        // sending: if COUNT capped the page, the client must ask again.
+        seq: entries.length &gt; 0 ? entries.at(-1).seq : doc.seq,
+        ops,
+      };
+    }
+    log.debug('delta impossible, log was trimmed past the client position', { docId, since });
+  }
+
+  metrics.inc('collab_sync_snapshot_total');
+  const snap = doc.snapshot();
+  return { mode: 'snapshot', seq: snap.seq, snapshot: snap.state, text: snap.text };
+}</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>delta</code></th><th><code>snapshot</code></th></tr></thead>
+<tbody>
+<tr><td>Chosen when</td><td><code>doc.seq - since &le; MAX_REPLAY_OPS</code> <em>and</em> the log still starts at <code>since + 1</code></td><td>Anything else, including <code>since = null</code> on a first join</td></tr>
+<tr><td>Payload</td><td>The ops themselves, one per character</td><td>The whole RGA state &mdash; nodes, tombstones and all &mdash; plus the rendered text</td></tr>
+<tr><td>Client action</td><td><code>rga.apply(msg.ops)</code></td><td><code>rga.restore(msg.snapshot)</code>, discarding local state</td></tr>
+<tr><td>Cost profile</td><td>Linear in ops missed; ~150 bytes each</td><td>Linear in document size, independent of absence length</td></tr>
+<tr><td>Failure if you got it wrong</td><td>A silently incomplete document &mdash; the reason for the contiguity check</td><td>Wasted bandwidth only</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Never acknowledge a sequence you did not send</span>
+  <p><code>seq: entries.at(-1).seq</code>, not <code>doc.seq</code>. If <code>COUNT</code> capped
+  the page at 2,000 while the document is 3,000 ahead, <code>doc.seq</code> tells the client it is
+  caught up while it is missing 1,000 ops, and its watermark then guarantees it never asks for them.
+  The honest number costs one extra round trip.</p>
+</div>
+
+<h2>Presence: heartbeats, TTL and the sweeper</h2>
+
+<p>One Redis hash per document, <code>clientId &rarr; JSON record</code> &mdash; a hash because
+each entry carries a payload (name, colour, cursor) that changes far more often than membership.
+Joining is trivial; <strong>leaving is the hard part</strong>, for the same reason the heartbeat
+exists. Every record carries a timestamp the pong refreshes, and each instance sweeps its own
+documents.</p>
+
+<div class="codewrap">
+<div class="codehead">presence.js &mdash; the sweep, and HDEL as the arbiter<span class="lang">js</span></div>
+<pre><code class="lang-js">async sweep(docIds) {
+  const cutoff = Date.now() - config.presenceTtlMs;
+  let expired = 0;
+  for (const docId of docIds) {
+    const k = redisKeys(config.keyPrefix, docId);
+    ...
+    for (const [clientId, json] of Object.entries(raw)) {
+      let entry;
+      try { entry = JSON.parse(json); } catch { entry = { ts: 0 }; }
+      if (entry.ts &gt; cutoff) continue;
+      // Atomic claim: exactly one instance gets removed === 1.
+      const removed = await redis.hDel(k.presence, clientId);
+      if (removed === 1) {
+        expired++;
+        metrics.inc('collab_presence_expired_total');
+        log.info('expired stale presence', { docId, clientId, ageMs: Date.now() - entry.ts });
+        await fanout(docId, 'leave', { clientId, instanceId: entry.instanceId ?? null });
+      }
+    }
+  }
+  metrics.inc('collab_presence_sweeps_total');
+  return expired;
+}</code></pre>
+</div>
+
+<p>Every instance sweeps, so two can call the same entry stale in the same instant.
+<code>HDEL</code> returns the number of fields it removed, and only the instance that gets
+<code>1</code> broadcasts the leave &mdash; "who may announce this?" as an atomic compare-and-set,
+with no lock and no leader election.</p>
+
+<div class="box note">
+  <span class="bt">Why not <code>HEXPIRE</code>, which Redis 8 certainly has</span>
+  <p>Per-field TTLs (Redis 7.4+) would delete this whole function, and are deliberately unused:
+  when Redis removes a field, <strong>nobody is left to broadcast the leave</strong>, and every
+  client keeps rendering a cursor for someone who left ten minutes ago. The sweep has to be
+  observable. A hash-level <code>EXPIRE</code> at four TTLs still guards against leaked keys.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">A heartbeat is not news</span>
+  <p><code>presence.heartbeat()</code> writes the record and does <em>not</em> fan out;
+  <code>update()</code> does both. Get it wrong and 300 clients heartbeating every 15&nbsp;s produce
+  300 pub/sub messages fanned out to 300 sockets each &mdash; 6,000 frames per second saying "still
+  here", which is exactly the traffic that triggers the backpressure path above.</p>
+</div>
+
+<h2>Graceful shutdown</h2>
+
+<p>Signals become an <code>AbortController</code> rather than doing the work inside the handler
+&mdash; Node's answer to <code>signal.NotifyContext</code> &mdash; with a second-signal escape hatch
+so an operator whose shutdown has wedged gets their terminal back. Then four steps, in an order
+where reversing any two loses data or hangs.</p>
+
+<div class="codewrap">
+<div class="codehead">index.js &mdash; stop new work, finish in-flight work, release resources<span class="lang">js</span></div>
+<pre><code class="lang-js">async function close() {
+  if (closed) return;
+  closed = true;
+  const started = Date.now();
+
+  // Order matters: stop new work, then finish in-flight work, then release
+  // resources. Reversing any two of these loses data or hangs.
+  await wsServer.close(); // 1. hang up sockets with 1001 "going away"
+  await new Promise((resolve) =&gt; server.close(resolve)); // 2. stop accepting
+  presence.stopSweeper();
+  await registry.closeAll(); // 3. final snapshots, unsubscribe
+  await bus.close();
+  await Promise.allSettled([redis.quit(), subscriber.quit()]); // 4. drain and close
+  logger.info('shutdown complete', { ms: Date.now() - started });
+}</code></pre>
+</div>
+
+<p>Draining means closing sockets with <code>1001 GOING_AWAY</code> rather than dropping them. The
+client reads the code, waits with jittered backoff and rejoins with <code>since</code>, so a deploy
+costs each user one delta replay instead of a lost paragraph. Jitter is not decoration: without it
+every client reconnects in lockstep and knocks over the instance that just came up.</p>
+
+<div class="codewrap">
+<div class="codehead">wsServer.close(), and the client side of the same contract<span class="lang">js</span></div>
+<pre><code class="lang-js">// server: refuse new sockets, then hang up the existing ones
+async close() {
+  shuttingDown = true;
+  clearInterval(heartbeat);
+  for (const conn of connections) conn.close(CLOSE.GOING_AWAY, 'server shutting down');
+  await new Promise((resolve) =&gt; wss.close(() =&gt; resolve()));
+}
+
+// client/client.js: 'close' is the only place reconnection is handled
+ws.addEventListener('close', (event) =&gt; {
+  state.connected = false;
+  state.ws = null;
+  if (state.closing) return;
+  state.reconnects++;
+  // Exponential backoff with jitter. Without jitter, every client kicked off
+  // by a deploy reconnects in lockstep and knocks the new instance over.
+  const wait = Math.min(RECONNECT_MAX_MS, state.backoff) * (0.5 + Math.random());
+  state.backoff = Math.min(RECONNECT_MAX_MS, state.backoff * 2);
+  setTimeout(connect, wait);
+});</code></pre>
+</div>
+
+<div class="box warn">
+  <span class="bt">The forced-exit timer is not optional either</span>
+  <p><code>SHUTDOWN_GRACE_MS</code> (10&nbsp;s) arms a <code>setTimeout</code> calling
+  <code>process.exit(1)</code>. If a Redis command never resolves, <code>close()</code> awaits
+  forever and Kubernetes SIGKILLs you anyway, losing the snapshots you were writing. Failing fast
+  leaves a log line saying which step hung.</p>
+</div>
+
+<h2>The test that proves it</h2>
+
+<p>Every unit test here can pass while the system is broken in the only way that matters, because
+that failure lives in the wiring. So <code>test/integration.test.js</code> starts <strong>two
+complete server instances inside one process</strong> against one Redis, and connects one client to
+each &mdash; possible only because <code>startServer()</code> takes its environment as an argument
+and holds no singletons.</p>
+
+<div class="codewrap">
+<div class="codehead">the assertions that pin down the backplane<span class="lang">js</span></div>
+<pre><code class="lang-js">await t.test('an edit on instance A reaches a client on instance B', async () =&gt; {
+  alice.type(0, 'hello');
+  await waitFor(() =&gt; bob.text === 'hello', `bob to receive "hello" (has ${JSON.stringify(bob.text)})`);
+  assert.equal(alice.text, 'hello');
+
+  // Proof that it went through Redis rather than some local shortcut: the
+  // instance that did not originate the op consumed it from the backplane.
+  assert.ok(b.metrics.get('collab_bus_received_total') &gt; 0, 'instance B consumed messages from the backplane');
+
+  // Proof of self-filtering: Redis pub/sub echoes to the publisher too. If
+  // instance A had applied its own message a second time, every one of those
+  // five ops would have been counted as a duplicate.
+  assert.equal(a.metrics.get('collab_ops_applied_total'), 5, 'A applied "hello" exactly once');
+  assert.equal(a.metrics.get('collab_ops_duplicate_total'), 0, 'A never re-applied its own echo');
+  assert.equal(b.metrics.get('collab_ops_applied_total'), 5, 'B applied the same five ops, from Redis');
+});
+
+await t.test('concurrent edits from both instances converge', async () =&gt; {
+  // Both clients edit at the same instant without seeing each other first.
+  alice.type(5, ' from alice');
+  bob.type(0, 'BOB SAYS: ');
+
+  await waitFor(() =&gt; alice.text === bob.text, () =&gt; `convergence (a=${alice.text} b=${bob.text})`, 10_000);
+  ...
+  // The servers hold the same document too - they are replicas, not relays.
+  await waitFor(async () =&gt; {
+    const docA = a.registry.stats().find((d) =&gt; d.docId === docId);
+    const docB = b.registry.stats().find((d) =&gt; d.docId === docId);
+    return docA &amp;&amp; docB &amp;&amp; docA.length === converged.length &amp;&amp; docB.length === converged.length;
+  }, 'both server documents to match the clients');
+
+  const docA = await a.registry.load(docId);
+  const docB = await b.registry.load(docId);
+  assert.equal(docA.text, converged, 'instance A server-side document');
+  assert.equal(docB.text, converged, 'instance B server-side document');
+});</code></pre>
+</div>
+
+<p>Note the shape of the convergence assertion: not a specific string, but that both replicas
+agree <em>and</em> all three inserts survived. An exact expected result would encode one interleaving
+and turn every timing change into a red test. The environment is driven deliberately too
+(<code>MAX_REPLAY_OPS: '8'</code>, <code>SNAPSHOT_EVERY_OPS: '5'</code>) so snapshot, delta and
+sweeper all fire in seconds.</p>
+
+<p>The server-side half is <em>polled</em> before it is asserted, and that is not belt-and-braces.
+Two clients agreeing only says both clients have everything; it says nothing about when each
+instance finished applying what it consumed from the bus. Asserting <code>docA.text</code> the
+instant the clients match races that, and an intermittent red here is indistinguishable from a real
+convergence bug &mdash; the most expensive kind of flake. So the test waits on the cheap synchronous
+<code>registry.stats()</code> view until both instances report the converged length, then loads the
+documents and compares the text exactly.</p>
+
+<details><summary>The zombie test: presence left behind by a crashed instance</summary>
+<div class="dbody">
+<p>The one leave path with nobody to notice it: an instance SIGKILLed, its clients left in the
+presence hash.</p>
+<div class="codewrap"><pre><code class="lang-js">await cleanup.hSet(presenceKey, 'zombie', JSON.stringify({
+  clientId: 'zombie', name: 'Zombie', color: '#000000', cursor: null,
+  instanceId: 'instance-that-died',
+  ts: Date.now() - 60_000, // far older than PRESENCE_TTL_MS
+}));
+
+await waitFor(async () =&gt; {
+  const roster = await cleanup.hGetAll(presenceKey);
+  return roster.zombie === undefined;
+}, 'the sweeper to remove the zombie entry', 15_000);
+
+const expiredAfter = a.metrics.get('collab_presence_expired_total') + b.metrics.get('collab_presence_expired_total');
+assert.ok(expiredAfter &gt; expiredBefore, 'exactly one instance claimed and counted the expiry');
+assert.equal(expiredAfter - expiredBefore, 1, 'and only one - HDEL is the arbiter, so there is no double report');</code></pre></div>
+<p><code>&gt; expiredBefore</code> proves the sweeper works, <code>=== 1</code> that arbitration
+does: two instances both broadcasting pass the first and fail the second.</p>
+</div>
+</details>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>A dead TCP connection and an idle one are identical from userspace. A protocol-level ping
+  with a two-tick liveness flag is the only thing separating them.</li>
+  <li><code>ws.send()</code> never blocks and never fails on a slow peer, so an unmonitored
+  <code>bufferedAmount</code> is an unbounded memory leak. Bound it &mdash; 1&nbsp;MiB buffered, 256
+  frames queued, then close with <code>4002</code>.</li>
+  <li>Once anything is queued, everything must queue: bypassing it reorders the stream, and the
+  client's <code>Math.max</code> watermark then permanently hides what it skipped.</li>
+  <li>Redis pub/sub delivers to the publisher too, and to nobody at all if a subscriber blinks.
+  The instance-id filter fixes the first, gap repair against the Stream the second. Fanout gives
+  speed, the log gives truth.</li>
+  <li>Append to the durable log <em>before</em> publishing and before applying. Reversing it passes
+  every test and loses edits on the one crash that happens in between.</li>
+  <li>Reconnect on a single integer: delta when the log contains everything after it contiguously,
+  snapshot otherwise &mdash; and never acknowledge a sequence higher than the ops you sent.</li>
+  <li>Presence expiry must be <em>observable</em>: <code>HEXPIRE</code> removes the field with
+  nobody left to broadcast the leave. Sweep it yourself and let <code>HDEL</code> elect the
+  announcer.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="01-design.html"><span class="lb">Previous</span>CRDTs &amp; the convergence problem</a>
+  <a href="03-running.html"><span class="lb">Next</span>Running, testing &amp; exercises</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

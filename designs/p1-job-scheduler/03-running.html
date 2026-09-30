@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Running, testing &amp; exercises &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Distributed Job Scheduler &amp; Workflow Engine</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Running, testing &amp; exercises</h1>
+<p class="lede">The exact commands to bring the cluster up, submit work and watch it execute &mdash; then
+three deliberate failures (a SIGKILLed worker, a handler that never succeeds, a dead database) with
+the log lines and SQL that prove the recovery machinery works. Ends with twelve exercises that each
+break one mechanism on purpose.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">operations</span>
+</div>
+
+<h2>Prerequisites and what the stack costs</h2>
+
+<p>Everything below assumes you already have Docker, a JDK and Maven. The versions are not
+negotiable in one place and flexible in another &mdash; the JDK matters, the rest does not.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Version</th><th>Why exactly this</th></tr></thead>
+<tbody>
+<tr><td>JDK</td><td><strong>17</strong></td><td><code>pom.xml</code> pins <code>java.version</code> to 17 and the Dockerfile builds on <code>maven:3.9-eclipse-temurin-17</code>. Nothing in the code needs 21 &mdash; <code>JobController</code> even open-codes a clamp with a comment saying <code>Math.clamp</code> is Java 21. Building on 21 works; running the fat jar on 17 after compiling on 21 does not.</td></tr>
+<tr><td>Maven</td><td>3.9+</td><td>Only for <code>package</code> and <code>test</code>. The Docker build has its own.</td></tr>
+<tr><td>Docker</td><td>Compose v2</td><td>Every target uses <code>docker compose</code> (space, not hyphen). Also required for <code>make test</code>: Testcontainers starts a real <code>postgres:16-alpine</code>, because <code>SKIP LOCKED</code>, advisory locks and partial indexes have no honest in-memory equivalent.</td></tr>
+<tr><td><code>make</code></td><td>GNU make</td><td>Optional. On Windows run it from Git Bash or WSL &mdash; every target is deliberately a one-liner you can copy out.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Images pulled: <code>postgres:16-alpine</code>, <code>redis:8-alpine</code>. Ports taken:
+<strong>15432</strong>, <strong>16379</strong>, <strong>18080</strong> (scheduler-a) and
+<strong>18081</strong> (scheduler-b) &mdash; deliberately not the defaults, so the stack does not
+collide with a PostgreSQL, Redis or MySQL installed natively on the machine, and so several of
+these projects can run at once. <em>Inside</em> the compose network nothing moved: the app still
+dials <code>postgres:5432</code> and <code>redis:6379</code>, and each container still listens on
+<code>8080</code>. Only the published host side is renumbered.
+Two profiles exist: the default starts only the two
+datastores, and <code>--profile cluster</code> additionally builds and starts two identical
+application instances.</p>
+
+<figure>
+<svg viewBox="0 0 820 350" role="img" aria-label="Two identical scheduler instances, each running five scheduled loops and the REST API, both writing to one PostgreSQL database, with Redis holding only an advisory node registry">
+  <text class="lbl-b" x="14" y="18">Every instance runs all five loops. Nothing is a singleton except one tick&rsquo;s advisory lock.</text>
+
+  <rect class="node-a" x="14" y="30" width="340" height="160" rx="7"/>
+  <text class="lbl-b" x="184" y="52" text-anchor="middle">scheduler-a &nbsp;:18080</text>
+  <text class="mono" x="28" y="76">CronTicker     1s    advisory lock</text>
+  <text class="mono" x="28" y="94">WorkerLoop     500ms claim + dispatch</text>
+  <text class="mono" x="28" y="112">WorkerLoop     5s    heartbeat</text>
+  <text class="mono" x="28" y="130">OrphanSweeper  10s   reclaim expired</text>
+  <text class="mono" x="28" y="148">DagResolver    2s    promote / cancel</text>
+  <text class="mono" x="28" y="172">JobController  REST  /api/**</text>
+
+  <rect class="node-a" x="370" y="30" width="340" height="160" rx="7"/>
+  <text class="lbl-b" x="540" y="52" text-anchor="middle">scheduler-b &nbsp;:18081</text>
+  <text class="lbl-s" x="384" y="80">byte-identical image, different SCHEDULER_NODEID</text>
+  <text class="lbl-s" x="384" y="100">no control-plane tier, no membership protocol,</text>
+  <text class="lbl-s" x="384" y="120">no leader between ticks &mdash; whoever wins the</text>
+  <text class="lbl-s" x="384" y="140">next advisory lock is the next leader</text>
+  <text class="lbl-s" x="384" y="172">scale to five and nothing in the code changes</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="184" y1="192" x2="252" y2="236" marker-end="url(#p12-ar1)"/>
+    <line class="edge-a" x1="540" y1="192" x2="420" y2="236" marker-end="url(#p12-ar2)"/>
+  </g>
+  <text class="lbl-s" x="118" y="222">claim &middot; tick &middot; sweep</text>
+  <text class="lbl-s" x="560" y="222">heartbeat &middot; complete</text>
+
+  <g color="var(--border-strong)">
+    <line class="dash" x1="618" y1="192" x2="638" y2="236" marker-end="url(#p12-ar3)"/>
+  </g>
+
+  <rect class="node-i" x="180" y="240" width="310" height="98" rx="7"/>
+  <text class="lbl-b" x="335" y="262" text-anchor="middle">PostgreSQL 16 &mdash; all coordination</text>
+  <text class="mono" x="196" y="284">job_execution &nbsp;&larr; the queue + the leases</text>
+  <text class="mono" x="196" y="302">job &middot; job_dependency</text>
+  <text class="mono" x="196" y="320">processed_execution &larr; idempotency ledger</text>
+
+  <rect class="node" x="520" y="240" width="250" height="70" rx="7"/>
+  <text class="lbl-b" x="645" y="262" text-anchor="middle">Redis 8 &mdash; advisory only</text>
+  <text class="lbl-s" x="645" y="280" text-anchor="middle">ZSET scheduler:nodes (live peers)</text>
+  <text class="lbl-s" x="645" y="298" text-anchor="middle">its health indicator is disabled on purpose</text>
+
+  <text class="lbl-s" x="14" y="336">Two systems that can disagree about who owns a row is the failure mode this design exists to avoid.</text>
+  <defs>
+    <marker id="p12-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p12-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p12-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Redis is reachable from both instances and holds nothing either of them needs. Kill it
+and the only thing that changes is that <code>liveNodes</code> comes back empty.</figcaption>
+</figure>
+
+<h2>The first ninety seconds</h2>
+
+<div class="codewrap">
+<div class="codehead">bring up the datastores, then one instance<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make up      # docker compose up -d --wait postgres redis
+make run     # mvn spring-boot:run  -&gt; one instance on :18080</code></pre>
+</div>
+
+<p><code>--wait</code> is doing real work: <code>pg_isready -U scheduler -d scheduler</code> returns 0
+only once the server accepts connections <em>for that database and role</em>, which is strictly
+stronger than "port 5432 is open". Without it the first thing you see is Flyway failing against a
+server still running its init scripts. There is no separate migration step &mdash; Flyway runs
+inside the application at startup:</p>
+
+<div class="codewrap">
+<div class="codehead">what a clean first boot prints<span class="lang">text</span></div>
+<pre><code class="lang-text">o.f.c.i.database.base.BaseDatabaseType   : Database: jdbc:postgresql://localhost:15432/scheduler (PostgreSQL 16.13)
+o.f.core.internal.command.DbValidate     : Successfully validated 1 migration (execution time 00:00.021s)
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - schema"
+o.f.core.internal.command.DbMigrate      : Successfully applied 1 migration to schema "public" (execution time 00:00.084s)
+c.a.scheduler.worker.WorkerLoop          : worker 'my-laptop' ready: 8 threads, capacity 16, handlers [http, logging]
+o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat started on port 18080 (http)</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Two local instances silently share one node id</span>
+  <p><code>application.yml</code> sets <code>node-id: ${HOSTNAME:${random.uuid}}</code>. Inside a
+  container <code>HOSTNAME</code> is the container id, so the two compose instances are distinct.
+  On your laptop <code>HOSTNAME</code> is your laptop, so <em>two</em> local
+  <code>mvn spring-boot:run</code> processes both call themselves <code>my-laptop</code> &mdash; and
+  the heartbeat statement is scoped by <code>claimed_by = :workerId</code>, which means each
+  process happily renews the other's leases for work it is not doing. The orphan sweeper then never
+  fires, and a genuinely dead instance leaks its rows forever. Run the second local instance with
+  <code>-Dspring-boot.run.arguments=--scheduler.node-id=local-b --server.port=18081</code>, or just
+  use <code>make up-cluster</code>.</p>
+</div>
+
+<h2>Submitting a job and watching it execute</h2>
+
+<p><code>make seed</code> creates six jobs in one go: a ten-second cron job, a job that fails
+its first three attempts, and a four-node diamond DAG. Here is the cron one on its own, because the
+response shows the two fields worth understanding.</p>
+
+<div class="codewrap">
+<div class="codehead">create a cron job<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -sS -X POST localhost:18080/api/jobs -H 'Content-Type: application/json' -d '{
+  "name": "heartbeat-every-10s",
+  "type": "CRON",
+  "cronExpr": "*/10 * * * * *",
+  "payload": {"handler": "logging", "message": "tick"}
+}' | jq</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">201 Created &mdash; nulls are omitted (Jackson NON_NULL)<span class="lang">json</span></div>
+<pre><code class="lang-json">{
+  "id": "b4b6b0a2-4f7e-4a6d-9c66-0f2a1f2b41c9",
+  "name": "heartbeat-every-10s",
+  "type": "CRON",
+  "cronExpr": "*/10 * * * * *",
+  "payload": { "handler": "logging", "message": "tick" },
+  "handler": "logging",
+  "maxAttempts": 3,
+  "timeoutMs": 30000,
+  "enabled": true,
+  "dependsOn": [],
+  "createdAt": "2026-09-02T10:15:30.412Z",
+  "updatedAt": "2026-09-02T10:15:30.412Z"
+}</code></pre>
+</div>
+
+<p><code>handler</code> is echoed back even though it is not a column &mdash; it is derived from the
+reserved <code>handler</code> key in the payload, and "which handler will actually run?" is the
+first question you ask when a job misbehaves. <code>maxAttempts: 3</code> is the default applied in
+<code>CreateJobRequest.withDefaults()</code>, not a database default reflected back.</p>
+
+<div class="box gotcha">
+  <span class="bt">Spring cron has six fields, and the five-field form is rejected</span>
+  <p><code>"*/10 * * * *"</code> gets you a 400 with a message naming all six fields. That is
+  deliberate: <code>JobController.validateCron</code> calls
+  <code>CronExpression.isValidExpression</code> at create time rather than at tick time, so a typo
+  is an error the author sees immediately instead of a job that looks scheduled and silently never
+  fires. Note also that a five-field expression is not <em>invalid</em> in every cron dialect &mdash;
+  it just means something completely different, which is the worse failure.</p>
+</div>
+
+<p>Ten seconds later, nothing has run &mdash; but six rows exist. That surprises people, so it is
+worth seeing:</p>
+
+<div class="codewrap">
+<div class="codehead">make psql, then look at the queue<span class="lang">sql</span></div>
+<pre><code class="lang-sql">SELECT status, count(*), min(run_at), max(run_at)
+  FROM job_execution
+ WHERE job_id = (SELECT id FROM job WHERE name = 'heartbeat-every-10s')
+ GROUP BY status;
+
+  status   | count |            min             |            max
+-----------+-------+----------------------------+----------------------------
+ PENDING   |     5 | 2026-09-02 10:15:40+00     | 2026-09-02 10:16:20+00
+ SUCCEEDED |     1 | 2026-09-02 10:15:30+00     | 2026-09-02 10:15:30+00</code></pre>
+</div>
+
+<p><code>scheduler.cron.horizon</code> is 60&nbsp;s, so each tick materialises every occurrence
+falling inside the next minute, bounded by <code>max-occurrences-per-tick: 16</code>. The rows are
+created early and simply are not claimable until <code>run_at &lt;= now()</code>. That is the whole
+reason the claim predicate has two terms rather than one, and it is why a schedule edit takes up to
+a horizon to take effect &mdash; already-materialised occurrences are deliberately left alone by
+<code>PATCH /api/jobs/{id}</code>.</p>
+
+<div class="codewrap">
+<div class="codehead">trigger a run of the DAG root &mdash; the whole closure is created at once<span class="lang">bash</span></div>
+<pre><code class="lang-bash">ROOT=$(curl -s localhost:18080/api/jobs | jq -r '.[] | select(.name=="dag-extract") | .id')
+curl -sS -X POST localhost:18080/api/jobs/$ROOT/trigger | jq '{scheduledFor, createdCount}'
+
+# 202 Accepted - materialised, not executed:
+# {
+#   "scheduledFor": "2026-09-02T10:16:02.118374Z",
+#   "createdCount": 4
+# }</code></pre>
+</div>
+
+<p>202 rather than 200 is not pedantry: the response is emitted long before any handler runs.
+<code>createdCount: 4</code> is the diamond &mdash; <code>dag-extract</code> PENDING plus three
+<code>BLOCKED</code> steps, all sharing that one <code>scheduledFor</code>. Six fractional digits,
+because <code>ExecutionMaterializer.normalize</code> truncates to microseconds to match
+<code>timestamptz</code>; a nanosecond-precision instant would produce an idempotency key that no
+longer matches the value the database stored.</p>
+
+<div class="codewrap">
+<div class="codehead">what the handler logs, two seconds later<span class="lang">text</span></div>
+<pre><code class="lang-text">[job-worker-3] job='dag-extract' attempt=0 scheduledFor=2026-09-02T10:16:02.118374Z key=5c2f...@2026-09-02T10:16:02.118374Z message=extract
+[job-worker-1] job='dag-transform-a' attempt=0 scheduledFor=2026-09-02T10:16:02.118374Z ... message=transform-a
+[job-worker-4] job='dag-transform-b' attempt=0 scheduledFor=2026-09-02T10:16:02.118374Z ... message=transform-b
+[job-worker-2] job='dag-load' attempt=0 scheduledFor=2026-09-02T10:16:02.118374Z ... message=load</code></pre>
+</div>
+
+<p>The two transforms interleave; <code>dag-load</code> waits for both. That ordering is enforced by
+one set-based statement, not by application logic &mdash;
+<code>DagResolver.promoteChildrenOf</code> runs the doubly-negated
+<code>NOT EXISTS (&hellip; NOT EXISTS &hellip;)</code>, which is SQL's way of saying "for all
+parents". Query the history and the wait is visible:</p>
+
+<div class="codewrap">
+<div class="codehead">GET /api/jobs/{id}/executions?limit=1<span class="lang">json</span></div>
+<pre><code class="lang-json">{
+  "jobName": "dag-load",
+  "scheduledFor": "2026-09-02T10:16:02.118374Z",
+  "status": "SUCCEEDED",
+  "attempt": 0,
+  "maxAttempts": 3,
+  "startedAt": "2026-09-02T10:16:03.401Z",
+  "finishedAt": "2026-09-02T10:16:03.408Z",
+  "lagMillis": 1283,
+  "durationMillis": 7
+}</code></pre>
+</div>
+
+<p><code>lagMillis</code> is the number to watch and to alert on. It is the gap between the logical
+occurrence and the <em>first</em> attempt's start &mdash; <code>started_at</code> is written once, with
+<code>COALESCE(started_at, :now)</code>, and a retry never clears it &mdash; so for a DAG leaf it is
+mostly upstream execution time, and for a cron job it is pure scheduling delay. It stays comparable
+across a row that succeeded first time and a row that took three attempts, which is the whole point:
+growing lag with a flat failure count means the cluster is under-provisioned, while failures show up
+in <code>status</code> instead. Note what is <em>missing</em>
+from that response: <code>claimedBy</code>, <code>claimedAt</code> and <code>heartbeatAt</code> are
+all absent, because <code>JobExecution.releaseClaim()</code> nulls them on completion and Jackson
+is configured to omit nulls.</p>
+
+<h2>Two instances, and watching the claim partition</h2>
+
+<div class="codewrap">
+<div class="codehead">the configuration this project is actually about<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make up-cluster   # postgres + redis + scheduler-a :18080 + scheduler-b :18081
+make logs         # both instances, interleaved
+curl -s localhost:18080/api/executions/stats | jq '{nodeId, liveNodes, inFlightOnThisNode, availableCapacity, succeededOnThisNode}'
+curl -s localhost:18081/api/executions/stats | jq '{nodeId, liveNodes, inFlightOnThisNode, availableCapacity, succeededOnThisNode}'
+
+# { "nodeId": "scheduler-a", "liveNodes": ["scheduler-a","scheduler-b"],
+#   "inFlightOnThisNode": 2, "availableCapacity": 6, "succeededOnThisNode": 143 }
+#
+# { "nodeId": "scheduler-b", "liveNodes": ["scheduler-a","scheduler-b"],
+#   "inFlightOnThisNode": 1, "availableCapacity": 7, "succeededOnThisNode": 128 }</code></pre>
+</div>
+
+<p><code>countsByStatus</code> in the same response is cluster-wide, because it comes from a table
+both instances share; everything else is per-instance. That asymmetry is the point of the endpoint.
+143 versus 128 is what <code>SKIP LOCKED</code> fairness looks like &mdash; roughly even, never
+exactly even, because each poll takes the first <em>batch</em> of rows nobody else holds, and the
+batch is <code>min(claimBatchSize, free slots)</code>. <code>availableCapacity</code> is 8 in a
+container (<code>SCHEDULER_WORKER_THREADS: "4"</code>, and <code>capacity() = threads * 2</code>).</p>
+
+<div class="box gotcha">
+  <span class="bt"><code>claimed_by</code> is NULL for everything except in-flight rows</span>
+  <p>The obvious query &mdash;
+  <code>SELECT claimed_by, status, count(*) FROM job_execution GROUP BY 1,2;</code> &mdash; will show
+  you <code>(NULL, SUCCEEDED, 271)</code> and nothing else, and you will conclude the claim is
+  broken. It is not: every terminal transition calls <code>releaseClaim()</code>, which nulls
+  <code>claimed_by</code>, <code>claimed_at</code> and <code>heartbeat_at</code>. It has to &mdash;
+  the <code>job_execution_running_is_owned</code> CHECK constraint permits an owner only on
+  <code>RUNNING</code> rows. So that query only ever shows live work; run it in a
+  <code>watch</code> loop while a backlog drains, or read the per-node counters from
+  <code>/api/executions/stats</code> for the historical split.</p>
+  <div class="codewrap"><pre><code class="lang-bash">watch -n 0.5 "docker compose exec -T postgres psql -U scheduler -d scheduler -c \
+  \"SELECT claimed_by, count(*) FROM job_execution WHERE status='RUNNING' GROUP BY 1;\""</code></pre></div>
+</div>
+
+<p>The cron job is the leader-election test. Both instances tick every second; exactly one wins
+<code>pg_try_advisory_xact_lock</code> per tick, and the loser discovers it lost in microseconds
+and does nothing. The proof is that no occurrence is ever duplicated:</p>
+
+<div class="codewrap">
+<div class="codehead">this query is always empty<span class="lang">sql</span></div>
+<pre><code class="lang-sql">SELECT scheduled_for, count(*)
+  FROM job_execution
+ WHERE job_id = (SELECT id FROM job WHERE name = 'heartbeat-every-10s')
+ GROUP BY 1
+HAVING count(*) &gt; 1;
+
+-- And the lock itself is essentially never observable, because it is
+-- transaction-scoped and a tick takes a couple of milliseconds:
+SELECT locktype, objid, granted FROM pg_locks WHERE locktype = 'advisory';</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">The unique constraint is the belt; the lock is the braces</span>
+  <p>Delete the advisory lock entirely and you still get no duplicate runs &mdash;
+  <code>ON CONFLICT (idempotency_key) DO NOTHING</code> in <code>insertIfAbsent</code> catches it,
+  because <code>ExecutionMaterializer.idempotencyKey</code> is a pure function of
+  <code>(jobId, scheduledFor)</code>. What you lose is efficiency and signal: every instance burns
+  a transaction per job per tick, and the losers log constraint churn forever. Electing one
+  materialiser makes the tick cost O(1) per cluster instead of O(instances).</p>
+</div>
+
+<h2>Breaking it on purpose</h2>
+
+<h3>1. Kill a worker mid-execution</h3>
+
+<div class="codewrap">
+<div class="codehead">give it something slow to hold, then SIGKILL the process<span class="lang">bash</span></div>
+<pre><code class="lang-bash">SLOW=$(curl -sS -X POST localhost:18080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"name":"slow","type":"ONE_OFF","payload":{"handler":"logging","sleepMs":120000}}' | jq -r .id)
+curl -sS -X POST localhost:18080/api/jobs/$SLOW/trigger &gt; /dev/null
+
+# wait until a row is RUNNING, then:
+docker kill p1-scheduler-a        # SIGKILL - no @PreDestroy, no handover
+make logs                         # watch scheduler-b</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="Timeline of a killed worker: the heartbeat timestamp stops advancing at the kill, three sweeps find nothing, and the fourth sweep past the thirty second lease timeout reclaims the row to PENDING with an attempt charged">
+  <text class="lbl-b" x="14" y="18">One row&rsquo;s life after <tspan class="mono">docker kill p1-scheduler-a</tspan></text>
+
+  <rect class="node-o" x="60"  y="44" width="140" height="36" rx="6"/>
+  <rect class="node-w" x="200" y="44" width="540" height="36" rx="6"/>
+  <rect class="node-i" x="740" y="44" width="62"  height="36" rx="6"/>
+  <text class="lbl-s" x="130" y="66" text-anchor="middle">RUNNING, beat 5s</text>
+  <text class="lbl-b" x="470" y="62" text-anchor="middle">RUNNING &mdash; heartbeat_at FROZEN, nobody renewing it</text>
+  <text class="lbl-s" x="470" y="76" text-anchor="middle">the database has no idea anything is wrong; the row looks perfectly healthy</text>
+  <text class="lbl-s" x="771" y="66" text-anchor="middle">PENDING</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="200" y1="40" x2="200" y2="196"/>
+  </g>
+  <text class="lbl-b" x="206" y="36">SIGKILL</text>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="740" y1="40" x2="740" y2="196"/>
+  </g>
+  <text class="lbl-b" x="736" y="36" text-anchor="end">reclaim</text>
+
+  <rect class="node"   x="230" y="120" width="14" height="14" rx="3"/>
+  <rect class="node"   x="410" y="120" width="14" height="14" rx="3"/>
+  <rect class="node"   x="590" y="120" width="14" height="14" rx="3"/>
+  <rect class="node-a" x="770" y="120" width="14" height="14" rx="3"/>
+  <text class="lbl-s" x="237" y="112" text-anchor="middle">sweep</text>
+  <text class="lbl-s" x="417" y="112" text-anchor="middle">sweep</text>
+  <text class="lbl-s" x="597" y="112" text-anchor="middle">sweep</text>
+  <text class="lbl-s" x="777" y="112" text-anchor="end">sweep &rarr; hit</text>
+  <text class="lbl-s" x="410" y="150" text-anchor="middle">every 10s, on BOTH instances: heartbeat_at &lt; now() &minus; 30s ? nothing yet.</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="60" y1="170" x2="806" y2="170" marker-end="url(#p12-ar4)"/>
+  </g>
+  <text class="lbl-s" x="200" y="188" text-anchor="middle">t = 0</text>
+  <text class="lbl-s" x="380" y="188" text-anchor="middle">+10s</text>
+  <text class="lbl-s" x="560" y="188" text-anchor="middle">+20s</text>
+  <text class="lbl-s" x="740" y="188" text-anchor="middle">+30s = lease-timeout</text>
+
+  <text class="lbl-s" x="14" y="216">The sweeper does not detect death. It reads one timestamp. A 31-second GC pause is indistinguishable from a SIGKILL &mdash;</text>
+  <text class="lbl-s" x="14" y="232">which is exactly why the reclaim goes through RetryPolicy and charges an attempt, and why handlers must be idempotent.</text>
+  <defs>
+    <marker id="p12-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Liveness is a timestamp, not a protocol. <code>lease-timeout / heartbeat-interval</code>
+= 30&nbsp;s / 5&nbsp;s means six consecutive missed heartbeats before anyone acts.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">what scheduler-b prints, ~30&ndash;40s after the kill<span class="lang">text</span></div>
+<pre><code class="lang-text">c.a.scheduler.worker.OrphanSweeper : reclaimed execution 8c1e4a91-... of job 'slow' from
+                                     'scheduler-a' -&gt; PENDING (attempt 1/3)
+c.a.scheduler.worker.OrphanSweeper : orphan sweep reclaimed 1 execution(s)
+c.a.s.worker.handlers.LoggingHandler : [job-worker-2] job='slow' attempt=1 ...</code></pre>
+</div>
+
+<p>Note <code>attempt 1/3</code>. The sweeper deliberately routes through
+<code>RetryPolicy.recordFailure</code> rather than issuing a bare
+<code>UPDATE &hellip; SET status = 'PENDING'</code>:</p>
+
+<div class="codewrap">
+<div class="codehead">OrphanSweeper.sweep &mdash; the loop that charges the attempt<span class="lang">java</span></div>
+<pre><code class="lang-java">for (JobExecution row : rows) {
+    String previousOwner = row.getClaimedBy();
+    Instant lastBeat = row.getHeartbeatAt();
+    String message = "lease expired: owner '" + previousOwner + "' last heartbeat at "
+            + lastBeat + ", lease timeout " + props.worker().leaseTimeout();
+
+    retryPolicy.recordFailure(row, message, now, true);
+
+    log.warn("reclaimed execution {} of job '{}' from '{}' -&gt; {} (attempt {}/{})",
+            row.getId(), row.getJob().getName(), previousOwner, row.getStatus(),
+            row.getAttempt(), row.getJob().getMaxAttempts());
+}</code></pre>
+</div>
+
+<p>A job whose handler reliably wedges the JVM would otherwise be reclaimed and re-run forever &mdash;
+an infinite loop that looks like healthy throughput on every dashboard. Charging an attempt means
+it eventually dead-letters and becomes visible. The reclaim also inherits the jittered backoff, so
+a dead instance holding 200 rows does not return all 200 to <code>PENDING</code> at the same
+instant and immediately flatten its surviving peers.</p>
+
+<div class="box gotcha">
+  <span class="bt"><code>docker stop</code> shows you nothing &mdash; that is the wrong verb</span>
+  <p><code>docker stop</code> sends SIGTERM, which runs <code>WorkerLoop</code>'s
+  <code>@PreDestroy</code>: the pool drains for up to <code>shutdown-grace: 20s</code>, then
+  <code>releaseToPending</code> hands the still-running rows straight back &mdash; no attempt
+  charged, no 30-second wait, and the log says
+  <code>released 1 in-flight execution(s) back to PENDING on shutdown</code>. That is the rolling-deploy
+  path and it is correct, but it exercises none of the recovery machinery. Use <code>docker kill</code>
+  when you want to see the sweeper.</p>
+</div>
+
+<h3>2. A handler that never succeeds</h3>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="State machine of a job execution: BLOCKED to PENDING to RUNNING, then to SUCCEEDED, DEAD_LETTER, FAILED, or back to PENDING with an incremented attempt">
+  <rect class="node-w" x="14"  y="40" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="74" y="60" text-anchor="middle">BLOCKED</text>
+  <text class="lbl-s" x="74" y="76" text-anchor="middle">out of the claim index</text>
+
+  <rect class="node-i" x="200" y="40" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="260" y="60" text-anchor="middle">PENDING</text>
+  <text class="lbl-s" x="260" y="76" text-anchor="middle">run_at &lt;= now()?</text>
+
+  <rect class="node-a" x="390" y="40" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="450" y="60" text-anchor="middle">RUNNING</text>
+  <text class="lbl-s" x="450" y="76" text-anchor="middle">holds a lease</text>
+
+  <rect class="node-o" x="600" y="22"  width="150" height="38" rx="7"/>
+  <text class="lbl-b" x="675" y="46" text-anchor="middle">SUCCEEDED</text>
+  <rect class="node-d" x="600" y="80"  width="150" height="38" rx="7"/>
+  <text class="lbl-b" x="675" y="104" text-anchor="middle">DEAD_LETTER</text>
+  <rect class="node-d" x="600" y="138" width="150" height="38" rx="7"/>
+  <text class="lbl-b" x="675" y="162" text-anchor="middle">FAILED</text>
+
+  <rect class="node" x="14" y="190" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="74" y="216" text-anchor="middle">CANCELLED</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="136" y1="62" x2="194" y2="62" marker-end="url(#p12-ar5)"/>
+    <line class="edge-a" x1="322" y1="62" x2="384" y2="62" marker-end="url(#p12-ar6)"/>
+    <line class="edge-a" x1="512" y1="55" x2="594" y2="42" marker-end="url(#p12-ar7)"/>
+    <path class="edge-a" d="M 450 86 C 450 152, 320 152, 264 88" fill="none" marker-end="url(#p12-ar8)"/>
+  </g>
+  <g color="var(--dang)">
+    <line class="edge-d" x1="512" y1="70" x2="594" y2="97" marker-end="url(#p12-ar9)"/>
+    <line class="edge-d" x1="512" y1="80" x2="594" y2="152" marker-end="url(#p12-ar10)"/>
+    <line class="edge-d" x1="74"  y1="86" x2="74"  y2="186" marker-end="url(#p12-ar11)"/>
+  </g>
+
+  <text class="lbl-s" x="165" y="34" text-anchor="middle">every parent</text>
+  <text class="lbl-s" x="165" y="46" text-anchor="middle">SUCCEEDED</text>
+  <text class="lbl-s" x="353" y="34" text-anchor="middle">claim: FOR UPDATE</text>
+  <text class="lbl-s" x="353" y="46" text-anchor="middle">SKIP LOCKED</text>
+  <text class="lbl-s" x="556" y="30" text-anchor="middle">handler returned</text>
+  <text class="lbl-s" x="560" y="112" text-anchor="middle">attempt &gt;= max_attempts</text>
+  <text class="lbl-s" x="556" y="176" text-anchor="middle">NonRetryableException</text>
+  <text class="lbl-s" x="380" y="176" text-anchor="middle">retryable failure OR lease expiry: attempt+1,</text>
+  <text class="lbl-s" x="380" y="190" text-anchor="middle">run_at += uniform(0, min(5m, 1s &times; 2^attempt))</text>
+  <text class="lbl-s" x="84" y="118">an ancestor</text>
+  <text class="lbl-s" x="84" y="132">reached FAILED /</text>
+  <text class="lbl-s" x="84" y="146">DEAD_LETTER /</text>
+  <text class="lbl-s" x="84" y="160">CANCELLED</text>
+
+  <text class="lbl-s" x="14" y="264">FAILED and DEAD_LETTER are kept distinct so you can tell &ldquo;we gave up after trying&rdquo; from &ldquo;trying was never going to help&rdquo;.</text>
+  <text class="lbl-s" x="14" y="282">Retry is &ldquo;put the row back with a future run_at&rdquo;, never &ldquo;sleep in the worker&rdquo; &mdash; sleeping would pin a slot and keep the lease alive.</text>
+  <defs>
+    <marker id="p12-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+    <marker id="p12-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+  </defs>
+</svg>
+<figcaption>A lease expiry and a thrown exception converge on the same transition. That is not a
+simplification &mdash; it is the reason a wedged handler cannot loop forever.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">a job that always throws, with a small attempt budget<span class="lang">bash</span></div>
+<pre><code class="lang-bash">DOOMED=$(curl -sS -X POST localhost:18080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"name":"doomed","type":"ONE_OFF","maxAttempts":3,"payload":{"handler":"logging","failAlways":true}}' | jq -r .id)
+curl -sS -X POST localhost:18080/api/jobs/$DOOMED/trigger &gt; /dev/null
+
+watch -n 1 "curl -s localhost:18080/api/jobs/$DOOMED/executions | jq -c '.[] | {status, attempt, runAt, error}'"
+
+# ...and afterwards, the other kind of failure:
+curl -sS -X PATCH localhost:18080/api/jobs/$DOOMED -H 'Content-Type: application/json' \
+  -d '{"payload":{"handler":"logging","failFatally":true}}'
+curl -sS -X POST localhost:18080/api/jobs/$DOOMED/trigger &gt; /dev/null
+# -&gt; status FAILED, attempt 1, no backoff, no further attempts consumed.</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">three attempts, then the terminus<span class="lang">text</span></div>
+<pre><code class="lang-text">execution 1f0c... of job 'doomed' failed (attempt 1/3): IllegalStateException: simulated
+    retryable failure on attempt 0 of job 'doomed' -&gt; PENDING
+execution 1f0c... of job 'doomed' failed (attempt 2/3): IllegalStateException: simulated
+    retryable failure on attempt 1 of job 'doomed' -&gt; PENDING
+execution 1f0c... of job 'doomed' failed (attempt 3/3): IllegalStateException: simulated
+    retryable failure on attempt 2 of job 'doomed' -&gt; DEAD_LETTER</code></pre>
+</div>
+
+<p>Three executions, not four. <code>attempt</code> counts attempts that have already finished and
+failed, so it is 0 on the first run; after the third failure it is 3, <code>3 &gt;= 3</code> holds,
+and the row is dead-lettered. That off-by-one is the classic bug in every retry implementation, and
+it is worth watching the backoff too &mdash; the gaps between those three lines will be roughly
+0&ndash;2&nbsp;s and 0&ndash;4&nbsp;s, not exactly 2&nbsp;s and 4&nbsp;s:</p>
+
+<div class="codewrap">
+<div class="codehead">RetryPolicy.capFor &mdash; doubling, not shifting<span class="lang">java</span></div>
+<pre><code class="lang-java">public Duration capFor(int attempt) {
+    long base = Math.max(1L, props.retry().baseDelay().toMillis());
+    long max = Math.max(base, props.retry().maxDelay().toMillis());
+
+    long cap = base;
+    for (int i = 0; i &lt; attempt &amp;&amp; cap &lt; max; i++) {
+        cap = cap * 2;
+    }
+    if (cap &gt; max || cap &lt;= 0) {
+        cap = max;
+    }
+    return Duration.ofMillis(cap);
+}</code></pre>
+</div>
+
+<p>The delay itself is <code>uniform(0, cap)</code> &mdash; full jitter. Plain exponential backoff
+does not spread load, it synchronises it: 500 jobs that fail in the same second all retry at
+exactly <code>base &times; 2</code> seconds later, delivering the downstream dependency the same
+simultaneous spike that knocked it over, in lockstep, forever. The loop rather than
+<code>base &lt;&lt; attempt</code> matters too: Java masks the shift distance to the low six bits,
+so <code>1L &lt;&lt; 64</code> is 1, and attempt 64 of a job would suddenly get a one-millisecond
+backoff.</p>
+
+<p>That distinction between <code>NonRetryableException</code> and everything else is the difference between a queue that drains and one that spends its capacity
+re-running work that was doomed the first time. A missing handler bean takes the same route &mdash;
+<code>WorkerLoop.run</code> fails terminally rather than burning three attempts, because retrying
+will not conjure a bean into existence.</p>
+
+<h3>3. Stop the database</h3>
+
+<div class="codewrap">
+<div class="codehead">the whole coordination substrate, gone<span class="lang">bash</span></div>
+<pre><code class="lang-bash">docker compose stop postgres
+make logs                       # then, 30 seconds later:
+docker compose start postgres</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">what you see &mdash; and how long between each line<span class="lang">text</span></div>
+<pre><code class="lang-text">c.a.scheduler.worker.WorkerLoop   : worker poll failed
+    org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection
+    Caused by: java.sql.SQLTransientConnectionException: scheduler-pool - Connection is not available,
+               request timed out after 10001ms
+c.a.scheduler.worker.WorkerLoop   : heartbeat failed
+c.a.scheduler.scheduler.CronTicker: cron tick failed
+c.a.scheduler.worker.OrphanSweeper: orphan sweep failed</code></pre>
+</div>
+
+<p>The back-off here is emergent rather than designed, and it is worth understanding because it is
+the honest answer. Every loop is <code>@Scheduled(fixedDelay)</code>, so the next run starts
+<em>after</em> the previous one finishes. Hikari's <code>connection-timeout</code> is
+10&nbsp;000&nbsp;ms, so a poll that used to take 2&nbsp;ms now takes 10&nbsp;s before throwing.
+The worker's poll rate therefore collapses from 2/s to roughly one attempt every 10.5&nbsp;s all by
+itself &mdash; no retry policy, no circuit breaker, just <code>fixedDelay</code> plus a bounded
+timeout. Swap <code>fixedDelay</code> for <code>fixedRate</code> and this becomes a thread pile-up
+instead.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>What you break</th><th>What survives</th><th>What degrades</th><th>Observable</th></tr></thead>
+<tbody>
+<tr><td><code>docker kill</code> one instance</td><td>Everything. The peer claims all new work immediately</td><td>Rows the dead instance held are stuck for up to <code>lease-timeout</code></td><td><code>reclaimed execution &hellip; -&gt; PENDING (attempt n/m)</code></td></tr>
+<tr><td><code>docker compose stop redis</code></td><td>Everything, including <code>/actuator/health</code> &mdash; <code>management.health.redis.enabled: false</code></td><td><code>liveNodes</code> is <code>[]</code></td><td>DEBUG-level <code>redis node registry unavailable</code>, nothing else</td></tr>
+<tr><td><code>docker compose stop postgres</code></td><td>The process, and every in-flight handler (they never touch the DB)</td><td>All five loops; health goes DOWN and the compose healthcheck marks the container unhealthy</td><td><code>Connection is not available, request timed out after 10001ms</code></td></tr>
+<tr><td>Postgres comes back after &gt; 30&nbsp;s</td><td>The queue, exactly as it was</td><td>In-flight rows whose heartbeat lapsed are reclaimed and re-run</td><td><code>heartbeat renewed 0 of 3 in-flight lease(s); some rows were reclaimed</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The database outage costs you an attempt on every in-flight job</span>
+  <p>Handlers keep running through a Postgres outage &mdash; <code>LoggingHandler</code> never touches
+  the database. But their heartbeats cannot land, so if the outage exceeds
+  <code>lease-timeout</code> every in-flight row is reclaimed the moment the sweeper can run again,
+  and each reclaim charges an attempt. A three-minute database blip therefore dead-letters any
+  3-attempt job that was running when it started. The <code>duplicatesSuppressedOnThisNode</code>
+  counter in <code>/api/executions/stats</code> going up afterwards is the idempotency ledger
+  visibly saving you from running the survivors twice. If that bothers you, the question to sit
+  with is whether a lease expiry during a <em>total</em> outage is a failed attempt in any useful
+  sense &mdash; the sweeper cannot tell the difference between "the owner died" and "nobody could
+  reach the database", because both are the same absent timestamp.</p>
+</div>
+
+<h2>The SQL to keep in a scratch buffer</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Query</th></tr></thead>
+<tbody>
+<tr><td>Overall shape</td><td><code>SELECT status, count(*) FROM job_execution GROUP BY 1 ORDER BY 1;</code> (this is <code>make status</code>)</td></tr>
+<tr><td>Who is working right now</td><td><code>SELECT claimed_by, count(*) FROM job_execution WHERE status='RUNNING' GROUP BY 1;</code></td></tr>
+<tr><td>Backlog and how late it is</td><td><code>SELECT count(*), now() - min(run_at) AS oldest FROM job_execution WHERE status='PENDING' AND run_at &lt;= now();</code></td></tr>
+<tr><td>Leases about to expire</td><td><code>SELECT id, claimed_by, now() - heartbeat_at AS age FROM job_execution WHERE status='RUNNING' ORDER BY 3 DESC;</code></td></tr>
+<tr><td>What gave up, and why</td><td><code>SELECT j.name, e.attempt, e.error FROM job_execution e JOIN job j ON j.id=e.job_id WHERE e.status IN ('DEAD_LETTER','FAILED') ORDER BY e.finished_at DESC LIMIT 20;</code></td></tr>
+<tr><td>A DAG run, in order</td><td><code>SELECT j.name, e.status, e.finished_at FROM job_execution e JOIN job j ON j.id=e.job_id WHERE e.scheduled_for = '2026-09-02T10:16:02.118374Z' ORDER BY e.finished_at NULLS LAST;</code></td></tr>
+<tr><td>Is the claim index doing its job</td><td><code>EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM job_execution WHERE status='PENDING' AND run_at &lt;= now() ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 16;</code> &mdash; you want <code>Index Scan using idx_job_execution_claim</code> and <strong>no Sort node</strong></td></tr>
+<tr><td>Index bloat over time</td><td><code>SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) FROM pg_stat_user_indexes WHERE relname='job_execution';</code></td></tr>
+<tr><td>Ledger growth</td><td><code>SELECT count(*), min(processed_at) FROM processed_execution;</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>make logs-db</code> is the other half of this. The compose file starts Postgres with
+<code>log_lock_waits=on</code>, <code>deadlock_timeout=200ms</code> and
+<code>log_min_duration_statement=200</code>, which means a healthy run produces an almost
+completely silent database log. Seeing lock waits appear is the signal that something is
+serialising &mdash; and the fastest way to make that happen is exercise 1.</p>
+
+<h2>Actuator, and what it does not tell you</h2>
+
+<div class="codewrap">
+<div class="codehead">the operational surface that actually exists<span class="lang">bash</span></div>
+<pre><code class="lang-bash">curl -s localhost:18080/actuator/health | jq            # db UP, diskSpace UP, ping UP - no redis entry
+curl -s localhost:18080/actuator/flyway | jq            # which migrations ran, checksums, timings
+curl -s localhost:18080/actuator/configprops | jq '.contexts.*.beans | keys'
+curl -s localhost:18080/actuator/metrics/hikaricp.connections.pending | jq</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Metric</th><th>Why it is the one to watch</th><th>Bad looks like</th></tr></thead>
+<tbody>
+<tr><td><code>hikaricp.connections.pending</code></td><td>Threads waiting for a connection. The pool is 20 and the demand is 8 workers + 6 scheduled threads + Tomcat</td><td>Persistently &gt; 0 &rarr; completion transactions are queueing behind claim transactions, which is the self-inflicted-lease-expiry failure the <code>application.yml</code> comment warns about</td></tr>
+<tr><td><code>hikaricp.connections.acquire</code> (max)</td><td>How long a connection takes to get</td><td>Approaching <code>connection-timeout</code> of 10&nbsp;s</td></tr>
+<tr><td><code>hikaricp.connections.active</code></td><td>In-use connections</td><td>Pinned at 20 while <code>inFlightOnThisNode</code> is small</td></tr>
+<tr><td><code>jvm.gc.pause</code> (max)</td><td>A pause longer than <code>lease-timeout</code> gets your live work reclaimed</td><td>Anything within an order of magnitude of 30&nbsp;s</td></tr>
+<tr><td><code>http.server.requests</code></td><td>API latency by URI and status</td><td>Only if you drive the API hard; the workers do not use it</td></tr>
+<tr><td><code>/api/executions/stats</code></td><td>The scheduler's own counters &mdash; in-flight, capacity, succeeded, failed, duplicates suppressed</td><td>&mdash;</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="bt">There is no Micrometer instrumentation in this project</span>
+  <p>Search the source for <code>MeterRegistry</code> and you will find nothing. Everything
+  domain-specific &mdash; claim rate, lag, dead-letter count, duplicates suppressed &mdash; lives in
+  <code>AtomicLong</code> fields on <code>WorkerLoop</code> and is exposed only through
+  <code>GET /api/executions/stats</code>, which means it is per-instance, resets on restart, and
+  cannot be scraped into a dashboard. That is a deliberate gap, and closing it is exercise 6. Also
+  note that the worker pool is a hand-built <code>ThreadPoolExecutor</code>, not a Spring
+  <code>TaskExecutor</code>, so Boot's automatic <code>executor.*</code> metrics do not cover it
+  either.</p>
+</div>
+
+<h2>Tests</h2>
+
+<div class="codewrap">
+<div class="codehead">four classes, one real PostgreSQL<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test     # depends on `up`, but the suite brings its OWN postgres:16-alpine via Testcontainers
+mvn -B test -Dtest=ClaimConcurrencyTest    # the one to read first</code></pre>
+</div>
+
+<p><code>ClaimConcurrencyTest</code> runs six threads over 400 executions with a batch size of 7
+(deliberately not a divisor of anything) and asserts set disjointness and total conservation. All
+five <code>@Scheduled</code> loops are disabled in <code>AbstractPostgresIT</code>; the tests call
+<code>claim()</code>, <code>sweep()</code>, <code>tick()</code> and <code>pollOnce()</code> directly,
+so an assertion is about a mechanism rather than about whether a timer happened to fire. The
+container is a static singleton started once for the JVM, not a per-class <code>@Container</code>,
+so four test classes cost one container start.</p>
+
+<div class="box gotcha">
+  <span class="bt">The Docker image build skips tests, and it has to</span>
+  <p><code>RUN mvn -B -q -DskipTests package</code> is not laziness &mdash; Testcontainers needs a
+  Docker daemon, and there is no daemon inside an image build. If you add a CI step that builds the
+  image and calls it "tested", it is not. Run <code>make test</code> on the host separately.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<p>Ordered roughly by difficulty. Each is designed to make one mechanism visible by breaking it or
+extending it. Write the test first where one exists to write.</p>
+
+<ol>
+  <li><strong>Separate the two keywords.</strong> Remove <code>SKIP LOCKED</code> from
+  <code>selectDueForUpdate</code> and run <code>ClaimConcurrencyTest</code>. It still passes &mdash;
+  correctness came from <code>FOR UPDATE</code> alone. Now time it and watch <code>make logs-db</code>
+  fill with <code>log_lock_waits</code> output: you have converted six workers into one. Then remove
+  <code>FOR UPDATE</code> too and watch the disjointness assertion fail.
+  <em>Hint: the goal is to be able to say in one sentence which guarantee each keyword provides.</em></li>
+
+  <li><strong>Break the leader election two ways.</strong> Change
+  <code>pg_try_advisory_xact_lock</code> to <code>pg_try_advisory_lock</code> and run
+  <code>make up-cluster</code>; it will appear to work, then cron materialisation stops
+  cluster-wide. Separately, remove <code>@Transactional</code> from <code>CronTicker.tick</code>.
+  <em>Hint: watch <code>SELECT * FROM pg_locks WHERE locktype='advisory'</code> in the first case;
+  read <code>AdvisoryLock.tryLock</code>'s guard clause for why the second case throws instead of
+  silently letting every instance win.</em></li>
+
+  <li><strong>Make the lease too short.</strong> Set <code>lease-timeout: 3s</code> with
+  <code>heartbeat-interval: 5s</code> &mdash; the application refuses to start. Then set
+  <code>lease-timeout: 6s</code> (legal, but tight), trigger a <code>logging</code> job with
+  <code>{"sleepMs": 30000}</code>, and watch the sweeper reclaim work that is still running.
+  <em>Hint: <code>duplicatesSuppressedOnThisNode</code> climbing is the idempotency ledger visibly
+  doing its job.</em></li>
+
+  <li><strong>Remove the backpressure.</strong> In <code>WorkerLoop.pollOnce</code>, claim
+  <code>props.worker().claimBatchSize()</code> unconditionally instead of
+  <code>Math.min(props.worker().claimBatchSize(), capacity)</code>. Queue a few hundred
+  <code>{"sleepMs": 20000}</code> jobs.
+  <em>Hint: a claimed row is RUNNING with a ticking lease whether or not a thread is on it. Watch
+  rows queue locally, expire, get reclaimed by the peer, and run twice. This is the most
+  instructive bug in the project.</em></li>
+
+  <li><strong>Make cron catch-up a policy instead of an accident.</strong> Stop the cluster for ten
+  minutes with a <code>*/10 * * * * *</code> job defined, then start it: the cursor in
+  <code>CronTicker.materializeOccurrences</code> resumes from
+  <code>findLatestScheduledFor</code>, so it replays every missed occurrence, sixteen per tick
+  (<code>max-occurrences-per-tick</code>), for about four minutes. Add a
+  <code>catch-up: ALL | LATEST_ONLY | NONE</code> setting per job.
+  <em>Hint: the two hard questions are what <code>scheduled_for</code> should be for a coalesced
+  occurrence (it must stay in the past, or handlers that partition by it write to the wrong day),
+  and why a job seen for the first time deliberately starts at <code>now</code> rather than
+  backfilling from <code>job.created_at</code>.</em></li>
+
+  <li><strong>Instrument it properly.</strong> Replace the <code>AtomicLong</code> counters with
+  Micrometer meters: a counter per terminal status, a gauge for
+  <code>slots.availablePermits()</code>, and a timer around <code>handler.execute</code>. Add a
+  gauge for queue depth and one for oldest-due age.
+  <em>Hint: the oldest-due age is the single best health signal in the system and it is a
+  <code>SELECT min(run_at)</code>, so it must be a polled gauge with a cache, not a query per
+  scrape.</em></li>
+
+  <li><strong>Add priority.</strong> Give <code>job</code> a <code>priority</code> column and change
+  the claim to <code>ORDER BY priority DESC, run_at</code>.
+  <em>Hint: the index must become <code>(status, priority DESC, run_at)</code> or you reintroduce a
+  Sort node. Then answer whether a low-priority job can starve, and measure it with the
+  <code>ClaimConcurrencyTest</code> harness rather than guessing.</em></li>
+
+  <li><strong>Add a per-job concurrency limit.</strong> No more than N executions of the same job
+  may be <code>RUNNING</code> cluster-wide.
+  <em>Hint: two shapes, and the trade is real. A window function inside the claim
+  (<code>row_number() OVER (PARTITION BY job_id)</code>) keeps it in one statement but interacts
+  badly with <code>SKIP LOCKED</code>, because rows skipped by a peer still consume window slots.
+  A <code>job_concurrency</code> counter table is exact but adds a contended row. Decide which
+  wrongness you can live with, and write the test that distinguishes them.</em></li>
+
+  <li><strong>Replace polling with <code>LISTEN</code>/<code>NOTIFY</code>.</strong> Add a trigger
+  that <code>NOTIFY</code>s on insert of a <code>PENDING</code> row, and have workers claim on
+  notification instead of every 500&nbsp;ms.
+  <em>Hint: this is a latency optimisation and nothing else &mdash; you must keep the poll as a
+  floor. <code>NOTIFY</code> is delivered on COMMIT and only to currently-connected listeners, it
+  is not durable, and it needs a dedicated connection outside the Hikari pool. A row whose
+  <code>run_at</code> is in the future generates no useful notification at all. Measure the p50 lag
+  before and after and decide whether it was worth the connection.</em></li>
+
+  <li><strong>Fan out one step into N.</strong> Let a DAG step declare
+  <code>{"fanOut": "shards", "count": 16}</code> and materialise sixteen sibling executions whose
+  children wait for all of them.
+  <em>Hint: the idempotency key is <code>jobId@instant</code>, which admits exactly one row per
+  (job, occurrence). You need a third component. Work out what that does to the
+  <code>NOT EXISTS (&hellip; NOT EXISTS &hellip;)</code> eligibility predicate.</em></li>
+
+  <li><strong>Partition <code>job_execution</code> by month, and prune the ledger.</strong> Convert
+  it to a <code>PARTITION BY RANGE (scheduled_for)</code> table with monthly children, plus a job
+  that creates next month's partition in advance and detaches expired ones. Then prune
+  <code>processed_execution</code>, which only grows.
+  <em>Hint: two traps. The primary key must include the partition key, which breaks the plain
+  <code>UNIQUE (idempotency_key)</code> constraint the entire idempotency design rests on &mdash;
+  decide whether to keep the ledger unpartitioned as the global uniqueness authority. And prune the
+  ledger no faster than the longest window in which a duplicate could still arrive, which is
+  <code>lease-timeout + max-delay</code>: deleting a key early silently re-enables a duplicate side
+  effect. Also re-check the claim plan &mdash; partition pruning cannot help a predicate on
+  <code>status</code> and <code>run_at</code>.</em></li>
+
+  <li><strong>Add distributed tracing.</strong> Bring in
+  <code>spring-boot-starter-actuator</code>'s Micrometer Tracing bridge and propagate a trace
+  context from <code>POST /trigger</code> through materialisation, claiming and execution &mdash;
+  including across the DAG.
+  <em>Hint: the hard part is that the trace crosses a database table and a process boundary with no
+  HTTP call in between. Store the <code>traceparent</code> on the execution row at materialisation
+  and restore it in <code>WorkerLoop.run</code>; a retry three minutes later on a different
+  instance should still join the same trace.</em></li>
+</ol>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>Use <code>docker kill</code>, not <code>docker stop</code>, to exercise recovery. SIGTERM runs
+  <code>@PreDestroy</code>, which releases rows to <code>PENDING</code> immediately with no attempt
+  charged; SIGKILL is the only way to see the 30-second lease expiry and the sweeper.</li>
+  <li><code>claimed_by</code> is NULL on every non-<code>RUNNING</code> row, because
+  <code>releaseClaim()</code> must clear it to satisfy the
+  <code>job_execution_running_is_owned</code> CHECK. Sample it while work is in flight, or read the
+  per-node counters from <code>/api/executions/stats</code> instead.</li>
+  <li>Cron occurrences appear up to <code>horizon</code> (60&nbsp;s) before they are claimable, so a
+  freshly seeded ten-second job immediately has six <code>PENDING</code> rows. The claim predicate
+  has two terms &mdash; <code>status = 'PENDING' AND run_at &lt;= now()</code> &mdash; precisely for
+  this reason.</li>
+  <li>A lease expiry and a thrown exception converge on the same transition and both charge an
+  attempt. That is what stops a handler that reliably kills its JVM from looping forever, and it
+  also means a database outage longer than <code>lease-timeout</code> costs every in-flight job an
+  attempt.</li>
+  <li>The back-off under a dead database is emergent, not designed: <code>fixedDelay</code> plus
+  Hikari's 10&nbsp;s <code>connection-timeout</code> collapses the poll rate from 2/s to ~1 per
+  10.5&nbsp;s on its own. Swapping to <code>fixedRate</code> would replace that with a thread
+  pile-up.</li>
+  <li>The only metrics that exist are Boot's own. Everything domain-specific is an
+  <code>AtomicLong</code> behind one REST endpoint &mdash; per-instance, reset on restart, unscrapeable.
+  Watch <code>hikaricp.connections.pending</code> as the leading indicator: connection starvation
+  produces self-inflicted lease expiry, which looks exactly like a peer dying.</li>
+  <li>The exercises worth doing first are 1 and 4. Exercise 1 shows you which guarantee comes from
+  <code>FOR UPDATE</code> and which from <code>SKIP LOCKED</code>; exercise 4 shows you why claiming
+  work you have no thread for is the same thing as running it twice.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="02-implementation.html"><span class="lb">Previous</span>Implementation walkthrough</a>
+  <span class="xref"><span class="lb">Next</span>10 &middot; Projects</span>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The dual-write problem &amp; outbox &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>The dual-write problem &amp; outbox</h1>
+<p class="lede">Why <code>save()</code> then <code>send()</code> has no safe ordering, why XA is not
+available to you on Kafka, and how one extra <code>INSERT</code> plus PostgreSQL's write-ahead log
+turns publishing from a <em>correctness</em> problem for your service into a <em>retry</em> problem
+for a connector.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">Kafka 4</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Debezium</span>
+  <span class="tag">outbox &amp; CDC</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The mental model that matters</span>
+  <p>A dual write is not "two things that might fail" &mdash; it is <strong>two independent commit
+  points with no coordinator between them</strong>. Nothing you write inside your service can fix
+  that, because the fix has to be a shared durability decision and there is only one storage engine
+  you can enlist. So the outbox pattern does not <em>coordinate</em> the second commit; it
+  <strong>deletes</strong> it. The event becomes a row in the same database, written by the same
+  transaction, and a separate process later turns rows into records. Delivery then has exactly the
+  property delivery is allowed to have: it can be retried forever, because the truth is already
+  durable.</p>
+</div>
+
+<h2>Two commit points, no coordinator</h2>
+
+<p>The version everybody writes first is two lines long, and it is documented in this project's
+own source as the thing the design exists to avoid:</p>
+
+<div class="codewrap">
+<div class="codehead">the broken shape, from <code>OrderService</code>'s class javadoc<span class="lang">java</span></div>
+<pre><code class="lang-java">orderRepository.save(order);        // (1) commits
+kafkaTemplate.send("orders", evt);  // (2) may or may not happen</code></pre>
+</div>
+
+<p>Swapping the two lines does not help, and neither does wrapping the second one in a retry loop.
+Each ordering fails differently, and each failure is worse than "an error the caller sees" &mdash;
+they are all <em>silent divergence between two systems that each believe they are correct</em>.</p>
+
+<figure>
+<svg viewBox="0 0 820 276" role="img" aria-label="Three timelines showing how a database-then-Kafka write, a Kafka-then-database write, and a retry loop each lose or duplicate data when a crash lands between the two commit points">
+  <text class="lbl-b" x="14" y="18">Two independent commits. Every ordering has a window, and the window is where the process dies.</text>
+
+  <text class="lbl-b" x="14" y="50">DB first,</text>
+  <text class="lbl-b" x="14" y="66">Kafka second</text>
+  <rect class="node-o" x="170" y="30" width="150" height="44" rx="6"/>
+  <text class="lbl-b" x="245" y="50" text-anchor="middle">COMMIT orders</text>
+  <text class="lbl-s" x="245" y="66" text-anchor="middle">durable, visible</text>
+  <rect class="node-d" x="336" y="30" width="140" height="44" rx="6"/>
+  <text class="lbl-b" x="406" y="50" text-anchor="middle">SIGKILL</text>
+  <text class="lbl-s" x="406" y="66" text-anchor="middle">or broker unreachable</text>
+  <rect class="node-w" x="492" y="30" width="314" height="44" rx="6"/>
+  <text class="lbl-b" x="649" y="50" text-anchor="middle">SILENT DATA LOSS</text>
+  <text class="lbl-s" x="649" y="66" text-anchor="middle">an order nobody downstream knows about; the event died in RAM</text>
+
+  <text class="lbl-b" x="14" y="114">Kafka first,</text>
+  <text class="lbl-b" x="14" y="130">DB second</text>
+  <rect class="node-o" x="170" y="94" width="150" height="44" rx="6"/>
+  <text class="lbl-b" x="245" y="114" text-anchor="middle">send() acked</text>
+  <text class="lbl-s" x="245" y="130" text-anchor="middle">event is on the log</text>
+  <rect class="node-d" x="336" y="94" width="140" height="44" rx="6"/>
+  <text class="lbl-b" x="406" y="114" text-anchor="middle">INSERT rolls back</text>
+  <text class="lbl-s" x="406" y="130" text-anchor="middle">constraint / deadlock</text>
+  <rect class="node-w" x="492" y="94" width="314" height="44" rx="6"/>
+  <text class="lbl-b" x="649" y="114" text-anchor="middle">PHANTOM STATE</text>
+  <text class="lbl-s" x="649" y="130" text-anchor="middle">shipments and invoices for an order that does not exist</text>
+
+  <text class="lbl-b" x="14" y="178">send() wrapped</text>
+  <text class="lbl-b" x="14" y="194">in a retry loop</text>
+  <rect class="node-o" x="170" y="158" width="150" height="44" rx="6"/>
+  <text class="lbl-b" x="245" y="178" text-anchor="middle">COMMIT succeeds</text>
+  <text class="lbl-s" x="245" y="194" text-anchor="middle">then send() times out</text>
+  <rect class="node-d" x="336" y="158" width="140" height="44" rx="6"/>
+  <text class="lbl-b" x="406" y="178" text-anchor="middle">broker DID persist</text>
+  <text class="lbl-s" x="406" y="194" text-anchor="middle">the ack was lost, not the write</text>
+  <rect class="node-w" x="492" y="158" width="314" height="44" rx="6"/>
+  <text class="lbl-b" x="649" y="178" text-anchor="middle">DUPLICATES, NO DEDUP KEY</text>
+  <text class="lbl-s" x="649" y="194" text-anchor="middle">and the process can still die between the timeout and the retry</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="322" y1="52"  x2="334" y2="52"  marker-end="url(#p30-ar1)"/>
+    <line class="edge" x1="478" y1="52"  x2="490" y2="52"  marker-end="url(#p30-ar1)"/>
+    <line class="edge" x1="322" y1="116" x2="334" y2="116" marker-end="url(#p30-ar1)"/>
+    <line class="edge" x1="478" y1="116" x2="490" y2="116" marker-end="url(#p30-ar1)"/>
+    <line class="edge" x1="322" y1="180" x2="334" y2="180" marker-end="url(#p30-ar1)"/>
+    <line class="edge" x1="478" y1="180" x2="490" y2="180" marker-end="url(#p30-ar1)"/>
+  </g>
+
+  <text class="lbl-s" x="14" y="228">None of these is a bug you can code around, because none of them is a bug. Each is the correct behaviour of two systems</text>
+  <text class="lbl-s" x="14" y="244">that were never told about each other. The only fix is to stop having two commit points &mdash; which is what the outbox does.</text>
+  <defs>
+    <marker id="p30-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The retry loop is the dangerous one, because it looks like a fix. It converts a loss
+window into a duplicate window and leaves you without an identifier you can dedupe on.</figcaption>
+</figure>
+
+<div class="box gotcha">
+  <span class="bt">"We wrapped it in <code>@Transactional</code> and it's fine now"</span>
+  <p>Putting <code>kafkaTemplate.send()</code> inside a Spring transaction does nothing for
+  atomicity by default: the send is executed immediately and the broker knows nothing about your
+  database transaction. Registering it as an <code>afterCommit</code> callback (the
+  <code>TransactionSynchronization</code> trick, or an
+  <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code>) is <em>strictly better</em> &mdash;
+  it removes the "phantom event for a rolled-back order" case &mdash; but it is exactly the "DB
+  first, Kafka second" row above. The process can be killed in the microsecond between
+  <code>COMMIT</code> returning and the callback running, and that event is gone with no record
+  anywhere that it was ever owed.</p>
+</div>
+
+<h2>The candidates, and why four of them lose</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>How it would work</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>XA / two-phase commit</strong></td><td>A transaction manager prepares both resources, then commits both</td><td><strong>Not available.</strong> Kafka exposes no XA resource adapter. Kafka transactions are Kafka-internal &mdash; they scope producer writes and consumer offset commits on the <em>same cluster</em>, and cannot enlist a JDBC connection. Even where XA exists it buys a blocking coordinator, in-doubt transactions that hold locks until an operator resolves them, heuristic outcomes, and latency measured in extra round trips per write.</td></tr>
+<tr><td><strong>Publish, then write</strong></td><td>Send to Kafka first; only write the row if the send is acked</td><td><strong>Rejected.</strong> Row two of the diagram. Downstream acts on state your database rejected; there is no compensating event to undo it because you never got far enough to know what to compensate.</td></tr>
+<tr><td><strong>Listen to yourself</strong></td><td>The service publishes the command/event, then <em>consumes its own topic</em> and writes the row from the consumer</td><td><strong>Rejected here.</strong> It is genuinely atomic &mdash; there is only one commit point &mdash; but it makes Kafka the system of record and the database a projection. The HTTP caller gets <code>201</code> before the row exists, so read-your-writes breaks; you cannot enforce a uniqueness or <code>CHECK</code> constraint at accept time, only discover the violation later on a topic you cannot reject from; and your write path is now down whenever the broker is down. Correct for an event-sourced design, wrong for a service whose database <em>is</em> the truth.</td></tr>
+<tr><td><strong>Polling outbox</strong></td><td>Same table, but a scheduled job <code>SELECT</code>s unpublished rows, sends them, and marks them published</td><td><strong>Viable, and the right first answer</strong> when you cannot run CDC. Costs a latency floor equal to the poll interval, a second write per event, and continuous query load on the primary. See below.</td></tr>
+<tr><td><strong>CDC outbox</strong> &mdash; what this project builds</td><td>Same table; Debezium reads PostgreSQL's write-ahead log and publishes what it sees</td><td><strong>Chosen.</strong> One <code>INSERT</code>, no read-back, no marker column, no extra load on the primary, and sub-second latency. Pays for it with an operational dependency (Kafka Connect) and a replication slot you must monitor.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="bt">Kafka transactions solve a different problem</span>
+  <p><code>enable.idempotence</code> + <code>transactional.id</code> gives you exactly-once
+  <em>consume&ndash;transform&ndash;produce</em> within Kafka: reading from topic A, writing to topic B and
+  committing the offset atomically. That is real and useful, and this project's consumer sets
+  <code>enable.idempotence: true</code> on its forwarding producer for the ordering guarantee it
+  brings. It does not and cannot make a PostgreSQL <code>COMMIT</code> atomic with a Kafka
+  <code>send()</code>.</p>
+</div>
+
+<h2>The outbox table is a public contract</h2>
+
+<p>The outbox is not a generic "events" table. Every column name in it is named again in the
+connector configuration, which means the DDL is an interface with an external consumer, not an
+implementation detail you can refactor.</p>
+
+<div class="codewrap">
+<div class="codehead">producer/src/main/resources/db/migration/V1__schema.sql<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- Column names here are a PUBLIC CONTRACT with connectors/outbox-connector.json.
+-- Every one of them is named in the EventRouter SMT configuration:
+--
+--   id             -&gt; transforms.outbox.table.field.event.id
+--   aggregate_type -&gt; transforms.outbox.route.by.field       (picks the topic)
+--   aggregate_id   -&gt; transforms.outbox.table.field.event.key (becomes the Kafka key)
+--   event_type     -&gt; transforms.outbox.table.field.event.type
+--   payload        -&gt; transforms.outbox.table.field.event.payload
+--   created_at     -&gt; transforms.outbox.table.field.event.timestamp
+--   trace_id       -&gt; carried through as a Kafka header
+
+CREATE TABLE outbox (
+    id             UUID        PRIMARY KEY,
+    aggregate_type VARCHAR(64) NOT NULL,
+    aggregate_id   VARCHAR(64) NOT NULL,
+    event_type     VARCHAR(64) NOT NULL,
+    payload        JSONB       NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    trace_id       VARCHAR(64)
+);
+
+-- Only used by the retention purge; Debezium never reads this table with SQL,
+-- it reads the write-ahead log.
+CREATE INDEX idx_outbox_created_at ON outbox (created_at);</code></pre>
+</div>
+
+<p>Two things are conspicuously absent. There is no <code>published</code> boolean and no
+<code>published_at</code> timestamp, because nothing ever reads a row back. And there is no
+<code>REPLICA IDENTITY FULL</code>, because the table is insert-only:</p>
+
+<div class="codewrap">
+<div class="codehead">why DEFAULT replica identity is enough<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- Replica identity stays at DEFAULT (the primary key). That is enough because
+-- the outbox is INSERT-only and the connector sets skipped.operations=u,d,t.
+-- If you ever start UPDATEing outbox rows you would need REPLICA IDENTITY FULL
+-- for Debezium to give you the "before" image.
+--
+-- No trigger, no NOTIFY, no polling job. The only mechanism that moves a row
+-- out of this table is Postgres' own write-ahead log, read by Debezium through
+-- the `outbox_slot` logical replication slot.</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Renaming an outbox column kills the connector, not the service</span>
+  <p>Rename <code>aggregate_id</code> to <code>entity_id</code> in a <code>V2</code> migration and
+  your producer keeps returning <code>201</code>, your tests keep passing, and orders keep
+  committing. Debezium keeps streaming too &mdash; it is the <em>SMT</em> that throws, and with
+  <code>errors.tolerance=none</code> the task dies. The pipeline goes silent while the service looks
+  perfectly healthy. This is the coupling the pattern really has, and it is why the migration file
+  carries that comment. Monitor
+  <code>GET /connectors/outbox-connector/status</code>, and alert on outbox rows written in the last
+  five minutes (the producer exposes <code>/api/orders/outbox/recent-count</code> for exactly this)
+  against records produced to <code>orders.events</code>.</p>
+</div>
+
+<h2>The one transaction</h2>
+
+<p>Everything above exists so that this method can be boring. Two saves, one
+<code>@Transactional</code>, no I/O of any kind between them:</p>
+
+<div class="codewrap">
+<div class="codehead">producer &middot; OrderService#createOrder &mdash; the whole point of the project<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional(propagation = Propagation.REQUIRED)
+public Order createOrder(String customerId, long amountCents, String status, String traceId) {
+    Order order = Order.place(customerId, amountCents, status);
+
+    UUID eventId = UUID.randomUUID();
+    String effectiveTraceId = (traceId == null || traceId.isBlank())
+            ? UUID.randomUUID().toString().replace("-", "").substring(0, 32)
+            : traceId;
+
+    OrderCreatedPayload payload = new OrderCreatedPayload(
+            eventId, order.getId(), order.getCustomerId(),
+            order.getAmountCents(), order.getStatus(), order.getCreatedAt());
+
+    String payloadJson = serialise(payload);
+
+    OutboxEvent outboxEvent = OutboxEvent.of(
+            eventId, aggregateType, order.getId().toString(),
+            eventTypeCreated, payloadJson, effectiveTraceId);
+
+    // ---------------------------------------------------------------
+    // THE ONE TRANSACTION. Two INSERTs, one COMMIT, one durability
+    // decision. Nothing between these two lines may talk to a broker,
+    // an HTTP endpoint, or anything else that can fail independently.
+    // ---------------------------------------------------------------
+    orderRepository.save(order);
+    outboxEventRepository.save(outboxEvent);
+
+    return order;
+}</code></pre>
+</div>
+
+<p>Three details in there are load-bearing. The order id is a client-generated
+<code>UUID</code> from <code>Order.place()</code>, not a database sequence &mdash; the outbox row must
+reference it before either <code>INSERT</code> is flushed, and application-assigned identifiers
+remove the "flush to get the id" dance entirely. The <code>eventId</code> is generated <em>here</em>,
+inside the transaction, and written in two places: as the outbox primary key and inside the
+serialised payload. And serialisation happens inside the transaction on purpose:</p>
+
+<div class="codewrap">
+<div class="codehead">a failure to serialise must roll the order back<span class="lang">java</span></div>
+<pre><code class="lang-java">private String serialise(OrderCreatedPayload payload) {
+    try {
+        return objectMapper.writeValueAsString(payload);
+    } catch (JsonProcessingException e) {
+        // Thrown inside the transaction, so the order insert rolls back with it. An order whose
+        // event cannot be serialised must not exist.
+        throw new IllegalStateException("Could not serialise outbox payload for order "
+                + payload.orderId(), e);
+    }
+}</code></pre>
+</div>
+
+<div class="box ok">
+  <span class="bt">The strongest statement of the pattern is a missing dependency</span>
+<div class="codewrap"><pre><code class="lang-xml">&lt;!--
+  LOOK AT WHAT IS *NOT* HERE.
+
+  There is no spring-kafka, no kafka-clients, no messaging dependency of any
+  kind. The producer service cannot talk to a broker even if it wanted to.
+  That is the strongest possible statement of the transactional outbox
+  pattern: publishing is somebody else's problem (Debezium's), and the only
+  thing this service must get right is a single local ACID transaction.
+--&gt;
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  ...</code></pre></div>
+  <p>A rule enforced by the classpath cannot be violated by a hurried pull request. The property
+  falls out of it: <code>docker compose stop kafka</code>, place ten orders, and all ten commit and
+  return <code>201</code>. The outbox grows; the broker comes back; Debezium drains it. A dual write
+  cannot give you that.</p>
+</div>
+
+<p>The claim is executable. <code>createOrderThenFail</code> writes both rows and then throws before
+the commit, and the demo endpoint returns <code>409</code> with a hint telling you what to check:</p>
+
+<div class="codewrap">
+<div class="codehead">proving atomicity from the shell<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make rollback-demo     # writes both rows, then throws before COMMIT
+make outbox            # neither row is there
+
+# under the hood:
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"customerId":"CUST-ROLLBACK","amountCents":1,"status":"CREATED"}' \
+  http://localhost:38081/api/orders/demo/rollback</code></pre>
+</div>
+
+<h2>Relay: polling publisher versus CDC</h2>
+
+<p>With the write side settled, the only remaining question is who turns rows into records. Both
+answers are at-least-once; they differ in cost and in what they do to your primary.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Polling publisher</th><th>CDC (this project)</th></tr></thead>
+<tbody>
+<tr><td>Mechanism</td><td><code>SELECT ... FOR UPDATE SKIP LOCKED</code> on a scheduled job, send, then mark published or delete</td><td>Debezium reads the WAL through a logical replication slot</td></tr>
+<tr><td>Writes per event</td><td><strong>2</strong> &mdash; the insert, plus an <code>UPDATE</code> (or <code>DELETE</code>) after publishing</td><td><strong>1</strong> &mdash; the insert. The relay never writes.</td></tr>
+<tr><td>Latency</td><td>Floor = poll interval. 1&nbsp;s polling means p50 &asymp; 500&nbsp;ms, p99 &asymp; 1&nbsp;s.</td><td>Bounded by WAL flush + connector poll; typically tens of milliseconds</td></tr>
+<tr><td>Load on the primary</td><td>A query per interval per instance, forever, whether or not there is work. Plus the update churn: dead tuples, index bloat, autovacuum pressure.</td><td>One walsender process. No queries against the table at all.</td></tr>
+<tr><td>Ordering</td><td>Whatever your <code>ORDER BY</code> and lock skipping produce &mdash; <code>SKIP LOCKED</code> with N workers explicitly reorders</td><td>WAL commit order, preserved by a single task</td></tr>
+<tr><td>Failure modes you own</td><td>Duplicate publishes on crash between send and mark; leader election if you do not want N instances all polling</td><td>Replication slot retention; connector lifecycle; schema/SMT coupling</td></tr>
+<tr><td>Ops dependency</td><td>None &mdash; it is your code</td><td>Kafka Connect cluster, and a database configured for logical replication</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the polling relay this project deliberately does not have<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- The shape you would write. SKIP LOCKED is what makes it safe to run N copies:
+-- each worker takes a disjoint batch instead of blocking on the others' rows.
+BEGIN;
+  SELECT id, aggregate_type, aggregate_id, event_type, payload
+    FROM outbox
+   WHERE published_at IS NULL
+   ORDER BY created_at
+   FOR UPDATE SKIP LOCKED
+   LIMIT 100;
+  -- ... send each one to Kafka ...
+  UPDATE outbox SET published_at = now() WHERE id = ANY(?);
+COMMIT;
+
+-- Note the crash window that remains: send() succeeded, UPDATE did not.
+-- Redelivery on restart. That is FINE - it is at-least-once, same as CDC -
+-- but it is the reason the consumer needs eventId either way.</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">producer &middot; OutboxEventRepository &mdash; note what is missing<span class="lang">java</span></div>
+<pre><code class="lang-java">/**
+ * Repository for the outbox.
+ *
+ * &lt;p&gt;Note what is missing: there is no "find unpublished rows" query and no "mark as published"
+ * update. This is a CDC outbox, not a polling outbox. Nothing in this service ever reads the table
+ * back; Debezium reads the write-ahead log instead, which is why the outbox costs one INSERT and no
+ * extra load on the primary.
+ */
+@Repository
+public interface OutboxEventRepository extends JpaRepository&lt;OutboxEvent, UUID&gt; {
+
+    @Modifying
+    @Query("DELETE FROM OutboxEvent e WHERE e.createdAt &lt; :cutoff")
+    int deleteCreatedBefore(@Param("cutoff") Instant cutoff);
+
+    long countByCreatedAtAfter(Instant since);
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The retention purge can delete an event that was never published</span>
+  <p>The outbox is a queue, not an audit log; left alone it grows without bound and every autovacuum
+  pass gets more expensive. But the <code>DELETE</code> is just another WAL entry &mdash; it does not
+  bring back the <code>INSERT</code> once the slot has advanced past it, and if the connector has
+  been down long enough that the WAL segment holding the insert is gone, the event is lost
+  permanently with no trace. The project sets <code>app.outbox.retention: 7d</code> with a
+  <code>0 */15 * * * *</code> cron precisely so the cutoff sits far beyond any plausible connector
+  lag. Pick your retention from your worst observed connector outage, not from disk pressure.</p>
+</div>
+
+<h2>PostgreSQL logical decoding, from the bottom up</h2>
+
+<p>Debezium is not magic and it is not a trigger. PostgreSQL's write-ahead log is a physical redo
+log &mdash; block images and byte offsets, useless to anything but a recovery process. <em>Logical
+decoding</em> is the mechanism that reassembles those records into logical row changes, and it needs
+three things configured before it will work at all.</p>
+
+<div class="codewrap">
+<div class="codehead">docker-compose.yml &middot; the postgres command line<span class="lang">yaml</span></div>
+<pre><code class="lang-yaml">    # wal_level=logical is the whole reason Debezium can work. Without it
+    # Postgres does not write enough information into the WAL to reconstruct
+    # row images, and the replication slot will refuse to be created.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_sender_timeout=0</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>If you get it wrong</th></tr></thead>
+<tbody>
+<tr><td><code>wal_level=logical</code></td><td>Adds the extra information (notably the old tuple for the configured replica identity) that lets a decoding plugin reconstruct row changes</td><td>Slot creation fails outright. <strong>Requires a restart</strong> &mdash; it is not a <code>SIGHUP</code> parameter, so this is a planned maintenance window on an existing cluster.</td></tr>
+<tr><td><code>max_replication_slots</code></td><td>Upper bound on concurrent slots (default 10 in PG&nbsp;16)</td><td>New connectors fail to start once you have accumulated abandoned slots</td></tr>
+<tr><td><code>max_wal_senders</code></td><td>Upper bound on concurrent walsender processes</td><td>Connector cannot open a replication connection; physical standbys compete for the same budget</td></tr>
+<tr><td><code>wal_sender_timeout=0</code></td><td>Disables the idle-sender timeout (default 60&nbsp;s)</td><td>On a low-traffic outbox the sender is dropped and reconnects in a loop. Fine to disable in a demo; in production prefer a heartbeat over an infinite timeout.</td></tr>
+<tr><td><code>plugin.name=pgoutput</code></td><td>The output plugin that decodes WAL into a change stream</td><td>See below &mdash; the alternatives need a server-side extension</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Why <code>pgoutput</code></h3>
+
+<p><code>pgoutput</code> has shipped <strong>in the PostgreSQL core</strong> since 10, because it is
+the plugin native logical replication itself uses. That is the entire argument: no
+<code>CREATE EXTENSION</code>, no <code>.so</code> to install on every replica, and it works on
+managed PostgreSQL (RDS, Cloud SQL, Azure) where you cannot install anything. The historical
+alternatives &mdash; <code>decoderbufs</code> (Protobuf, from the Debezium project) and
+<code>wal2json</code> &mdash; both require a server-side extension and buy you nothing here, since
+Debezium converts to Connect records immediately either way.</p>
+
+<p><code>pgoutput</code> decodes only tables that belong to a <strong>publication</strong>, which is
+why the connector names one and asks to have it created:</p>
+
+<div class="codewrap">
+<div class="codehead">connectors/outbox-connector.json &middot; the decoding half<span class="lang">json</span></div>
+<pre><code class="lang-json">{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "1",
+
+  "database.dbname": "ordersdb",
+  "topic.prefix": "acme",
+
+  "plugin.name": "pgoutput",
+  "slot.name": "outbox_slot",
+  "publication.name": "outbox_publication",
+  "publication.autocreate.mode": "filtered",
+
+  "schema.include.list": "public",
+  "table.include.list": "public.outbox",
+
+  "snapshot.mode": "no_data",
+
+  "skipped.operations": "u,d,t",
+  "tombstones.on.delete": "false",
+
+  "heartbeat.interval.ms": "10000",
+  "errors.tolerance": "none"
+}</code></pre>
+</div>
+
+<p><code>publication.autocreate.mode=filtered</code> means "create a publication covering exactly
+the tables in <code>table.include.list</code>, and nothing else". The default,
+<code>all_tables</code>, publishes your whole database and decodes every change in it &mdash; enormous
+waste when you care about one insert-only table. The cost of <code>filtered</code> is a privilege:
+only the table owner can add it to a publication, which is why this stack connects as
+<code>postgres</code> and why the init script spells out what production should do instead.</p>
+
+<div class="codewrap">
+<div class="codehead">docker/postgres/init &middot; the production role, spelled out<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- The `postgres` superuser owns both databases in this demo stack. In
+-- production you would create a dedicated replication role for Debezium:
+--
+--   CREATE ROLE debezium WITH REPLICATION LOGIN PASSWORD '...';
+--   GRANT USAGE ON SCHEMA public TO debezium;
+--   GRANT SELECT ON public.outbox TO debezium;
+--   -- plus ownership of the publication, or pre-create it yourself.</code></pre>
+</div>
+
+<h3><code>snapshot.mode</code>, and why this one is <code>no_data</code></h3>
+
+<p>On first start a Debezium connector has no offset, so it must decide what "the beginning" means.
+The default <code>initial</code> takes a consistent snapshot of every included table with
+<code>SELECT *</code> and emits a synthetic <code>r</code> (read) event per row before switching to
+streaming. For a table you are replicating that is exactly right. For an <strong>outbox</strong> it
+is a disaster: every row still in the table is an event that was already delivered, so a snapshot
+republishes the last seven days of your event stream to production consumers. <code>no_data</code>
+establishes the slot's starting LSN and streams from there without reading a single row &mdash; the
+correct semantics for a queue whose rows are historical by definition.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>snapshot.mode</code></th><th>Behaviour on first start</th><th>Use for an outbox?</th></tr></thead>
+<tbody>
+<tr><td><code>initial</code> (default)</td><td>Snapshot all included tables, then stream</td><td><strong>No</strong> &mdash; re-emits every undeleted event</td></tr>
+<tr><td><code>no_data</code></td><td>Capture schema, skip the data, stream from now</td><td><strong>Yes</strong> &mdash; what this project uses</td></tr>
+<tr><td><code>never</code></td><td>Stream only; no schema capture pass</td><td>Only if you are certain the schema is already known</td></tr>
+<tr><td><code>always</code></td><td>Snapshot on <em>every</em> connector start</td><td>Never. Full replay on each restart.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3><code>skipped.operations</code> and the purge</h3>
+
+<p>The retention job <code>DELETE</code>s outbox rows, and a delete is a WAL record like any other.
+Without <code>skipped.operations=u,d,t</code>, every purge cycle would push a delete event for every
+purged row through the SMT and onto <code>orders.events</code> &mdash; and with
+<code>tombstones.on.delete</code> at its default of <code>true</code>, a null-valued tombstone record
+after each one. Fifteen minutes of quiet, then a burst of thousands of records your consumer has to
+recognise and discard. <code>u,d,t</code> means updates, deletes and truncates are dropped in the
+connector before they ever reach the transform.</p>
+
+<div class="box gotcha">
+  <span class="bt">An abandoned replication slot pins WAL until the disk fills</span>
+  <p>A logical slot guarantees the server keeps every WAL segment from the slot's
+  <code>restart_lsn</code> onwards, because that is the promise that makes the consumer restartable.
+  If nothing reads the slot, that promise is unbounded. Delete the connector and keep taking orders
+  and <code>pg_wal</code> grows forever &mdash; the database does not slow down, does not warn you, and
+  then stops accepting writes when the volume is full. The <code>Makefile</code> says this out loud
+  because the failure is so quiet:</p>
+<div class="codewrap"><pre><code class="lang-text">$ make connector-delete
+deleted
+note: the replication slot 'outbox_slot' still exists in postgres.
+      an abandoned slot pins WAL forever - drop it with:
+      make psql, then SELECT pg_drop_replication_slot('outbox_slot');</code></pre></div>
+  <p>Alert on it directly. This is the one query every team running CDC should have on a
+  dashboard:</p>
+<div class="codewrap"><pre><code class="lang-sql">SELECT slot_name,
+       active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+  FROM pg_replication_slots;
+
+-- active = false on a slot you still want is an outage in progress.
+-- retained_wal climbing without bound is an outage you have not noticed yet.
+-- PG 13+: set max_slot_wal_keep_size so the server invalidates a runaway slot
+-- instead of running out of disk. That converts a silent outage into a loud one.</code></pre></div>
+</div>
+
+<div class="box warn">
+  <span class="bt">A busy database and an idle outbox is the sneakiest version of the same bug</span>
+  <p>The slot's <code>restart_lsn</code> only advances when the connector flushes an offset, and it
+  only has an offset to flush when it emits something. If <code>ordersdb</code> is busy with other
+  traffic while the <code>outbox</code> table is quiet, the connector decodes and discards everything
+  and never advances &mdash; so WAL accumulates on a slot that is perfectly healthy and perfectly
+  active. That is what <code>heartbeat.interval.ms: 10000</code> is for: it makes the connector emit
+  a heartbeat and flush its position every 10&nbsp;s regardless of whether the captured table
+  changed.</p>
+</div>
+
+<h2>The outbox event router SMT</h2>
+
+<p>Debezium's raw output is a change envelope: <code>before</code>, <code>after</code>,
+<code>source</code>, <code>op</code>, <code>ts_ms</code>, keyed by the table's primary key. Publishing
+that to your consumers would leak the outbox's physical shape into your event contract. The
+<code>EventRouter</code> single-message transform unwraps it and rebuilds the record from the columns
+you nominate.</p>
+
+<div class="codewrap">
+<div class="codehead">connectors/outbox-connector.json &middot; the routing half<span class="lang">json</span></div>
+<pre><code class="lang-json">    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+
+    "transforms.outbox.table.field.event.id": "id",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.timestamp": "created_at",
+    "transforms.outbox.table.field.event.payload": "payload",
+
+    "transforms.outbox.table.expand.json.payload": "true",
+
+    "transforms.outbox.route.by.field": "aggregate_type",
+    "transforms.outbox.route.topic.replacement": "${routedByValue}.events",
+
+    "transforms.outbox.table.fields.additional.placement":
+        "event_type:header:eventType,trace_id:header:traceId,id:header:eventId,aggregate_type:header:aggregateType",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "header.converter": "org.apache.kafka.connect.storage.SimpleHeaderConverter"</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Outbox column</th><th>Becomes</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>aggregate_type</code> = <code>"orders"</code></td><td>The <strong>topic</strong>, via <code>${routedByValue}.events</code> &rarr; <code>orders.events</code></td><td>Routing is <em>data</em>, not configuration. Emit <code>aggregate_type = "shipments"</code> from a new endpoint and <code>shipments.events</code> appears with no connector change.</td></tr>
+<tr><td><code>aggregate_id</code></td><td>The record <strong>key</strong> (String)</td><td>Determines the partition, and therefore the ordering guarantee. See below.</td></tr>
+<tr><td><code>payload</code> (jsonb)</td><td>The record <strong>value</strong>, verbatim</td><td>Your event contract is the payload you wrote, not a Debezium envelope</td></tr>
+<tr><td><code>id</code></td><td><code>eventId</code> header <em>and</em> the payload's own <code>eventId</code> field</td><td>The idempotency key. Duplicated on purpose &mdash; see the gotcha below.</td></tr>
+<tr><td><code>event_type</code>, <code>trace_id</code>, <code>aggregate_type</code></td><td>Headers</td><td>A consumer can dispatch, or propagate a trace, without parsing the body</td></tr>
+<tr><td><code>created_at</code></td><td>The record timestamp</td><td>Event time is when the business fact committed, not when Kafka saw it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Without <code>table.expand.json.payload</code> your event arrives as a string</span>
+  <p>The <code>payload</code> column is <code>jsonb</code>, but to the connector it is just a text
+  value. Left alone, the SMT places that text into the record value and the
+  <code>JsonConverter</code> serialises it as a <em>JSON-encoded string</em>: your consumer receives
+  <code>"{\"eventId\":\"...\",\"orderId\":\"...\"}"</code> and Jackson refuses it, or worse, quietly
+  binds nothing.
+  <code>"transforms.outbox.table.expand.json.payload": "true"</code> parses the column and emits a
+  real object. It is one line, and its absence is the single most common way this pattern is
+  mis-wired &mdash; it is listed in the project's own troubleshooting table.</p>
+</div>
+
+<div class="box note">
+  <span class="bt">Why <code>eventId</code> is in the header <em>and</em> the body</span>
+  <p>From <code>OrderCreatedPayload</code>: "headers can be stripped by a badly configured converter
+  or an intermediate proxy, and the consumer's idempotency key must never depend on transport
+  metadata. The body is the contract." The header exists so a router or a filter can read it
+  cheaply; the body field exists because correctness depends on it.</p>
+</div>
+
+<h2>The whole path, end to end</h2>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="End-to-end data flow from an HTTP POST through one PostgreSQL transaction, the write-ahead log, a replication slot read by Debezium, the outbox event router transform, and finally the orders.events Kafka topic and the consumer">
+  <text class="lbl-b" x="14" y="18">POST /api/orders  &rarr;  one commit  &rarr;  WAL  &rarr;  slot  &rarr;  SMT  &rarr;  topic</text>
+
+  <rect class="node"   x="10"  y="34" width="132" height="62" rx="7"/>
+  <text class="lbl-b"  x="76"  y="54" text-anchor="middle">producer :38081</text>
+  <text class="lbl-s"  x="76"  y="70" text-anchor="middle">Spring Boot 3.4.1</text>
+  <text class="lbl-s"  x="76"  y="86" text-anchor="middle">no Kafka client at all</text>
+
+  <rect class="node-i" x="172" y="34" width="150" height="62" rx="7"/>
+  <text class="lbl-b"  x="247" y="52" text-anchor="middle">PostgreSQL 16</text>
+  <text class="mono"   x="247" y="68" text-anchor="middle">INSERT orders</text>
+  <text class="mono"   x="247" y="84" text-anchor="middle">INSERT outbox</text>
+
+  <rect class="node-w" x="352" y="34" width="118" height="62" rx="7"/>
+  <text class="lbl-b"  x="411" y="54" text-anchor="middle">WAL</text>
+  <text class="mono"   x="411" y="70" text-anchor="middle">outbox_slot</text>
+  <text class="lbl-s"  x="411" y="86" text-anchor="middle">wal_level=logical</text>
+
+  <rect class="node-a" x="500" y="34" width="160" height="62" rx="7"/>
+  <text class="lbl-b"  x="580" y="52" text-anchor="middle">Debezium 3.1</text>
+  <text class="lbl-s"  x="580" y="68" text-anchor="middle">pgoutput decoding</text>
+  <text class="lbl-s"  x="580" y="84" text-anchor="middle">EventRouter SMT</text>
+
+  <rect class="node-o" x="690" y="34" width="116" height="62" rx="7"/>
+  <text class="lbl-b"  x="748" y="54" text-anchor="middle">Kafka 4</text>
+  <text class="mono"   x="748" y="70" text-anchor="middle">orders.events</text>
+  <text class="lbl-s"  x="748" y="86" text-anchor="middle">3 partitions</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="144" y1="65" x2="170" y2="65" marker-end="url(#p30-ar2)"/>
+    <line class="edge" x1="324" y1="65" x2="350" y2="65" marker-end="url(#p30-ar2)"/>
+    <line class="edge" x1="472" y1="65" x2="498" y2="65" marker-end="url(#p30-ar2)"/>
+    <line class="edge" x1="662" y1="65" x2="688" y2="65" marker-end="url(#p30-ar2)"/>
+    <line class="edge" x1="748" y1="98" x2="748" y2="146" marker-end="url(#p30-ar2)"/>
+  </g>
+
+  <rect class="node-o" x="10" y="120" width="312" height="30" rx="5"/>
+  <text class="lbl-b" x="166" y="139" text-anchor="middle">ONE TRANSACTION &mdash; a correctness boundary</text>
+  <rect class="node-w" x="352" y="120" width="308" height="30" rx="5"/>
+  <text class="lbl-b" x="506" y="139" text-anchor="middle">AT-LEAST-ONCE &mdash; a retry boundary</text>
+
+  <text class="lbl-s" x="10"  y="170">Either both rows exist</text>
+  <text class="lbl-s" x="10"  y="186">or neither does. The</text>
+  <text class="lbl-s" x="10"  y="202">HTTP 201 means the</text>
+  <text class="lbl-s" x="10"  y="218">event is owed, and</text>
+  <text class="lbl-s" x="10"  y="234">the debt is durable.</text>
+
+  <text class="lbl-s" x="352" y="170">Everything right of the commit can fail and be retried without</text>
+  <text class="lbl-s" x="352" y="186">losing anything: the slot holds the connector's position, so a</text>
+  <text class="lbl-s" x="352" y="202">restart resumes from the last flushed LSN. A restart whose</text>
+  <text class="lbl-s" x="352" y="218">offsets were NOT flushed re-emits &mdash; which is why this is</text>
+  <text class="lbl-s" x="352" y="234">at-least-once and why every event carries an eventId.</text>
+
+  <rect class="node" x="620" y="150" width="186" height="70" rx="7"/>
+  <text class="lbl-b" x="713" y="170" text-anchor="middle">consumer :38082</text>
+  <text class="lbl-s" x="713" y="186" text-anchor="middle">processed_message ledger</text>
+  <text class="lbl-s" x="713" y="202" text-anchor="middle">+ effect, one transaction</text>
+
+  <text class="lbl-s" x="10" y="266">The producer cannot lose an event, because losing it would mean losing the order. The connector cannot lose an event,</text>
+  <text class="lbl-s" x="10" y="282">because the slot will not let the WAL go. The consumer cannot double-apply an event, because eventId is a primary key.</text>
+  <text class="lbl-s" x="10" y="304">Three separate mechanisms; each one covers exactly one hop, and none of them requires distributed consensus.</text>
+  <defs>
+    <marker id="p30-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The value of the pattern is that the guarantee is decomposed. No single component has to
+be exactly-once; each hop only has to be either atomic or retryable.</figcaption>
+</figure>
+
+<h2>Ordering, and the <code>aggregate_id</code>-as-key decision</h2>
+
+<p>Kafka orders records within a partition and offers nothing across partitions. The producer here
+does not choose partitions &mdash; the SMT sets the key from <code>aggregate_id</code> and the default
+partitioner hashes it (<code>murmur2(key) % numPartitions</code>). That single line of configuration
+is what turns "3 partitions of unordered events" into "per-order ordering with 3&times; the
+parallelism".</p>
+
+<figure>
+<svg viewBox="0 0 820 292" role="img" aria-label="Outbox rows in write-ahead-log commit order flowing through a single Debezium task and being hashed by aggregate id onto three Kafka partitions, showing that per-key order is preserved while cross-key order is not">
+  <text class="lbl-b" x="14" y="18">WAL commit order</text>
+  <rect class="node"   x="14" y="30"  width="118" height="26" rx="5"/>
+  <text class="mono"   x="73" y="47"  text-anchor="middle">A1  order-A</text>
+  <rect class="node"   x="14" y="60"  width="118" height="26" rx="5"/>
+  <text class="mono"   x="73" y="77"  text-anchor="middle">B1  order-B</text>
+  <rect class="node"   x="14" y="90"  width="118" height="26" rx="5"/>
+  <text class="mono"   x="73" y="107" text-anchor="middle">A2  order-A</text>
+  <rect class="node"   x="14" y="120" width="118" height="26" rx="5"/>
+  <text class="mono"   x="73" y="137" text-anchor="middle">C1  order-C</text>
+  <rect class="node"   x="14" y="150" width="118" height="26" rx="5"/>
+  <text class="mono"   x="73" y="167" text-anchor="middle">A3  order-A</text>
+
+  <rect class="node-a" x="196" y="60" width="150" height="86" rx="7"/>
+  <text class="lbl-b"  x="271" y="82"  text-anchor="middle">Debezium</text>
+  <text class="mono"   x="271" y="100" text-anchor="middle">tasks.max = 1</text>
+  <text class="lbl-s"  x="271" y="118" text-anchor="middle">one walsender, one</text>
+  <text class="lbl-s"  x="271" y="134" text-anchor="middle">totally ordered stream</text>
+
+  <rect class="node-i" x="400" y="72" width="150" height="62" rx="7"/>
+  <text class="lbl-b"  x="475" y="92"  text-anchor="middle">partitioner</text>
+  <text class="mono"   x="475" y="110" text-anchor="middle">murmur2(key) % 3</text>
+  <text class="lbl-s"  x="475" y="126" text-anchor="middle">key = aggregate_id</text>
+
+  <rect class="node-o" x="604" y="30"  width="202" height="34" rx="6"/>
+  <text class="lbl-b"  x="618" y="51">p0</text>
+  <text class="mono"   x="700" y="51"  text-anchor="middle">B1</text>
+  <rect class="node-o" x="604" y="72"  width="202" height="34" rx="6"/>
+  <text class="lbl-b"  x="618" y="93">p1</text>
+  <text class="mono"   x="712" y="93"  text-anchor="middle">A1 &rarr; A2 &rarr; A3</text>
+  <rect class="node-o" x="604" y="114" width="202" height="34" rx="6"/>
+  <text class="lbl-b"  x="618" y="135">p2</text>
+  <text class="mono"   x="700" y="135" text-anchor="middle">C1</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="134" y1="103" x2="194" y2="103" marker-end="url(#p30-ar3)"/>
+    <line class="edge" x1="348" y1="103" x2="398" y2="103" marker-end="url(#p30-ar3)"/>
+  </g>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="552" y1="100" x2="602" y2="48"  marker-end="url(#p30-ar4)"/>
+    <line class="edge-a" x1="552" y1="103" x2="602" y2="90"  marker-end="url(#p30-ar4)"/>
+    <line class="edge-a" x1="552" y1="106" x2="602" y2="132" marker-end="url(#p30-ar4)"/>
+  </g>
+
+  <rect class="node-o" x="14" y="192" width="392" height="76" rx="7"/>
+  <text class="lbl-b" x="28" y="212">GUARANTEED</text>
+  <text class="lbl-s" x="28" y="230">A1 before A2 before A3, always. All three hash to one</text>
+  <text class="lbl-s" x="28" y="246">partition, one consumer thread owns that partition, and</text>
+  <text class="lbl-s" x="28" y="262">the WAL gave them to Debezium in commit order.</text>
+
+  <rect class="node-d" x="422" y="192" width="384" height="76" rx="7"/>
+  <text class="lbl-b" x="436" y="212">NOT GUARANTEED</text>
+  <text class="lbl-s" x="436" y="230">B1 relative to A1, or C1 relative to anything. Different</text>
+  <text class="lbl-s" x="436" y="246">partitions, different threads. Also lost: A-order itself,</text>
+  <text class="lbl-s" x="436" y="262">once A1 fails and parks on a retry topic while A2 proceeds.</text>
+  <defs>
+    <marker id="p30-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p30-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Keying by the aggregate is a deliberate choice of ordering granularity: you get order
+exactly where a business invariant needs it, and parallelism everywhere else.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">producer &middot; the schema comment that states the guarantee<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- `aggregate_id` becomes the Kafka message key, which is what gives you
+-- per-aggregate ordering: every event for one order lands on one partition and
+-- is therefore consumed in write order.</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Key choice</th><th>Ordering you get</th><th>Parallelism</th><th>When it is right</th></tr></thead>
+<tbody>
+<tr><td><code>aggregate_id</code> &mdash; <strong>this project</strong></td><td>Total order per aggregate</td><td>Up to <code>numPartitions</code> consumers</td><td>Almost always. Invariants are per-aggregate by definition.</td></tr>
+<tr><td><code>event_id</code> (or null &rarr; round-robin)</td><td>None</td><td>Maximum</td><td>Only for genuinely independent facts: metrics, logs, clicks</td></tr>
+<tr><td><code>customer_id</code></td><td>Total order per customer, coarser than per order</td><td>Lower, and hot customers create hot partitions</td><td>When invariants span a customer's orders (credit limits, balances)</td></tr>
+<tr><td>Constant / single partition</td><td>Total order over everything</td><td><strong>One</strong> consumer thread</td><td>Only when the whole stream is a single state machine and the volume is small</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Adding partitions silently rewrites the mapping</span>
+  <p>The partition is <code>murmur2(key) % numPartitions</code>. Change the partition count from 3
+  to 6 and roughly half of all keys move &mdash; including keys with events already sitting on the old
+  partition. For a window equal to your consumer lag, two partitions hold events for the same
+  aggregate and are consumed concurrently, which is precisely the ordering violation the key was
+  chosen to prevent. Kafka will not warn you. Size the partition count for peak consumer parallelism
+  up front, and treat an increase on a keyed topic as a migration, not a config tweak.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">The relay is ordered because <code>tasks.max = 1</code>, and it cannot be otherwise</span>
+  <p>A PostgreSQL connector reads one replication slot; it does not shard. That is a throughput
+  ceiling &mdash; one connector task publishing every event for a database &mdash; and it is also the
+  reason the stream that reaches the partitioner is in commit order. If you outgrow it the answer is
+  another database, not another task.</p>
+</div>
+
+<h2>Where the guarantee stops</h2>
+
+<p>Be able to state the residual weakness out loud: <strong>this pipeline is at-least-once, not
+exactly-once</strong>. Debezium can re-emit a row after a connector restart whose offsets were not
+flushed &mdash; <code>OFFSET_FLUSH_INTERVAL_MS: 1000</code> in the Compose file bounds that window at
+roughly one second of records. Nothing in the outbox pattern removes duplicates; it removes
+<em>loss</em>. Deduplication is the consumer's job, and it is why every event carries a stable
+identifier generated inside the producer's transaction:</p>
+
+<div class="codewrap">
+<div class="codehead">consumer &middot; the other half of the contract<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- One row per event this consumer has *committed* the effects of. `event_id` is
+-- the primary key, which gives us the unique constraint the whole mechanism
+-- hangs on.
+CREATE TABLE processed_message (
+    event_id       UUID         PRIMARY KEY,
+    topic          VARCHAR(255) NOT NULL,
+    partition_no   INTEGER      NOT NULL,
+    record_offset  BIGINT       NOT NULL,
+    consumer_group VARCHAR(255) NOT NULL,
+    processed_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);</code></pre>
+</div>
+
+<p>Note that the ledger lives in <code>consumerdb</code>, a different database from the producer's
+<code>ordersdb</code>. That separation is deliberate: if both services shared one database you could
+make the consumer's effect part of the producer's transaction and learn nothing about the realistic
+distributed case. The next page picks up from here &mdash; what happens when the consumer's effect
+fails, how to tell a transient failure from a permanent one, and why blocking retries destroy a
+partition.</p>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>A dual write has no safe ordering because it has two commit points and no coordinator.
+  DB-then-Kafka loses events on a crash; Kafka-then-DB creates phantom state; a retry loop converts
+  loss into duplicates you have no key to dedupe on. An <code>afterCommit</code> callback narrows
+  the window to microseconds without closing it.</li>
+  <li>XA is not an option because Kafka exposes no XA resource adapter &mdash; Kafka transactions are
+  Kafka-internal and cannot enlist a JDBC connection. The outbox does not coordinate the second
+  commit, it <strong>deletes</strong> it: the event becomes a row written by the same transaction.</li>
+  <li>The strongest expression of the pattern is a <em>missing dependency</em>. The producer module
+  has no <code>kafka-clients</code> on its classpath, so it cannot dual-write even by accident, and
+  orders keep committing with the broker completely down.</li>
+  <li>CDC beats a polling publisher on write amplification (one <code>INSERT</code>, no
+  mark-as-published <code>UPDATE</code>), on latency (no poll-interval floor) and on load (no queries
+  against your primary) &mdash; at the cost of a Connect cluster and a replication slot you must
+  monitor.</li>
+  <li>Logical decoding needs <code>wal_level=logical</code> (a <strong>restart</strong>, not a reload),
+  slots and walsender budget, and a publication. Use <code>pgoutput</code> because it is in-core and
+  therefore works on managed PostgreSQL; use <code>publication.autocreate.mode=filtered</code> so you
+  decode one table instead of the whole database; use <code>snapshot.mode=no_data</code> because an
+  <code>initial</code> snapshot of an outbox republishes your entire event history.</li>
+  <li>An unread replication slot pins WAL until the disk fills, silently. Alert on
+  <code>pg_replication_slots.active</code> and on <code>pg_wal_lsn_diff(pg_current_wal_lsn(),
+  restart_lsn)</code>, set <code>max_slot_wal_keep_size</code>, and use
+  <code>heartbeat.interval.ms</code> so a busy database with a quiet outbox still advances the slot.</li>
+  <li>The <code>EventRouter</code> SMT makes routing <em>data</em>: <code>aggregate_type</code> picks
+  the topic, <code>aggregate_id</code> becomes the key and therefore the ordering granularity, and
+  <code>table.expand.json.payload=true</code> is what stops your payload arriving as a JSON-encoded
+  string. Keying by the aggregate buys per-aggregate order with N-way parallelism &mdash; and changing
+  the partition count later silently breaks it.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="index.html"><span class="lb">Previous</span>Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</a>
+  <a href="02-errors-dlq.html"><span class="lb">Next</span>Retries, DLQ &amp; poison pills</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

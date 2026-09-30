@@ -1,0 +1,965 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Retries, DLQ &amp; poison pills &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Retries, DLQ &amp; poison pills</h1>
+<p class="lede">The consumer half of the project, read as a series of forced choices: why one bad
+message can stop a partition forever, why classifying every failure as retryable wedges the consumer
+and classifying everything as fatal loses data, what the tiered retry topics cost you in ordering,
+and why a <code>try</code>/<code>catch</code> in the listener body cannot see a deserialisation
+failure at all.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">Kafka 4</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Debezium</span>
+  <span class="tag">error handling</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The mental model for the whole consumer</span>
+  <p>A Kafka partition is a <strong>single cursor</strong>, not a queue you can take items out of.
+  There is no "ack this one, nack that one" &mdash; there is one committed offset per partition per
+  group, and it can only move forwards. Every error-handling mechanism in this project exists because
+  of that one fact. You cannot skip a message without abandoning it, and you cannot hold a message
+  without holding everything behind it. So the only workable answer is to <em>move</em> the failure
+  somewhere else &mdash; to a retry topic, or to the DLT &mdash; and let the cursor advance. Error
+  handling here is a <strong>routing</strong> problem, not a <code>try</code>/<code>catch</code>
+  problem.</p>
+</div>
+
+<h2>One bad message blocks its partition</h2>
+
+<p>Start with the failure the naive consumer has. The listener throws, the container catches, the
+offset is not committed, and the next <code>poll()</code> returns the same record. There is nothing
+wrong with that loop &mdash; it is exactly what at-least-once delivery means. The problem is that the
+partition has 50 other orders behind that record and none of them can be delivered until the cursor
+moves.</p>
+
+<figure>
+<svg viewBox="0 0 820 264" role="img" aria-label="A Kafka partition as a single cursor: a failing record at offset 104 stops offsets 105 to 109 from ever being delivered, and a blocking retry eventually trips max.poll.interval.ms">
+  <text class="lbl-b" x="14" y="20">orders.events &mdash; partition 1 &mdash; one committed offset for the whole group</text>
+
+  <rect class="node-o" x="14"  y="32" width="80" height="42" rx="6"/>
+  <rect class="node-o" x="98"  y="32" width="80" height="42" rx="6"/>
+  <rect class="node-d" x="182" y="32" width="80" height="42" rx="6"/>
+  <rect class="node"   x="266" y="32" width="80" height="42" rx="6"/>
+  <rect class="node"   x="350" y="32" width="80" height="42" rx="6"/>
+  <rect class="node"   x="434" y="32" width="80" height="42" rx="6"/>
+  <rect class="node"   x="518" y="32" width="80" height="42" rx="6"/>
+  <rect class="node"   x="602" y="32" width="80" height="42" rx="6"/>
+
+  <text class="mono" x="54"  y="50" text-anchor="middle">102</text>
+  <text class="mono" x="138" y="50" text-anchor="middle">103</text>
+  <text class="mono" x="222" y="50" text-anchor="middle">104</text>
+  <text class="mono" x="306" y="50" text-anchor="middle">105</text>
+  <text class="mono" x="390" y="50" text-anchor="middle">106</text>
+  <text class="mono" x="474" y="50" text-anchor="middle">107</text>
+  <text class="mono" x="558" y="50" text-anchor="middle">108</text>
+  <text class="mono" x="642" y="50" text-anchor="middle">109</text>
+
+  <text class="lbl-s" x="54"  y="66" text-anchor="middle">done</text>
+  <text class="lbl-s" x="138" y="66" text-anchor="middle">done</text>
+  <text class="lbl-s" x="222" y="66" text-anchor="middle">FAILS</text>
+  <text class="lbl-s" x="306" y="66" text-anchor="middle">waiting</text>
+  <text class="lbl-s" x="390" y="66" text-anchor="middle">waiting</text>
+  <text class="lbl-s" x="474" y="66" text-anchor="middle">waiting</text>
+  <text class="lbl-s" x="558" y="66" text-anchor="middle">waiting</text>
+  <text class="lbl-s" x="642" y="66" text-anchor="middle">waiting</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="222" y1="98" x2="222" y2="80" marker-end="url(#p31-ar1)"/>
+  </g>
+  <text class="lbl-b" x="222" y="114" text-anchor="middle">committed offset stops here</text>
+  <text class="lbl-s" x="222" y="130" text-anchor="middle">it can only move forwards, never past a gap</text>
+
+  <rect class="node-w" x="14" y="146" width="392" height="72" rx="7"/>
+  <text class="lbl-b" x="210" y="166" text-anchor="middle">BLOCKING RETRY (sleep on the consumer thread)</text>
+  <text class="lbl-s" x="210" y="184" text-anchor="middle">105&ndash;109 wait for the whole backoff. If the sleep exceeds</text>
+  <text class="lbl-s" x="210" y="198" text-anchor="middle">max.poll.interval.ms the broker evicts this consumer,</text>
+  <text class="lbl-s" x="210" y="212" text-anchor="middle">the group rebalances, and the new owner starts the sleep again.</text>
+
+  <rect class="node-i" x="416" y="146" width="390" height="72" rx="7"/>
+  <text class="lbl-b" x="611" y="166" text-anchor="middle">NON-BLOCKING RETRY (forward to another topic)</text>
+  <text class="lbl-s" x="611" y="184" text-anchor="middle">104 is published to orders.events-retry-5000 and the listener</text>
+  <text class="lbl-s" x="611" y="198" text-anchor="middle">returns normally. The offset commits, 105 is delivered next.</text>
+  <text class="lbl-s" x="611" y="212" text-anchor="middle">Cost: 104 is now applied AFTER 105, even if they share a key.</text>
+
+  <text class="lbl-s" x="14" y="244">The choice is not "safe vs fast". It is "head-of-line stall" vs "loss of per-key ordering for the failing key". One of the two, always.</text>
+  <defs>
+    <marker id="p31-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Nothing here is a Spring problem. It is the shape of the log, and every framework that
+consumes Kafka has to pick a side of the same trade.</figcaption>
+</figure>
+
+<h2>Classification, and why the two easy answers are both wrong</h2>
+
+<p>Before you can route a failure you have to say what kind it is, and there are only two useful
+kinds. Treating <em>everything</em> as retryable means a message with a missing <code>eventId</code>
+occupies the ladder for three and a half minutes and then reaches the DLT anyway &mdash; you paid the
+full latency to learn nothing, and if the defect is systematic you have just multiplied your broker
+traffic by four. Treating <em>everything</em> as fatal means one 503 from a downstream service
+dead-letters a perfectly good order that would have succeeded on the next attempt. Both defaults are
+data loss or wasted time dressed as a policy.</p>
+
+<p>The project makes the decision explicit with two exception types, and the javadoc on each one is
+the test you apply at the throw site.</p>
+
+<div class="codewrap">
+<div class="codehead">consumer/error/RetryableException.java &mdash; the question to ask<span class="lang">java</span></div>
+<pre><code class="lang-java">/**
+ * A failure that a later attempt could plausibly succeed at.
+ *
+ * &lt;p&gt;Throw this for transient infrastructure conditions: a downstream HTTP call timed out, a
+ * connection pool was exhausted, a row was locked, a rate limit was hit, a dependency returned 503.
+ * The defining question is &lt;em&gt;"would the identical message, replayed in five minutes, have a real
+ * chance of working?"&lt;/em&gt; If yes, it is retryable.
+ */
+public class RetryableException extends RuntimeException { ... }</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">consumer/error/NonRetryableException.java &mdash; the short circuit<span class="lang">java</span></div>
+<pre><code class="lang-java">/**
+ * A failure that no amount of retrying will fix.
+ *
+ * &lt;p&gt;Throw this for defects in the message or in the business rules applied to it: a required field
+ * is missing, an enum value is unknown, a referenced entity can never exist, the amount is
+ * negative, a schema version is unsupported. Replaying such a message in five minutes produces the
+ * same exception, so the retry ladder would only burn broker storage and delay the operator's
+ * discovery of a real bug.
+ */
+public class NonRetryableException extends RuntimeException { ... }</code></pre>
+</div>
+
+<p>The classification is applied in exactly one place &mdash; the annotation's <code>exclude</code>
+list &mdash; and everything not named there is retryable by default. That default is the right way
+round: a new exception type you forgot to classify gets retried and then dead-lettered with full
+diagnostics, rather than being silently discarded.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Failure</th><th>Classified as</th><th>Route</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Downstream timeout, 503, pool exhausted, row lock</td><td><code>RetryableException</code></td><td>Full ladder, then DLT</td><td>The identical bytes have a real chance in 5s/30s/180s</td></tr>
+<tr><td>Missing <code>eventId</code>, null <code>orderId</code>, negative amount</td><td><code>NonRetryableException</code></td><td>Straight to DLT</td><td>Structural defect in the message; time cannot fix it</td></tr>
+<tr><td>Bytes that are not JSON, or JSON of the wrong shape</td><td><code>DeserializationException</code></td><td>Straight to DLT</td><td>Fatal in <code>DefaultErrorHandler</code> by default; excluded from the ladder explicitly here too</td></tr>
+<tr><td>Duplicate <code>eventId</code></td><td><em>not an error</em></td><td>Commit and move on</td><td>A duplicate is a success; throwing would dead-letter healthy redeliveries</td></tr>
+<tr><td>Anything you did not classify</td><td>retryable (default)</td><td>Full ladder, then DLT</td><td>Fail loudly and slowly rather than quietly and fast</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The classifier must walk the cause chain, or it never fires</span>
+  <p>Your <code>NonRetryableException</code> does not arrive at the classifier naked. Spring wraps it
+  in a <code>ListenerExecutionFailedException</code>; a <code>DeserializationException</code> arrives
+  wrapped too, and itself wraps the underlying Jackson error. A classifier that looks only at
+  <code>e.getClass()</code> sees the wrapper and routes every fatal defect onto the retry ladder. That
+  is what <code>traversingCauses = "true"</code> is for, and it is why the DLT's own triage label is
+  computed by walking <em>down</em> from the top rather than jumping to the root cause:</p>
+<div class="codewrap"><pre><code class="lang-java">private static String classify(Throwable exception) {
+    for (Throwable current = exception; current != null; current = current.getCause()) {
+        if (current instanceof DeserializationException) {
+            return "DESERIALIZATION";
+        }
+        if (current instanceof NonRetryableException) {
+            return "NON_RETRYABLE";
+        }
+        if (current.getCause() == current) {
+            break;                       // self-referential cause: stop, do not spin
+        }
+    }
+    return "RETRIES_EXHAUSTED";
+}</code></pre></div>
+  <p>Inspecting only the <em>deepest</em> cause would classify every poison pill as a generic Jackson
+  parse failure and lose the distinction the operator actually needs.</p>
+</div>
+
+<h2>Blocking versus non-blocking retries</h2>
+
+<p>The blocking version is one line of configuration and it is what most services ship with:
+a <code>DefaultErrorHandler</code> holding a <code>BackOff</code>. The consumer thread sleeps between
+attempts. That thread owns the partition, so the sleep is a stall for every other order on it, and
+once the total sleep approaches <code>max.poll.interval.ms</code> the broker declares the consumer
+dead and rebalances &mdash; into a loop, because the new owner starts the same sleep.</p>
+
+<p>This project uses <code>@RetryableTopic</code> instead, and deliberately configures the fallback
+handler to do <em>no</em> in-memory retry at all so the two mechanisms cannot compound:</p>
+
+<div class="codewrap">
+<div class="codehead">consumer/config/KafkaConfig.java &mdash; the non-<code>@RetryableTopic</code> fallback<span class="lang">java</span></div>
+<pre><code class="lang-java">/**
+ * &lt;p&gt;{@code FixedBackOff(0, 0)} means "no in-memory retry at all": recover immediately. In-memory
+ * retry blocks the consumer thread and therefore the whole partition, which is exactly the
+ * property the retry topics were introduced to avoid. Retrying in two places at once just
+ * multiplies the delays.
+ */
+@Bean
+public DefaultErrorHandler defaultErrorHandler(DeadLetterPublishingRecoverer recoverer) {
+    DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, new FixedBackOff(0L, 0L));
+    handler.addNotRetryableExceptions(NonRetryableException.class);
+    handler.setAckAfterHandle(true);
+    handler.setLogLevel(org.springframework.kafka.KafkaException.Level.WARN);
+    return handler;
+}</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Blocking (<code>DefaultErrorHandler</code> + <code>BackOff</code>)</th><th>Non-blocking (<code>@RetryableTopic</code>)</th></tr></thead>
+<tbody>
+<tr><td>Where the wait happens</td><td>On the consumer thread, inside the listener container</td><td>On a separate container per retry topic, whose partitions are paused</td></tr>
+<tr><td>Effect on other records in the partition</td><td>All stalled for the full backoff</td><td>None &mdash; the main partition keeps flowing at full speed</td></tr>
+<tr><td>Per-key ordering</td><td><strong>Preserved</strong></td><td><strong>Lost for any key that fails</strong></td></tr>
+<tr><td>Interaction with <code>max.poll.interval.ms</code></td><td>Total backoff must stay under it or the group rebalances forever</td><td>Longest single tier must stay under it (here 180&nbsp;s vs 900&nbsp;s)</td></tr>
+<tr><td>Extra topics / containers</td><td>None</td><td>One topic and one container per tier, plus the DLT</td></tr>
+<tr><td>Correct when</td><td>Events are a per-key state machine (paid &rarr; shipped)</td><td>Events are independent facts, as in this projection</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="bt">The ordering trade, stated out loud</span>
+  <p>From <code>OrderEventListener</code>'s own javadoc: <em>if orders A1 and A2 share a key and A1
+  fails, A2 is processed while A1 is parked on <code>orders.events-retry-5000</code>. When A1
+  eventually succeeds it is applied <strong>after</strong> A2.</em> For a projection of independent
+  facts that is fine and the idempotency ledger keeps replays safe. For a state machine it is
+  corruption: "order shipped" applied before "order paid" is not a delay, it is wrong data. When
+  strict per-key ordering matters you must either block the partition and accept the stall, or park
+  the whole key &mdash; stop consuming it, buffer subsequent events, resume in order once the failure
+  clears. Non-blocking retries are the right <em>default</em>; picking them without knowing which case
+  you are in is how "impossible" ordering bugs get written.</p>
+</div>
+
+<h2>The retry topology</h2>
+
+<figure>
+<svg viewBox="0 0 820 320" role="img" aria-label="The tiered retry topology: the main topic forwards retryable failures through three retry topics with increasing delays into the dead letter topic, while non-retryable and deserialisation failures bypass the ladder entirely">
+  <rect class="node-a" x="14" y="30" width="150" height="56" rx="7"/>
+  <text class="lbl-b" x="89" y="52" text-anchor="middle">orders.events</text>
+  <text class="lbl-s" x="89" y="68" text-anchor="middle">3 partitions, attempt 1</text>
+  <text class="lbl-s" x="89" y="82" text-anchor="middle">retention 7 days</text>
+
+  <rect class="node-w" x="214" y="30" width="150" height="56" rx="7"/>
+  <text class="lbl-b" x="289" y="52" text-anchor="middle">-retry-5000</text>
+  <text class="lbl-s" x="289" y="68" text-anchor="middle">wait 5s &middot; attempt 2</text>
+  <text class="lbl-s" x="289" y="82" text-anchor="middle">own container, paused</text>
+
+  <rect class="node-w" x="414" y="30" width="150" height="56" rx="7"/>
+  <text class="lbl-b" x="489" y="52" text-anchor="middle">-retry-30000</text>
+  <text class="lbl-s" x="489" y="68" text-anchor="middle">wait 30s &middot; attempt 3</text>
+  <text class="lbl-s" x="489" y="82" text-anchor="middle">own container, paused</text>
+
+  <rect class="node-w" x="614" y="30" width="150" height="56" rx="7"/>
+  <text class="lbl-b" x="689" y="52" text-anchor="middle">-retry-180000</text>
+  <text class="lbl-s" x="689" y="68" text-anchor="middle">wait 180s &middot; attempt 4</text>
+  <text class="lbl-s" x="689" y="82" text-anchor="middle">own container, paused</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="166" y1="58" x2="210" y2="58" marker-end="url(#p31-ar2)"/>
+    <line class="edge" x1="366" y1="58" x2="410" y2="58" marker-end="url(#p31-ar2)"/>
+    <line class="edge" x1="566" y1="58" x2="610" y2="58" marker-end="url(#p31-ar2)"/>
+  </g>
+  <text class="lbl-s" x="188" y="24" text-anchor="middle">fail</text>
+  <text class="lbl-s" x="388" y="24" text-anchor="middle">fail</text>
+  <text class="lbl-s" x="588" y="24" text-anchor="middle">fail</text>
+
+  <rect class="node-d" x="300" y="216" width="220" height="62" rx="7"/>
+  <text class="lbl-b" x="410" y="238" text-anchor="middle">orders.events-dlt</text>
+  <text class="lbl-s" x="410" y="254" text-anchor="middle">retention 30 days &middot; terminal</text>
+  <text class="lbl-s" x="410" y="268" text-anchor="middle">@DltHandler archives to dlq_record</text>
+
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 689 90 C 689 170 560 190 522 224" marker-end="url(#p31-ar3)"/>
+    <path class="edge-d" d="M 60 90 C 60 200 250 214 296 232" marker-end="url(#p31-ar3)"/>
+    <path class="edge-d" d="M 120 90 C 120 180 240 190 296 246" marker-end="url(#p31-ar3)"/>
+  </g>
+
+  <text class="lbl-s" x="690" y="120" text-anchor="middle">4th failure:</text>
+  <text class="lbl-s" x="690" y="134" text-anchor="middle">ladder exhausted</text>
+
+  <rect class="node-i" x="14" y="126" width="252" height="70" rx="7"/>
+  <text class="lbl-b" x="140" y="146" text-anchor="middle">exclude + traversingCauses</text>
+  <text class="lbl-s" x="140" y="162" text-anchor="middle">NonRetryableException &rarr; DLT directly</text>
+  <text class="lbl-s" x="140" y="176" text-anchor="middle">DeserializationException &rarr; DLT directly</text>
+  <text class="lbl-s" x="140" y="190" text-anchor="middle">no retry topic is ever touched</text>
+
+  <text class="lbl-s" x="546" y="300">Total ladder time 5 + 30 + 180 = 215&nbsp;s &asymp; 3.5&nbsp;min. Longest single wait 180&nbsp;s vs max.poll.interval.ms 900&nbsp;s.</text>
+  <defs>
+    <marker id="p31-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p31-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Three retry topics, not three sleeps. Each tier is a real topic with its own consumer
+group member, and the delay is implemented by pausing that partition &mdash; not by holding the main
+one.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">consumer/listener/OrderEventListener.java &mdash; every attribute is load-bearing<span class="lang">java</span></div>
+<pre><code class="lang-java">@RetryableTopic(
+        attempts = "${app.retry.attempts}",
+        backoff = @Backoff(
+                delayExpression = "${app.retry.initial-delay-ms}",
+                multiplierExpression = "${app.retry.multiplier}",
+                maxDelayExpression = "${app.retry.max-delay-ms}"),
+        topicSuffixingStrategy = TopicSuffixingStrategy.SUFFIX_WITH_DELAY_VALUE,
+        dltStrategy = DltStrategy.FAIL_ON_ERROR,
+        exclude = { NonRetryableException.class, DeserializationException.class },
+        traversingCauses = "true",
+        autoCreateTopics = "true",
+        numPartitions = "${app.kafka.partitions}",
+        replicationFactor = "${app.kafka.replication-factor}",
+        kafkaTemplate = "retryKafkaTemplate",
+        listenerContainerFactory = "kafkaListenerContainerFactory")
+@KafkaListener(
+        id = "order-events-listener",
+        topics = "${app.kafka.topic}",
+        groupId = "${spring.kafka.consumer.group-id}",
+        containerFactory = "kafkaListenerContainerFactory")
+public void onOrderEvent(ConsumerRecord&lt;String, OrderEvent&gt; record) {
+    OrderEvent event = record.value();
+
+    int attempt = KafkaConfig.readIntHeader(record.headers(), KafkaConfig.RETRY_ATTEMPTS, 1);
+    log.debug("Received key={} from {}-{}@{} (attempt {})",
+            record.key(), record.topic(), record.partition(), record.offset(), attempt);
+
+    // Deliberately NOT caught. Letting the exception escape is how the container learns the
+    // record failed; swallowing it here would commit the offset and lose the message. All error
+    // routing decisions belong to the retry-topic infrastructure, not to business code.
+    boolean applied = processor.process(
+            event, record.topic(), record.partition(), record.offset(), consumerGroup);
+    ...
+}</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">consumer/resources/application.yml &mdash; the ladder is data, not code<span class="lang">yaml</span></div>
+<pre><code class="lang-yaml">app:
+  retry:
+    # attempts counts the FIRST delivery as attempt 1, so 4 attempts means the
+    # main topic plus three retry topics, then the DLT.
+    attempts: 4
+    # Exponential ladder: 5s -&gt; 30s -&gt; 180s, ceiling 300s.
+    #   attempt 1 fails -&gt; wait 5s   on orders.events-retry-5000
+    #   attempt 2 fails -&gt; wait 30s  on orders.events-retry-30000
+    #   attempt 3 fails -&gt; wait 180s on orders.events-retry-180000
+    #   attempt 4 fails -&gt; orders.events-dlt
+    initial-delay-ms: 5000
+    multiplier: 6.0
+    max-delay-ms: 300000</code></pre>
+</div>
+
+<p>Naming the topics after their delay rather than their index
+(<code>SUFFIX_WITH_DELAY_VALUE</code>) is worth more than the shorter name: the whole topology is
+readable from <code>kafka-topics.sh --list</code>, which is the first command anybody runs on an
+unfamiliar cluster.</p>
+
+<div class="codewrap">
+<div class="codehead">make topics, after one retryable failure<span class="lang">text</span></div>
+<pre><code class="lang-text">orders.events
+orders.events-dlt
+orders.events-retry-5000
+orders.events-retry-30000
+orders.events-retry-180000</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Two tiers clamped to the same delay collapse into one topic</span>
+  <p>Because the suffix <em>is</em> the delay, a ladder whose later tiers both hit
+  <code>max-delay-ms</code> produces two tiers with the same name, and Spring's default reuse
+  strategy folds them into a single topic. You asked for five attempts and got four, silently. With
+  <code>initial-delay-ms=5000</code>, <code>multiplier=6.0</code> and a 300&nbsp;s ceiling the third
+  tier lands on 180&nbsp;s and never reaches the cap, so nothing clamps. Change the multiplier to
+  7.75 and the third tier sits exactly on 300000; add a fourth and it collides. Check the topic list
+  after any change to these three numbers &mdash; the count of retry topics is the only reliable
+  confirmation of how many attempts you actually have.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>max.poll.interval.ms</code> is what the ladder is really budgeted against</span>
+  <p>A retry-topic partition is <em>paused</em>, not polled, for the whole backoff. If the longest
+  tier exceeds <code>max.poll.interval.ms</code> the broker evicts the consumer mid-wait and the group
+  rebalances continuously &mdash; the symptom is a consumer that never processes anything and a log
+  full of "Attempt to heartbeat failed since group is rebalancing". This project sets
+  <code>max.poll.interval.ms: 900000</code> against a longest tier of 180&nbsp;000&nbsp;ms, a 5&times;
+  margin. The check is per-tier, not on the total, but leave real room: the interval also has to cover
+  the processing time of a full <code>max-poll-records: 50</code> batch.</p>
+</div>
+
+<h2>The dead letter record</h2>
+
+<p>A DLT record has one job: to let somebody who was not on call reconstruct the incident six weeks
+later, and then put the message back. That means diagnostics in headers and the payload
+<strong>byte-identical</strong> to what failed. Anything that rewrites the payload &mdash; a
+re-serialisation, a "cleanup", a schema upgrade &mdash; destroys the only artefact that proves what
+went wrong.</p>
+
+<div class="codewrap">
+<div class="codehead">consumer/config/KafkaConfig.java &mdash; enriching what Spring cannot know<span class="lang">java</span></div>
+<pre><code class="lang-java">recoverer.setHeadersFunction((record, exception) -&gt; {
+    Headers headers = new RecordHeaders();
+    Throwable root = rootCause(exception);
+
+    int attempts = readIntHeader(record.headers(), RETRY_ATTEMPTS, 1);
+    long firstFailureAt = readLongHeader(record.headers(), RETRY_ORIGINAL_TIMESTAMP,
+            record.timestamp());
+
+    headers.add(APP_DLQ_ATTEMPTS, String.valueOf(attempts).getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_FIRST_FAILURE_AT,
+            String.valueOf(firstFailureAt).getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_DEAD_LETTERED_AT,
+            String.valueOf(System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_ERROR_CLASS, root.getClass().getName().getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_ERROR_MESSAGE,
+            String.valueOf(root.getMessage()).getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_ORIGIN_SERVICE, applicationName.getBytes(StandardCharsets.UTF_8));
+    headers.add(APP_DLQ_CLASSIFICATION, classify(exception).getBytes(StandardCharsets.UTF_8));
+
+    return headers;
+});
+
+// Keep every generation of the standard headers rather than overwriting them. A record that
+// is dead-lettered, replayed, and dead-lettered again then carries its whole history.
+recoverer.setAppendOriginalHeaders(true);
+recoverer.setFailIfSendResultIsError(true);</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Header</th><th>Written by</th><th>Contains</th><th>Why you need it</th></tr></thead>
+<tbody>
+<tr><td><code>kafka_dlt-original-topic</code></td><td>Spring</td><td>Topic of the hop that failed</td><td>Replay destination &mdash; but see the gotcha below</td></tr>
+<tr><td><code>kafka_dlt-original-partition</code> / <code>-offset</code></td><td>Spring</td><td>4-byte big-endian int / 8-byte long</td><td>Locate the record in the source topic and read its neighbours</td></tr>
+<tr><td><code>kafka_dlt-original-consumer-group</code></td><td>Spring</td><td>The group that gave up</td><td>Which deployment, in a multi-consumer topology</td></tr>
+<tr><td><code>kafka_dlt-exception-fqcn</code> / <code>-message</code> / <code>-stacktrace</code></td><td>Spring</td><td>Class, message, full trace</td><td>The postmortem, without needing the log to still exist</td></tr>
+<tr><td><code>retry_topic-attempts</code></td><td>retry infrastructure</td><td>Deliveries made, as a 4-byte int</td><td>Distinguishes "fatal on sight" (1) from "exhausted" (4)</td></tr>
+<tr><td><code>retry_topic-original-timestamp</code></td><td>retry infrastructure</td><td><strong>First</strong> failure, not the last &mdash; <code>BigInteger</code> bytes, so 6 wide, not 8</td><td>Without it a record that spent 3.5 minutes on the ladder looks brand new</td></tr>
+<tr><td><code>eventId</code>, <code>eventType</code>, <code>traceId</code></td><td>Debezium <code>EventRouter</code></td><td>Application identity</td><td>Joins the failure to the producer-side trace</td></tr>
+<tr><td><code>x-dlq-classification</code></td><td>this project's enricher</td><td><code>RETRIES_EXHAUSTED</code> / <code>NON_RETRYABLE</code> / <code>DESERIALIZATION</code></td><td>Triage the DLT without parsing stack traces</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>kafka_dlt-original-topic</code> names the <em>last</em> hop, not the first</span>
+  <p>Each forward overwrites it. A record that walked the whole ladder reports
+  <code>orders.events-retry-180000</code> &mdash; so a replay tool that trusts the header republishes
+  onto a retry topic. That technically works (the retry container picks it up immediately, since the
+  backoff header was stripped) but it skips the main topic's consumer-group semantics and it is
+  thoroughly misleading in an incident. The inspector recovers the true origin with a regex:</p>
+<div class="codewrap"><pre><code class="lang-java">/** Removes a trailing {@code -retry-&lt;delay&gt;} (optionally {@code -&lt;index&gt;}) suffix. */
+static String stripRetrySuffix(String topic) {
+    return topic.replaceFirst("-retry-\\d+(-\\d+)?$", "");
+}</code></pre></div>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Header values are opaque bytes, and length is not the discriminator</span>
+  <p>There is no type system here, and the obvious decoder &mdash; switch on
+  <code>value.length</code> &mdash; is wrong. Three producers touch a DLT record and they write
+  numbers three different ways. Spring's <code>DeadLetterPublishingRecoverer</code> writes
+  <code>kafka_dlt-original-partition</code> as a fixed-width 4-byte int and
+  <code>-offset</code>/<code>-timestamp</code> as fixed-width 8-byte longs, and the retry
+  infrastructure writes <code>retry_topic-attempts</code> as a 4-byte int. But
+  <code>retry_topic-original-timestamp</code> and <code>retry_topic-backoff-timestamp</code> come
+  from <code>BigInteger#toByteArray()</code>, which is <strong>variable</strong> width: an
+  epoch-milli needs only 41 bits, so those headers arrive <strong>six</strong> bytes long, not
+  eight. And this project's own <code>x-dlq-*</code> headers are decimal text, so an attempt count
+  of <code>4</code> is one byte whose raw value is 52 &mdash; the ASCII code, not the number.</p>
+  <p>So the decoder reads decimal text first &mdash; a run of ASCII digits is unambiguous, because
+  every binary encoding above starts with a magnitude byte far below <code>'0'</code> for any
+  plausible count or timestamp &mdash; and otherwise hands the bytes to <code>BigInteger</code>,
+  which reads two's-complement big-endian at <em>any</em> width and so covers the fixed-width 4- and
+  8-byte cases as a subset of the variable-width one:</p>
+<div class="codewrap"><pre><code class="lang-java">private static long decodeNumericHeader(byte[] value, long defaultValue) {
+    if (value == null || value.length == 0) {
+        return defaultValue;
+    }
+    if (isDecimalText(value)) {
+        try {
+            return Long.parseLong(new String(value, StandardCharsets.UTF_8).trim());
+        } catch (NumberFormatException ignored) {
+            // Not text after all; fall through to the binary decode.
+        }
+    }
+    if (value.length &lt;= Long.BYTES) {
+        return new java.math.BigInteger(value).longValue();
+    }
+    return defaultValue;
+}</code></pre></div>
+  <p><code>readIntHeader</code> and <code>readLongHeader</code> are one-line wrappers over that.
+  Matching on <code>value.length == Long.BYTES</code> instead would miss
+  <code>retry_topic-original-timestamp</code> completely and silently return the default, which is
+  exactly how a record that spent 3.5 minutes on the ladder gets archived as a fresh failure. The
+  same decode is repeated verbatim in <code>DlqInspector</code>, which has no Spring dependency, and
+  in <code>AbstractIntegrationTest</code>, so the tests cannot pass on a decode the application would
+  get wrong.</p>
+</div>
+
+<h2>Deserialisation failures, and why your <code>try</code>/<code>catch</code> cannot see them</h2>
+
+<p>This is the mechanism most people meet the hard way. Deserialisation does not happen in your
+listener. It happens inside <code>KafkaConsumer.poll()</code>, while the client is turning the fetch
+response into <code>ConsumerRecord</code> objects &mdash; before any container code, any error
+handler, any offset commit, and certainly before your method body. A <code>try</code>/<code>catch</code>
+around the listener is code that never runs. The container catches the exception from
+<code>poll()</code>, logs it, and polls the same offset again. Forever.</p>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Sequence comparison: a plain JsonDeserializer throws inside poll so the listener is never reached and the same offset is polled forever, while ErrorHandlingDeserializer returns a null value plus a DeserializationException header so the record reaches the container and can be routed">
+  <text class="lbl-b" x="14" y="20">WITHOUT ErrorHandlingDeserializer &mdash; the crash loop</text>
+
+  <rect class="node"   x="14"  y="32" width="118" height="44" rx="6"/>
+  <rect class="node"   x="150" y="32" width="150" height="44" rx="6"/>
+  <rect class="node-d" x="318" y="32" width="170" height="44" rx="6"/>
+  <rect class="node"   x="506" y="32" width="150" height="44" rx="6"/>
+
+  <text class="lbl-b" x="73"  y="52" text-anchor="middle">broker fetch</text>
+  <text class="lbl-b" x="225" y="52" text-anchor="middle">poll() decodes bytes</text>
+  <text class="lbl-b" x="403" y="52" text-anchor="middle">JsonDeserializer THROWS</text>
+  <text class="lbl-b" x="581" y="52" text-anchor="middle">container logs, re-polls</text>
+  <text class="lbl-s" x="225" y="68" text-anchor="middle">inside the client, not your code</text>
+  <text class="lbl-s" x="403" y="68" text-anchor="middle">offset never committed</text>
+  <text class="lbl-s" x="581" y="68" text-anchor="middle">same offset, next second</text>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="134" y1="54" x2="146" y2="54" marker-end="url(#p31-ar4)"/>
+    <line class="edge-d" x1="302" y1="54" x2="314" y2="54" marker-end="url(#p31-ar4)"/>
+    <line class="edge-d" x1="490" y1="54" x2="502" y2="54" marker-end="url(#p31-ar4)"/>
+    <path class="edge-d" d="M 656 66 C 700 110 240 118 200 82" marker-end="url(#p31-ar4)"/>
+  </g>
+  <text class="lbl-s" x="430" y="112" text-anchor="middle">the listener, the error handler and the DLT are all downstream of a call that never returns a record</text>
+
+  <line class="dash" x1="14" y1="132" x2="806" y2="132"/>
+
+  <text class="lbl-b" x="14" y="158">WITH ErrorHandlingDeserializer &mdash; the failure becomes routable</text>
+
+  <rect class="node"   x="14"  y="170" width="118" height="52" rx="6"/>
+  <rect class="node-i" x="150" y="170" width="180" height="52" rx="6"/>
+  <rect class="node-w" x="348" y="170" width="180" height="52" rx="6"/>
+  <rect class="node-d" x="546" y="170" width="180" height="52" rx="6"/>
+
+  <text class="lbl-b" x="73"  y="190" text-anchor="middle">broker fetch</text>
+  <text class="lbl-b" x="240" y="190" text-anchor="middle">catches, returns null</text>
+  <text class="lbl-b" x="438" y="190" text-anchor="middle">listener invoked</text>
+  <text class="lbl-b" x="636" y="190" text-anchor="middle">orders.events-dlt</text>
+  <text class="lbl-s" x="240" y="206" text-anchor="middle">DeserializationException</text>
+  <text class="lbl-s" x="240" y="218" text-anchor="middle">stashed in a header</text>
+  <text class="lbl-s" x="438" y="206" text-anchor="middle">error handler sees a normal</text>
+  <text class="lbl-s" x="438" y="218" text-anchor="middle">fatal failure, excluded from retries</text>
+  <text class="lbl-s" x="636" y="206" text-anchor="middle">ORIGINAL byte[] recovered</text>
+  <text class="lbl-s" x="636" y="218" text-anchor="middle">from the exception, verbatim</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="134" y1="196" x2="146" y2="196" marker-end="url(#p31-ar5)"/>
+    <line class="edge-a" x1="332" y1="196" x2="344" y2="196" marker-end="url(#p31-ar5)"/>
+    <line class="edge-a" x1="530" y1="196" x2="542" y2="196" marker-end="url(#p31-ar5)"/>
+  </g>
+
+  <text class="lbl-s" x="14" y="252">Deserialisation therefore always "succeeds". That is the entire trick: the failure is converted from an exception the</text>
+  <text class="lbl-s" x="14" y="268">container cannot route into a record it can. The partition keeps moving, and the malformed bytes are preserved for you to read.</text>
+  <text class="lbl-s" x="14" y="290">The forwarding template's serializer must pass byte[] through untouched, or the DLT gets a base64 JSON string instead of the pill.</text>
+  <defs>
+    <marker id="p31-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p31-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The fix is not a better <code>catch</code>. It is moving the failure to a place where a
+<code>catch</code> is possible at all.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">consumer/config/KafkaConfig.java &mdash; the poison pill defence, wired<span class="lang">java</span></div>
+<pre><code class="lang-java">JsonDeserializer&lt;OrderEvent&gt; jsonDeserializer =
+        new JsonDeserializer&lt;&gt;(OrderEvent.class, objectMapper, false);
+// The producer is Debezium, not Spring, so there are no __TypeId__ headers to honour and
+// nothing to strip. Target type comes from the constructor above.
+jsonDeserializer.addTrustedPackages("com.acme.consumer.model");
+
+return new DefaultKafkaConsumerFactory&lt;&gt;(
+        props,
+        new StringDeserializer(),
+        new ErrorHandlingDeserializer&lt;&gt;(jsonDeserializer));</code></pre>
+</div>
+
+<p>The second half of the defence is on the way <em>out</em>. When a poison pill is forwarded, the
+value being published is the original <code>byte[]</code> recovered from the
+<code>DeserializationException</code> &mdash; not an <code>OrderEvent</code>. A plain
+<code>JsonSerializer</code> would base64-encode those bytes into a JSON string, and the DLT would hold
+a mangled copy of the one thing you need to look at.</p>
+
+<div class="codewrap">
+<div class="codehead">consumer/config/KafkaConfig.java &mdash; bytes in, bytes out<span class="lang">java</span></div>
+<pre><code class="lang-java">static final class PayloadOrRawBytesSerializer implements Serializer&lt;Object&gt; {
+    @Override
+    public byte[] serialize(String topic, Object data) {
+        if (data == null) {
+            return null;
+        }
+        if (data instanceof byte[] bytes) {
+            return byteArraySerializer.serialize(topic, bytes);
+        }
+        if (data instanceof String string) {
+            return stringSerializer.serialize(topic, string);
+        }
+        try {
+            return objectMapper.writeValueAsBytes(data);
+        } catch (Exception e) {
+            // Failing to serialise a record on its way to the DLT would lose the failure
+            // itself. Degrade to a readable marker instead of throwing.
+            log.error("Could not serialise {} for topic {}; writing a diagnostic stub instead",
+                    data.getClass().getName(), topic, e);
+            return ("{\"serializationError\":\"" + e.getClass().getName()
+                    + "\",\"type\":\"" + data.getClass().getName() + "\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+        }
+    }
+}</code></pre>
+</div>
+
+<p>The integration test asserts exactly this property, and it is the assertion to steal for your own
+codebase:</p>
+
+<div class="codewrap">
+<div class="codehead">consumer/src/test/.../RetryAndDltTest.java<span class="lang">java</span></div>
+<pre><code class="lang-java">assertThat(new String(dead.value(), StandardCharsets.UTF_8))
+        .as("the DLT holds the ORIGINAL bytes, byte for byte. This is why the forwarding "
+                + "template's serializer has to pass byte[] through untouched - anything "
+                + "else would mangle the one artefact you need in order to debug.")
+        .isEqualTo(malformed);</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The <code>@DltHandler</code> never sees a poison pill</span>
+  <p>The DLT container deserialises with the same <code>JsonDeserializer</code> that already rejected
+  those bytes once, so it fails again. <code>DltStrategy.FAIL_ON_ERROR</code> logs and moves on, which
+  is the safe outcome &mdash; the alternative, <code>ALWAYS_RETRY_ON_ERROR</code>, republishes the
+  record to the DLT forever and you discover it as an unbounded topic. The consequence is that
+  <code>dlq_record</code> has <strong>no row</strong> for a poison pill: the archive covers what could
+  be parsed. Reading the raw bytes is what <code>DlqInspector describe</code> is for, and its
+  best-effort printer says so explicitly &mdash; <code>"&lt;-- not valid JSON (this is the poison
+  pill)"</code>.</p>
+</div>
+
+<h2>The idempotent consumer</h2>
+
+<p>Every mechanism above is at-least-once. Debezium re-emits an outbox row after a connector restart
+whose offsets were not flushed; the consumer processes a record and dies before committing; a
+rebalance revokes a partition between processing and commit. None of those can be engineered away, so
+the consumer is built to make duplicates harmless instead. The guard is one insert with a unique
+constraint, <strong>in the same transaction as the effect</strong>.</p>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="State machine of one transaction: insert the idempotency marker, branch on zero rows for a duplicate, apply the effect, commit or roll back both together; and the broken variant where the marker commits separately">
+  <rect class="node-a" x="14" y="26" width="120" height="44" rx="7"/>
+  <text class="lbl-b" x="74" y="46" text-anchor="middle">BEGIN</text>
+  <text class="lbl-s" x="74" y="62" text-anchor="middle">READ_COMMITTED</text>
+
+  <rect class="node-i" x="170" y="26" width="180" height="44" rx="7"/>
+  <text class="lbl-b" x="260" y="46" text-anchor="middle">INSERT processed_message</text>
+  <text class="lbl-s" x="260" y="62" text-anchor="middle">ON CONFLICT (event_id) DO NOTHING</text>
+
+  <rect class="node-o" x="386" y="8" width="160" height="42" rx="7"/>
+  <text class="lbl-b" x="466" y="26" text-anchor="middle">0 rows &rarr; duplicate</text>
+  <text class="lbl-s" x="466" y="42" text-anchor="middle">return false, COMMIT (no-op)</text>
+
+  <rect class="node-w" x="386" y="60" width="160" height="42" rx="7"/>
+  <text class="lbl-b" x="466" y="78" text-anchor="middle">1 row &rarr; first sight</text>
+  <text class="lbl-s" x="466" y="94" text-anchor="middle">apply the business effect</text>
+
+  <rect class="node-o" x="586" y="8" width="220" height="42" rx="7"/>
+  <text class="lbl-b" x="696" y="26" text-anchor="middle">COMMIT &mdash; marker + effect together</text>
+  <text class="lbl-s" x="696" y="42" text-anchor="middle">no window where one is visible without the other</text>
+
+  <rect class="node-d" x="586" y="60" width="220" height="42" rx="7"/>
+  <text class="lbl-b" x="696" y="78" text-anchor="middle">effect throws &rarr; ROLLBACK BOTH</text>
+  <text class="lbl-s" x="696" y="94" text-anchor="middle">marker vanishes, so the retry is reprocessed</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="136" y1="48" x2="166" y2="48" marker-end="url(#p31-ar6)"/>
+    <line class="edge" x1="352" y1="40" x2="382" y2="30" marker-end="url(#p31-ar6)"/>
+    <line class="edge" x1="352" y1="56" x2="382" y2="76" marker-end="url(#p31-ar6)"/>
+    <line class="edge" x1="548" y1="28" x2="582" y2="28" marker-end="url(#p31-ar6)"/>
+    <line class="edge" x1="548" y1="82" x2="582" y2="30" marker-end="url(#p31-ar6)"/>
+    <line class="edge" x1="548" y1="90" x2="582" y2="82" marker-end="url(#p31-ar6)"/>
+  </g>
+
+  <rect class="node-d" x="14" y="132" width="792" height="66" rx="7"/>
+  <text class="lbl-b" x="410" y="152" text-anchor="middle">THE BROKEN VARIANT &mdash; marker in its own transaction (@Transactional(propagation = REQUIRES_NEW), a Redis SETNX, a local cache)</text>
+  <text class="lbl-s" x="410" y="170" text-anchor="middle">marker COMMITS &rarr; effect throws &rarr; record walks the ladder &rarr; every redelivery sees the committed marker and is skipped as a duplicate</text>
+  <text class="lbl-s" x="410" y="186" text-anchor="middle">The event is lost, silently, while every metric says it was handled. This is the single most common idempotency bug.</text>
+
+  <text class="lbl-s" x="14" y="222">The dedupe key is the producer-assigned eventId &mdash; not the offset (it changes on every retry hop) and not a payload hash (legitimately identical events collide).</text>
+  <defs>
+    <marker id="p31-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Two properties, both from the single transaction: a failed apply cannot poison the event,
+and a successful apply cannot be repeated.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">consumer/service/IdempotentProcessor.java &mdash; the guard<span class="lang">java</span></div>
+<pre><code class="lang-java">@Transactional(propagation = Propagation.REQUIRED, isolation = Isolation.READ_COMMITTED)
+public boolean process(OrderEvent event, String topic, int partition, long offset,
+                       String consumerGroup) {
+
+    validate(event);
+
+    int inserted = jdbcTemplate.update(INSERT_MARKER,
+            event.eventId(), topic, partition, offset, consumerGroup,
+            new Timestamp(System.currentTimeMillis()));
+
+    if (inserted == 0) {
+        // The unique constraint on processed_message.event_id did its job. Note that we return
+        // normally rather than throwing: a duplicate is a success, not an error. Throwing here
+        // would send perfectly healthy redeliveries to the DLT.
+        log.info("Duplicate event {} for order {} from {}-{}@{} - effect already applied, skipping",
+                event.eventId(), event.orderId(), topic, partition, offset);
+        return false;
+    }
+
+    // ---------------------------------------------------------------
+    // The business effect. Still inside the same transaction as the
+    // marker above, so the two commit or roll back as one.
+    // ---------------------------------------------------------------
+    simulateFailureIfRequested(event);
+    applyToProjection(event);
+    ...
+}</code></pre>
+</div>
+
+<p><code>READ_COMMITTED</code> is deliberate and sufficient: two concurrent deliveries of the same
+event race on the <code>processed_message</code> primary key, and the loser either sees zero affected
+rows or blocks until the winner commits and then sees zero. Higher isolation buys nothing except
+serialisation failures.</p>
+
+<div class="box ok">
+  <span class="bt">The assertion that proves the coupling</span>
+  <p>After a retryable failure walks all four attempts, <code>RetryAndDltTest</code> asserts that
+  <code>processed_message</code> is <em>empty</em> for that <code>eventId</code>:</p>
+<div class="codewrap"><pre><code class="lang-java">assertThat(processedMessageCount(eventId))
+        .as("the idempotency marker is written inside the same transaction as the effect, "
+                + "so four failed attempts must leave no trace at all")
+        .isZero();</code></pre></div>
+  <p>Exercise 3 in the README is to break this on purpose &mdash; move the marker into
+  <code>REQUIRES_NEW</code> and watch the event disappear while the logs report success.</p>
+</div>
+
+<h2>Replay: the workflow and its safeguards</h2>
+
+<p>The DLT is not an archive you read; it is a queue you eventually drain. Replay is the drain, and it
+is the most dangerous operation in the whole pipeline &mdash; a mistyped filter republishes four
+thousand records onto a production topic. <code>DlqInspector</code> is built around that risk.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Safeguard</th><th>How</th><th>The mistake it prevents</th></tr></thead>
+<tbody>
+<tr><td><strong>Dry run by default</strong></td><td>Nothing is published without <code>--execute</code></td><td>Learning the flag ordering on a live topic</td></tr>
+<tr><td><strong>No consumer group</strong></td><td><code>assign()</code> + <code>seekToBeginning()</code>, offsets never committed</td><td>The tool stealing records from the application's own DLT consumer, or hiding them from a second run</td></tr>
+<tr><td><strong>Byte-level reads</strong></td><td><code>ByteArrayDeserializer</code> in, <code>ByteArraySerializer</code> out</td><td>Choking on exactly the records you most need to see</td></tr>
+<tr><td><strong>Framework headers stripped</strong></td><td><code>kafka_dlt-</code>, <code>retry_topic-</code>, <code>x-dlq-</code> prefixes dropped</td><td>The next failure's diagnostics describing the <em>previous</em> incident</td></tr>
+<tr><td><strong>Origin recovered</strong></td><td><code>stripRetrySuffix</code> on <code>kafka_dlt-original-topic</code></td><td>Republishing onto a retry topic instead of the real source</td></tr>
+<tr><td><strong>Replay never deletes</strong></td><td>The DLT keeps the originals; expiry is a separate decision</td><td>Losing the evidence the moment the fix looks like it worked</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">tools/DlqInspector.java &mdash; what a replay actually publishes<span class="lang">java</span></div>
+<pre><code class="lang-java">ProducerRecord&lt;String, byte[]&gt; outbound =
+        new ProducerRecord&lt;&gt;(target, null, record.key(), record.value());
+
+// Carry the application's own headers across (trace ids, event type, ...) but drop
+// every framework diagnostic: the replayed record must fail on its own merits.
+record.rawHeaders().forEach(header -&gt; {
+    if (!isStripped(header.key())) {
+        outbound.headers().add(header);
+    }
+});
+
+outbound.headers().add(new RecordHeader(REPLAY_MARKER,
+        (record.topic() + "-" + record.partition() + "@" + record.offset())
+                .getBytes(StandardCharsets.UTF_8)));
+outbound.headers().add(new RecordHeader(REPLAY_AT,
+        String.valueOf(System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8)));</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the dry run, and the advice it prints<span class="lang">bash</span></div>
+<pre><code class="lang-bash">$ make replay                       # or: dlq-inspector replay --exception RetryableException
+
+REPLAY (DRY RUN): 3 record(s) selected from orders.events-dlt
+----------------------------------------------------------------------------------------------------
+  SEND  0@4        key=8f14e45f-...                        -&gt; orders.events (214 bytes)
+  SEND  1@2        key=c9bb1f30-...                        -&gt; orders.events (211 bytes)
+  SKIP  2@0        no kafka_dlt-original-topic header and no --target-topic
+----------------------------------------------------------------------------------------------------
+2 to send, 1 skipped
+
+Dry run. Nothing was published. Re-run with --execute to publish.
+Before you do: fix the cause. Replaying into an unfixed consumer
+just refills the DLT, and each pass adds another x-replayed-from-dlt
+header to records that are already hard to read.</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Replay is only safe because the consumer is idempotent</span>
+  <p>A replayed record is a duplicate by construction. If it had already been applied before the
+  failure &mdash; say the effect committed and the DLT record came from a later, unrelated hop &mdash;
+  the <code>processed_message</code> ledger rejects it and <code>apply_count</code> does not move. If
+  it had not, it is applied normally. Without the ledger, "replay the DLT" and "double-charge every
+  customer in it" are the same command. The correct order of operations is always: fix the cause,
+  deploy, dry run, read the plan, then <code>--execute</code>.</p>
+</div>
+
+<h2>Monitoring: three signals, and what each one means</h2>
+
+<p>The DLT is a metric, not just a topic. Three numbers cover almost every real incident, and they
+answer different questions &mdash; you need all three.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Signal</th><th>Where it comes from</th><th>What a bad value means</th><th>Suggested alert</th></tr></thead>
+<tbody>
+<tr><td><strong>DLT depth</strong></td><td>Consumer-group lag on <code>orders.events-dlt</code>, or <code>count(*)</code> on <code>dlq_record</code></td><td>Something is systematically failing. A step change points at a deploy; a ramp points at a dependency</td><td>Any increase over a 15-minute window; page on a rate, not a total</td></tr>
+<tr><td><strong>Retry rate</strong></td><td>Records/s into <code>orders.events-retry-5000</code> &divide; records/s into <code>orders.events</code></td><td>The <em>leading</em> indicator &mdash; it moves 3.5 minutes before the DLT does. A rising ratio with a flat DLT means a dependency is degraded but recovering</td><td>Ratio above a few percent sustained</td></tr>
+<tr><td><strong>Oldest untriaged age</strong></td><td><code>now() - min(dead_lettered_at)</code> over unresolved <code>dlq_record</code> rows</td><td>Nobody is draining the DLT. The 30-day retention is a deadline, and records that expire are gone</td><td>Older than your triage SLA, well inside 30 days</td></tr>
+<tr><td><strong>Time on the ladder</strong></td><td><code>dead_lettered_at - first_failure_at</code></td><td>&asymp;&nbsp;0 means fatal-on-sight (bad data or a bad deploy); &asymp;&nbsp;215&nbsp;s means the ladder was fully walked (a real dependency failure)</td><td>Not an alert &mdash; a dashboard split that tells you which team to wake</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">triage queries against the archive table<span class="lang">sql</span></div>
+<pre><code class="lang-sql">-- What is failing, and is it one thing or many?
+SELECT exception_class, count(*) AS n, max(dead_lettered_at) AS latest
+FROM dlq_record
+WHERE dead_lettered_at &gt; now() - interval '1 hour'
+GROUP BY exception_class
+ORDER BY n DESC;
+
+-- Fatal on sight, or exhausted the ladder? The gap is the whole diagnosis.
+SELECT attempt_count,
+       count(*),
+       avg(dead_lettered_at - first_failure_at) AS avg_time_failing
+FROM dlq_record
+GROUP BY attempt_count
+ORDER BY attempt_count;
+
+-- Is anybody draining the DLT?
+SELECT now() - min(dead_lettered_at) AS oldest_untriaged, count(*) AS backlog
+FROM dlq_record;</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Retention asymmetry is deliberate</span>
+  <p><code>orders.events</code> keeps 7 days; <code>orders.events-dlt</code> keeps 30, with
+  <code>cleanup.policy=delete</code>. A DLT that expires before anyone triages it is a deleted
+  incident report. The asymmetry also means you can still replay a record whose <em>original</em> has
+  aged out of the main topic &mdash; the DLT carries the payload, so publishing it back does not
+  depend on the source still existing.</p>
+</div>
+
+<details><summary>Reproducing every path in about four minutes</summary>
+<div class="dbody">
+<div class="codewrap"><pre><code class="lang-bash">make fail-retryable     # walks 5s -&gt; 30s -&gt; 180s, DLT at ~215s. Watch the consumer log:
+                        # it keeps processing the main topic the entire time.
+make topics             # the three retry tiers now exist, named after their delays
+
+make fail-fatal         # NonRetryableException: in the DLT within milliseconds,
+                        # no retry topic is touched at all
+
+make poison             # malformed bytes published straight to orders.events.
+                        # The consumer does not crash-loop; the bytes reach the DLT intact.
+
+make dlq-list           # one line per record + a breakdown by exception class
+make dlq-describe       # every header decoded, the raw payload, the stack trace
+make dlq-table          # the same failures as SQL rows (poison pills are absent - by design)
+
+make replay             # DRY RUN: prints the plan, publishes nothing
+make replay-execute     # actually republish, to the resolved ORIGINAL topic
+make projection         # apply_count did not move for anything already applied</code></pre></div>
+</div>
+</details>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>A partition is one cursor. You cannot skip or hold a single message, so every error-handling
+  design reduces to <em>where do I move the failure</em> &mdash; a retry topic, the DLT, or nowhere,
+  in which case the partition stalls.</li>
+  <li>Classification is the only decision that matters, and it has exactly one right question: would
+  the identical bytes, replayed in five minutes, have a real chance of working? Retryable by default
+  is the safe polarity &mdash; an unclassified exception should be retried and dead-lettered loudly,
+  not discarded.</li>
+  <li>The classifier must traverse causes. <code>NonRetryableException</code> arrives wrapped in
+  <code>ListenerExecutionFailedException</code>, and <code>DeserializationException</code> wraps the
+  Jackson error underneath it &mdash; a check on <code>e.getClass()</code> matches neither.</li>
+  <li>Non-blocking retries buy a partition that never stalls and cost per-key ordering for the failing
+  key. That is a data-model decision, not a config decision: fine for a projection of independent
+  facts, corruption for a state machine.</li>
+  <li>Naming retry topics after their delay makes the ladder readable from
+  <code>kafka-topics.sh --list</code>, and it makes a clamped tier visible as a collision instead of a
+  silently missing attempt. Budget the longest single tier against
+  <code>max.poll.interval.ms</code> &mdash; here 180&nbsp;s against 900&nbsp;s.</li>
+  <li>Deserialisation happens inside <code>poll()</code>, so no <code>try</code>/<code>catch</code> in
+  your listener can ever see it. <code>ErrorHandlingDeserializer</code> converts an unroutable
+  exception into a routable record; the forwarding serializer must then pass <code>byte[]</code>
+  through untouched, or the DLT holds a mangled copy of the evidence.</li>
+  <li>The idempotency marker and the business effect must share one transaction. Committing the marker
+  separately is the single most common bug in this pattern: the effect fails, the retry is skipped as
+  a duplicate, and the event is lost while every metric reports success.</li>
+  <li>Replay is dry by default, strips framework headers, recovers the true origin topic from the
+  <code>-retry-&lt;delay&gt;</code> suffix, and never deletes. Alert on the retry rate, not just the DLT
+  depth &mdash; it moves 3.5 minutes earlier.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="01-design.html"><span class="lb">Previous</span>The dual-write problem &amp; outbox</a>
+  <a href="03-running.html"><span class="lb">Next</span>Running, testing &amp; exercises</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

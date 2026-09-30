@@ -1,0 +1,1133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Expiry, eviction &amp; persistence &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Mini-Redis: an in-memory store in Go</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Expiry, eviction &amp; persistence</h1>
+<p class="lede">The three mechanisms that turn a concurrent map into a cache: an expiry that never
+scans the keyspace, a sampled LRU and LFU that never maintains a list, and an append-only log whose
+durability you dial. All three are approximate on purpose; this page is what each gives up.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24.6</span>
+  <span class="tag">store &amp; persistence</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The one idea underneath all three</span>
+  <p><strong>Every exact algorithm here costs O(keyspace) somewhere &mdash; time, memory or lock
+  contention; the approximate one costs O(1) with a bound you can state.</strong> Exact expiry is a
+  timer per key; exact LRU is a list every read must mutate; exact durability is an
+  <code>fsync</code> per command. Redis approximates all three and makes the error <em>bounded</em>:
+  ~25&nbsp;% of volatile keys awaiting reclamation, a victim from the oldest sixth, one second of
+  writes. The tests assert those bounds, not the outcomes.</p>
+</div>
+
+<h2>Expiry, half one: passive on access</h2>
+
+<p>A key with a TTL is not deleted when the TTL passes. It is deleted when something next
+<em>looks</em> at it. That is the whole of passive expiry, and it lives in one branch of
+<code>Store.lookup</code>:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/store.go &mdash; the passive half is four lines<span class="lang">go</span></div>
+<pre><code class="lang-go">// lookup returns the live value for key, deleting it first if it has expired.
+//
+// This is *passive* expiry: a key with a TTL in the past is still physically
+// present until something touches it. Together with the active cycle in
+// expire.go it is how Redis keeps expiry O(1) on the hot path.
+func (s *Store) lookup(sh *shard, key string) *Value {
+	v, ok := sh.entries[key]
+	if !ok {
+		s.counters.misses.Add(1)
+		return nil
+	}
+	if v.expireAt != 0 &amp;&amp; v.expireAt &lt;= s.now() {
+		sh.drop(key, v)
+		s.counters.expired.Add(1)
+		s.counters.misses.Add(1)
+		return nil
+	}
+	s.counters.hits.Add(1)
+	s.touch(v)
+	return v
+}</code></pre>
+</div>
+
+<p>One comparison against an <code>int64</code> on a cache line the lookup already pulled in. Free, and
+it makes the guarantee absolute: <strong>an expired key is never visible to a client</strong>, however
+far behind the background cycle is. <code>expireAt</code> is an <em>absolute</em> Unix-millisecond
+timestamp, not a duration &mdash; the decision that makes AOF replay and snapshots correct.</p>
+
+<p>A second reader must not have <code>lookup</code>'s side effects, and forgetting it is the classic
+bug in this design:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/store.go &mdash; the read that must not count as a read<span class="lang">go</span></div>
+<pre><code class="lang-go">// peek is lookup without the hit/miss accounting or the LRU/LFU touch. Scans,
+// TTL inspection and eviction sampling use it: looking at a key to decide
+// whether to evict it must not make that key look recently used.
+func (s *Store) peek(sh *shard, key string) *Value {
+	v, ok := sh.entries[key]
+	if !ok {
+		return nil
+	}
+	if v.expireAt != 0 &amp;&amp; v.expireAt &lt;= s.now() {
+		return nil
+	}
+	return v
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt"><code>peek</code> hides the key but does not reclaim it</span>
+  <p><code>peek</code> returns <code>nil</code> without calling <code>drop</code> &mdash; right for
+  <code>TTL</code>, <code>SCAN</code> and eviction sampling, none of which should mutate a shard they
+  only meant to inspect. But the entry is still in the map, still in <code>sh.expires</code>, still
+  counted in <code>sh.mem</code>. So <code>Store.Len</code> filters explicitly and
+  <code>MemoryUsed</code> genuinely over-reports &mdash; not fixable by tightening the accounting,
+  because it is exactly what the 25&nbsp;% rule bounds.</p>
+</div>
+
+<h2>Expiry, half two: the active sampling cycle</h2>
+
+<p>Passive expiry alone leaks: a key written once with a TTL and never read again occupies memory
+forever. Something has to go looking. The rejected alternatives matter more than the chosen one,
+because each is the design someone reaches for first:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>What it costs per key with a TTL</th><th>Why it is not what this server does</th></tr></thead>
+<tbody>
+<tr><td><strong>One <code>time.AfterFunc</code> per key</strong></td><td>A runtime timer heap entry, a closure, and a goroutine wake at the deadline. Every <code>EXPIRE</code> is a <code>Stop</code>+<code>Reset</code>.</td><td>10M volatile keys means 10M live timers. Worse, deadlines cluster &mdash; a deploy that writes a million keys with <code>EX 3600</code> fires a million callbacks in the same millisecond, each of which wants a shard lock. A thundering herd with no back pressure.</td></tr>
+<tr><td><strong>One global deadline min-heap</strong></td><td>O(log N) on every TTL set, change and <code>DEL</code>, plus a per-key index so deletion can find its heap slot.</td><td>It reintroduces exactly the single globally contended structure that sharding the keyspace was for. Every write with a TTL would serialise on it.</td></tr>
+<tr><td><strong>Scan all volatile keys each tick</strong></td><td>O(V) with the shard lock held.</td><td>A 200k-key shard walk at <code>-hz 10</code> is a stall every 100&nbsp;ms. This is the thing an in-memory server exists not to do.</td></tr>
+<tr><td><strong>Sample and re-sample while it pays</strong></td><td>20 map iterations under a briefly held lock, repeated only while the sample is dense with dead keys.</td><td><strong>This one.</strong> The cost is a function of the sample size, not the keyspace &mdash; and it self-tunes: a keyspace full of dead keys gets more attention automatically.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/store/expire.go &mdash; the three constants that define the algorithm<span class="lang">go</span></div>
+<pre><code class="lang-go">const (
+	// activeExpireSampleSize is how many volatile keys one sampling round looks
+	// at. Redis uses ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP = 20.
+	activeExpireSampleSize = 20
+
+	// activeExpireThresholdNum/Den is the "keep going" threshold: if more than
+	// 25% of the sample was expired, the shard is probably full of dead keys,
+	// so sample again immediately. Below that, stop and let the next cron tick
+	// pick it up. The choice of 25% bounds the expected fraction of expired-but-
+	// still-resident keys in the keyspace.
+	activeExpireThresholdNum = 1
+	activeExpireThresholdDen = 4
+
+	// activeExpireMaxRounds caps the work per shard per cycle so that a
+	// keyspace where everything expires at once cannot monopolise the cron
+	// goroutine. Redis bounds the same loop by a time budget instead.
+	activeExpireMaxRounds = 16
+)</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="State machine of one active expiry cycle: the cron tick locks each shard, samples twenty volatile keys, deletes the expired ones, and loops back to sample again only while more than a quarter of the sample was dead">
+  <text class="lbl-b" x="14" y="20">One call to ActiveExpireCycle(), per shard</text>
+
+  <rect class="node"   x="14"  y="34" width="118" height="52" rx="7"/>
+  <text class="lbl-b" x="73"  y="56" text-anchor="middle">cron tick</text>
+  <text class="lbl-s" x="73"  y="72" text-anchor="middle">every 1/hz = 100 ms</text>
+
+  <rect class="node-i" x="176" y="34" width="180" height="52" rx="7"/>
+  <text class="lbl-b" x="266" y="56" text-anchor="middle">lock shard, range</text>
+  <text class="mono"  x="266" y="74" text-anchor="middle">sh.expires</text>
+
+  <rect class="node-a" x="400" y="34" width="180" height="52" rx="7"/>
+  <text class="lbl-b" x="490" y="56" text-anchor="middle">sample S &le; 20 keys</text>
+  <text class="lbl-s" x="490" y="72" text-anchor="middle">count D that are dead</text>
+
+  <rect class="node-w" x="624" y="34" width="182" height="52" rx="7"/>
+  <text class="lbl-b" x="715" y="56" text-anchor="middle">drop the dead ones</text>
+  <text class="lbl-s" x="715" y="72" text-anchor="middle">entries + expires + mem</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="134" y1="60" x2="172" y2="60" marker-end="url(#p41-ar1)"/>
+    <line class="edge" x1="358" y1="60" x2="396" y2="60" marker-end="url(#p41-ar2)"/>
+    <line class="edge" x1="582" y1="60" x2="620" y2="60" marker-end="url(#p41-ar3)"/>
+  </g>
+
+  <rect class="node-d" x="560" y="126" width="246" height="52" rx="7"/>
+  <text class="lbl-b" x="683" y="148" text-anchor="middle">D &times; 4 &gt; S &times; 1 ?</text>
+  <text class="lbl-s" x="683" y="164" text-anchor="middle">was more than a quarter of it dead?</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="715" y1="88" x2="700" y2="122" marker-end="url(#p41-ar4)"/>
+  </g>
+
+  <g color="var(--accent)">
+    <path class="edge-a" d="M 560 152 C 470 152 500 110 494 92" marker-end="url(#p41-ar5)"/>
+  </g>
+  <text class="lbl-s" x="470" y="140" text-anchor="middle">YES &rarr; resample immediately, same shard, same lock cycle</text>
+  <text class="lbl-s" x="470" y="156" text-anchor="middle">(bounded at 16 rounds &mdash; then stop regardless)</text>
+
+  <rect class="node-o" x="560" y="206" width="246" height="44" rx="7"/>
+  <text class="lbl-b" x="683" y="224" text-anchor="middle">stop &rarr; next shard</text>
+  <text class="lbl-s" x="683" y="240" text-anchor="middle">wait for the next tick</text>
+  <g color="var(--border-strong)">
+    <line class="edge" x1="683" y1="180" x2="683" y2="202" marker-end="url(#p41-ar6)"/>
+  </g>
+  <text class="lbl-s" x="812" y="196" text-anchor="end">NO</text>
+
+  <text class="lbl-s" x="14" y="212">Steady state: one round per shard</text>
+  <text class="lbl-s" x="14" y="228">per tick &mdash; 20 &times; 16 shards = 320</text>
+  <text class="lbl-s" x="14" y="244">samples per tick, 3,200/second.</text>
+  <text class="lbl-s" x="14" y="268">Worst case: 16 rounds &times; 20 = 320</text>
+  <text class="lbl-s" x="14" y="284">samples per shard, then it yields.</text>
+
+  <text class="lbl-s" x="300" y="212">The lock is taken and released once</text>
+  <text class="lbl-s" x="300" y="228">per round, not once per cycle: a</text>
+  <text class="lbl-s" x="300" y="244">16-round burst on a hot shard still</text>
+  <text class="lbl-s" x="300" y="268">lets 15 windows of client commands</text>
+  <text class="lbl-s" x="300" y="284">through in between.</text>
+
+  <defs>
+    <marker id="p41-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The loop-back edge is the entire algorithm. Without it the cycle reclaims 20 keys per
+shard per tick regardless of how much is dead; with it, a keyspace that just expired en masse gets
+16&times; the attention and a quiet one gets none.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/store/expire.go &mdash; the cycle<span class="lang">go</span></div>
+<pre><code class="lang-go">func (s *Store) ActiveExpireCycle() int {
+	s.counters.cycles.Add(1)
+	total := 0
+	for _, sh := range s.shards {
+		for round := 0; round &lt; activeExpireMaxRounds; round++ {
+			sampled, expired := s.expireSampleRound(sh)
+			total += expired
+			if sampled == 0 {
+				break
+			}
+			// Keep going only while the sample was dense with dead keys.
+			if expired*activeExpireThresholdDen &lt;= sampled*activeExpireThresholdNum {
+				break
+			}
+		}
+	}
+	return total
+}</code></pre>
+</div>
+
+<p>The comparison is integer cross-multiplication, <code>expired*4 &lt;= sampled*1</code>, not a float
+division: no rounding, no divide, and the threshold stays a pair of constants you can move to
+<code>1/8</code> and re-run <code>expire_test.go</code> against.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/expire.go &mdash; one round<span class="lang">go</span></div>
+<pre><code class="lang-go">// The sample is drawn by iterating the shard's `expires` set. Go randomises the
+// starting bucket of every map range, which is precisely the uniform-ish sample
+// this algorithm needs; Redis has to call dictGetRandomKey explicitly to get
+// the same effect.
+func (s *Store) expireSampleRound(sh *shard) (sampled, expired int) {
+	now := s.now()
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if len(sh.expires) == 0 {
+		return 0, 0
+	}
+	var doomed []string
+	for key := range sh.expires {
+		sampled++
+		v, ok := sh.entries[key]
+		if !ok {
+			// Defensive: the expires set should never outlive its entry.
+			doomed = append(doomed, key)
+			continue
+		}
+		if v.expireAt != 0 &amp;&amp; v.expireAt &lt;= now {
+			doomed = append(doomed, key)
+		}
+		if sampled &gt;= activeExpireSampleSize {
+			break
+		}
+	}
+	for _, key := range doomed {
+		if v, ok := sh.entries[key]; ok {
+			sh.drop(key, v)
+			expired++
+		} else {
+			delete(sh.expires, key)
+		}
+	}
+	s.counters.expired.Add(uint64(expired))
+	return sampled, expired
+}</code></pre>
+</div>
+
+<p>Two details carry weight. The sample comes from <code>sh.expires</code> &mdash; <em>exactly</em> the
+keys carrying a TTL &mdash; not from <code>sh.entries</code>: with ten million keys and a hundred
+TTLs, sampling the main table finds an expired key roughly never. And deletions happen in a second
+pass over <code>doomed</code>, because deleting from a map you are ranging over is legal in Go but
+its interaction with the 20-key bound is not worth reasoning about.</p>
+
+<h3>The arithmetic behind 25&nbsp;%</h3>
+
+<div class="codewrap">
+<div class="codehead">why a fraction, why 25, why 20<span class="lang">text</span></div>
+<pre><code class="lang-text">ONE ROUND:  draw S = 20 keys from the shard's volatile set; D of them are dead.
+CONTINUE WHILE:   D * 4 &gt; S * 1        i.e.   D/S &gt; 25%
+
+WHY A FRACTION AND NOT A COUNT
+  D/S estimates the DENSITY of dead keys in the volatile set. Stopping at 25%
+  means: when the cycle gives up, its best estimate of the dead-but-resident
+  fraction is &lt;= 1/4. That is the actual guarantee this design offers. It is
+  NOT "a key is reclaimed within X ms" - nothing here promises that. It is
+  "at most about a quarter of the volatile keys are waiting", which is what
+  bounds the wasted memory, and therefore what maxmemory has to be sized for.
+
+WHY IT CONVERGES
+  A round at density f deletes about f*20 keys, so the density falls
+  geometrically while it stays above the threshold. Starting from f = 1.0 on a
+  volatile set of V keys it takes roughly  ln(0.25) / ln(1 - 20/V)  rounds to
+  fall under 25%. V = 1000 -&gt; ~69 rounds. That is why the 16-round cap exists:
+  the convergence is fine, the LATENCY of getting there is not, and the cap
+  converts "one long stall" into "spread over the next few ticks".
+
+WHY S = 20 AND NOT 200
+  sd(D/S) = sqrt(f(1-f)/S).  At f = 0.25, S = 20:  sd = 0.097.
+  One round reads the density to about +/- 10 percentage points - far too
+  noisy to trust. It is not trusted once. At -hz 10 the decision is retaken
+  ten times a second per shard, so the error averages across ticks instead of
+  being averaged inside one long lock-holding round. Sampling more per round
+  buys precision you do not need and lock hold time you cannot afford.</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Go's map randomisation gives you a random <em>window</em>, not a random subset</span>
+  <p>What Go randomises is the <em>starting bucket and cell</em>; after that, iteration is in bucket
+  order. So one round's 20 keys are 20 consecutive entries from a random offset, not 20 independent
+  draws &mdash; keys hashing into the same bucket are always sampled together, and a shard whose dead
+  keys cluster reads deader or livelier than it is. Real Redis calls <code>dictGetRandomKey</code> per
+  draw to avoid this. It does not break the algorithm &mdash; the decision is retaken 10&times; a
+  second from a fresh offset &mdash; but a test asserting one round's density will be flaky.</p>
+</div>
+
+<h2>Eviction: why there is no LRU list</h2>
+
+<p>A textbook LRU cache is a hash map plus a doubly linked list, and every <em>read</em> unlinks a
+node and relinks it at the head. Count that here: two pointer writes per read, dirtying a cache line
+on every operation; a node elsewhere in memory, so an extra cache miss on the hot path; and a global
+list, so with the keyspace split into 16 independently locked shards it is one lock every reader on
+every shard must take. Not a smaller problem &mdash; the whole problem back again.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/evict.go &mdash; the metadata that replaces the list<span class="lang">go</span></div>
+<pre><code class="lang-go">// lruClock returns the coarse second-resolution clock stored on each value.
+// Second resolution is deliberate: it is all the precision an approximated LRU
+// needs, and it keeps the per-object metadata small.
+func (s *Store) lruClock() uint32 { return uint32(s.now() / 1000) }
+
+// touch records an access. Called by every lookup, so it must be cheap: two
+// field writes for LRU, a decay plus a probabilistic increment for LFU.
+func (s *Store) touch(v *Value) {
+	if s.Policy().isLFU() {
+		v.lfu = s.lfuLogIncr(s.lfuDecay(v))
+		v.lfuDecay = s.lfuMinutes()
+		return
+	}
+	v.lru = s.lruClock()
+}</code></pre>
+</div>
+
+<p>That is the trade: nine bytes inline in the <code>Value</code> struct, one store instruction on the
+read path, no shared structure, no lock. The cost is that eviction no longer knows which key is
+oldest &mdash; it has to go and find out.</p>
+
+<div class="box gotcha">
+  <span class="bt">Switching <code>maxmemory-policy</code> at runtime leaves stale metadata behind</span>
+  <p><code>touch</code> updates <em>only</em> the metric the current policy uses, which
+  <code>TestOnlyTheActivePolicysMetadataIsUpdated</code> pins down. So after
+  <code>CONFIG SET maxmemory-policy allkeys-lfu</code> on a server that ran <code>allkeys-lru</code>
+  for a week, every key still carries its birth counter of <code>lfuInitVal = 5</code>, which
+  <code>lfuDecay</code> ages to <strong>0</strong> over "idleness" that never happened. Every old key
+  now scores identically cold, so the first eviction wave is effectively random and discards your
+  hottest data. Change the policy at a restart.</p>
+</div>
+
+<h2>Sampled LRU, and how good the approximation is</h2>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="The eviction sampler draws candidates from a random starting shard, capped at half the sample per shard, scores each one, and evicts the single highest-scoring key">
+  <text class="lbl-b" x="14" y="20">sampleVictims(policy, n = 5): random start shard, at most n/2+1 = 3 from any one shard</text>
+
+  <rect class="node"   x="14"  y="34" width="150" height="66" rx="7"/>
+  <rect class="node-a" x="180" y="34" width="150" height="66" rx="7"/>
+  <rect class="node-a" x="346" y="34" width="150" height="66" rx="7"/>
+  <rect class="node"   x="512" y="34" width="150" height="66" rx="7"/>
+  <rect class="node"   x="678" y="34" width="128" height="66" rx="7"/>
+  <text class="lbl-b" x="89"  y="54" text-anchor="middle">shard 0</text>
+  <text class="lbl-b" x="255" y="54" text-anchor="middle">shard 1 &nbsp;&larr; start</text>
+  <text class="lbl-b" x="421" y="54" text-anchor="middle">shard 2</text>
+  <text class="lbl-b" x="587" y="54" text-anchor="middle">shard 3</text>
+  <text class="lbl-b" x="742" y="54" text-anchor="middle">&hellip; shard N</text>
+  <text class="lbl-s" x="89"  y="74" text-anchor="middle">not reached</text>
+  <text class="lbl-s" x="255" y="74" text-anchor="middle">3 drawn</text>
+  <text class="lbl-s" x="421" y="74" text-anchor="middle">2 drawn</text>
+  <text class="lbl-s" x="587" y="74" text-anchor="middle">not reached</text>
+  <text class="lbl-s" x="742" y="74" text-anchor="middle">not reached</text>
+  <text class="mono"  x="255" y="92" text-anchor="middle">range sh.entries</text>
+  <text class="mono"  x="421" y="92" text-anchor="middle">range sh.entries</text>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="255" y1="102" x2="300" y2="140" marker-end="url(#p41-ar7)"/>
+    <line class="edge-a" x1="421" y1="102" x2="380" y2="140" marker-end="url(#p41-ar8)"/>
+  </g>
+
+  <rect class="node-i" x="140" y="146" width="540" height="56" rx="7"/>
+  <text class="lbl-b" x="410" y="166" text-anchor="middle">[]victim &mdash; {key, sh, score}, score = "how much we want this gone"</text>
+  <text class="mono"  x="200" y="188" text-anchor="middle">idle 12s</text>
+  <text class="mono"  x="290" y="188" text-anchor="middle">idle 47s</text>
+  <text class="mono"  x="380" y="188" text-anchor="middle">idle 3s</text>
+  <text class="mono"  x="480" y="188" text-anchor="middle">idle 511s</text>
+  <text class="mono"  x="590" y="188" text-anchor="middle">idle 30s</text>
+
+  <g color="var(--dang)">
+    <line class="edge" x1="480" y1="204" x2="480" y2="228" marker-end="url(#p41-ar9)"/>
+  </g>
+  <rect class="node-d" x="330" y="232" width="300" height="44" rx="7"/>
+  <text class="lbl-b" x="480" y="250" text-anchor="middle">argmax(score) &rarr; drop it</text>
+  <text class="lbl-s" x="480" y="266" text-anchor="middle">one key per evictOne; the loop repeats until under the limit</text>
+
+  <text class="lbl-s" x="14" y="240">Oldest-of-5 from N keys lands</text>
+  <text class="lbl-s" x="14" y="256">at expected age rank N/6 &mdash;</text>
+  <text class="lbl-s" x="14" y="272">not N/1, but nowhere near N/2.</text>
+
+  <text class="lbl-s" x="654" y="240">The per-shard cap exists so a</text>
+  <text class="lbl-s" x="654" y="256">sample cannot come entirely from</text>
+  <text class="lbl-s" x="654" y="272">one shard's local key population.</text>
+
+  <defs>
+    <marker id="p41-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Every policy runs through the same sampler. Only <code>score()</code> changes &mdash;
+which is why adding <code>volatile-ttl</code> was three lines rather than a second eviction
+subsystem.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/store/evict.go &mdash; drawing the sample<span class="lang">go</span></div>
+<pre><code class="lang-go">// The sample size is the whole basis of the approximation: taking the oldest of
+// five draws from a hundred keys lands on the oldest sixth of the keyspace,
+// while taking the oldest of three only reaches the oldest quarter. So the
+// per-shard cap below must never be allowed to silently shrink the sample --
+// one pass over the shards yields at most len(shards)*perShard candidates,
+// which falls short of n on a store with very few shards, and the sampler has
+// to keep going until it has the n it was asked for.
+func (s *Store) sampleVictims(policy Policy, n int) []victim {
+	if n &lt; 1 {
+		n = 1
+	}
+	out := make([]victim, 0, n)
+
+	// Take at most half the sample from any one shard: a sample drawn entirely
+	// from one shard would be biased toward whatever that shard happens to
+	// hold, and with few shards that skews which keys survive.
+	perShard := n/2 + 1
+	now := s.now()
+	lruNow := s.lruClock()
+
+	// Make repeated passes over the shards until the sample is full. Ranging
+	// over a Go map starts at a fresh random position every time, so a second
+	// pass over the same shard draws different keys; a pass that adds nothing
+	// at all means the keyspace is simply smaller than n, and we stop.
+	for len(out) &lt; n {
+		before := len(out)
+		start := int(rand.Uint64N(uint64(len(s.shards))))
+		for i := 0; i &lt; len(s.shards) &amp;&amp; len(out) &lt; n; i++ {
+			sh := s.shards[(start+i)%len(s.shards)]
+			want := perShard
+			if remaining := n - len(out); want &gt; remaining {
+				want = remaining
+			}
+			out = s.sampleShard(sh, policy, want, now, lruNow, out)
+		}
+		if len(out) == before {
+			break
+		}
+	}
+	return out
+}</code></pre>
+</div>
+
+<p>Two things in that loop carry weight. The repeated passes exist because the per-shard cap bounds a
+single pass at <code>len(shards) &times; (n/2+1)</code> candidates: run with <code>-shards 1</code>
+and one pass yields 3, not the 5 <code>maxmemory-samples</code> asked for &mdash; a quietly worse
+approximation on exactly the single-shard store
+<code>TestSampledLRUApproximatesTrueLRU</code> builds. The <code>len(out) == before</code> guard is
+what ends those passes. Progress is guaranteed while any shard yields a candidate, because the
+<code>want &gt; remaining</code> clamp keeps <code>want</code> at 1 or more; so a pass that adds
+nothing means there is nothing to add &mdash; an empty keyspace, or a <code>volatile-*</code> policy
+on a store where no key has a TTL. Without the guard that case spins forever; with it the sampler
+returns an empty slice, <code>evictOne</code> reports failure, and <code>EvictIfNeeded</code> answers
+<code>OOM</code> rather than hanging the connection. The price of the extra passes is that nothing
+dedupes <code>out</code>: on a keyspace smaller than <code>n</code> the later passes re-draw keys the
+earlier ones already took, so the sample is padded with repeats rather than being short.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/evict.go &mdash; one line per policy<span class="lang">go</span></div>
+<pre><code class="lang-go">// score ranks a candidate; larger means evict sooner.
+func (s *Store) score(policy Policy, v *Value, now int64, lruNow uint32) int64 {
+	switch policy {
+	case PolicyAllKeysLRU, PolicyVolatileLRU:
+		// Idle seconds: the longer since the last access, the better a victim.
+		return int64(idleSeconds(lruNow, v.lru))
+	case PolicyAllKeysLFU, PolicyVolatileLFU:
+		// Invert the frequency so that rarely used keys score high.
+		return int64(lfuMaxVal - s.lfuDecay(v))
+	case PolicyVolatileTTL:
+		// Evict whatever dies soonest. Scores are negative expiry timestamps so
+		// that "sooner" is "larger", keeping the comparison uniform.
+		if v.expireAt == 0 {
+			return math.MinInt64
+		}
+		return -v.expireAt
+	default: // the random policies
+		return 0
+	}
+}</code></pre>
+</div>
+
+<p>Accuracy is a one-line order statistic: the best of <em>k</em> uniform draws from <em>N</em> sits at
+expected rank <em>N/(k+1)</em>. That is the whole theory of <code>maxmemory-samples</code>, and
+<code>TestSampledLRUApproximatesTrueLRU</code> measures it over 200 trials on a 100-key store aged
+one second apart.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>maxmemory-samples</code></th><th>Expected age rank of the victim, N = 100</th><th>Drawn from the oldest&hellip;</th><th>Cost per eviction</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>1 (&equiv; <code>allkeys-random</code>)</td><td>50.0</td><td>everything</td><td>1 map step</td><td>Not LRU at all &mdash; the baseline the test compares against</td></tr>
+<tr><td>3</td><td>25.0</td><td>quarter</td><td>3 map steps + 3 scores</td><td>Visibly worse hit rate on a skewed workload</td></tr>
+<tr><td><strong>5</strong> (default)</td><td><strong>16.7</strong></td><td><strong>sixth</strong></td><td>5 map steps + 5 scores</td><td>Within a few percent of true LRU on real traffic</td></tr>
+<tr><td>10</td><td>9.1</td><td>eleventh</td><td>2&times; the work of 5</td><td>The difference from true LRU is invisible; the CPU cost is not free &mdash; <code>BenchmarkEviction</code> runs <code>allkeys-lru/5</code> against <code>/10</code> for exactly this</td></tr>
+<tr><td>&infin; (true LRU)</td><td>1.0</td><td>oldest key</td><td>Pointer writes on every <em>read</em>, plus a global lock</td><td>The thing sampling exists to avoid</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box deep">
+  <span class="bt">Why N/(k+1)</span>
+  <p>Rank the N keys by age on [0,1]. Drawing k independently, the chance all k land above x is
+  (1&minus;x)<sup>k</sup>, so the best draw has CDF 1&minus;(1&minus;x)<sup>k</sup> and expectation
+  1/(k+1). Returns diminish harmonically, and the approximation degrades gracefully &mdash; a key
+  only has to be <em>old</em>, not <em>oldest</em>, to be a fine victim.</p>
+</div>
+
+<h2>LFU: a one-byte logarithm that forgets</h2>
+
+<p>LRU asks "when was this last touched". LFU asks "how often", the right question when a key read a
+thousand times an hour ago beats one read once a minute ago. But a useful counter costs 4&ndash;8
+bytes per key. Redis's answer is one byte holding the <em>logarithm</em> of the access count:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/store/evict.go &mdash; probabilistic increment and time decay<span class="lang">go</span></div>
+<pre><code class="lang-go">// lfuLogIncr increments the counter logarithmically.
+//
+// The counter is a single byte, but it has to represent access frequencies
+// spanning many orders of magnitude. So it is not a count, it is the logarithm
+// of one: the probability of incrementing is 1/(baseval*factor + 1), which
+// means going from 5 to 6 takes a couple of hits while going from 250 to 251
+// takes millions. With the default factor of 10 the counter saturates at 255
+// around a million accesses.
+func (s *Store) lfuLogIncr(counter uint8) uint8 {
+	if counter &gt;= lfuMaxVal {
+		return lfuMaxVal
+	}
+	baseval := float64(counter) - lfuInitVal
+	if baseval &lt; 0 {
+		baseval = 0
+	}
+	factor := math.Float64frombits(s.lfuLogFactor.Load())
+	p := 1.0 / (baseval*factor + 1)
+	if rand.Float64() &lt; p {
+		return counter + 1
+	}
+	return counter
+}
+
+// lfuDecay returns the counter after ageing it.
+//
+// Without decay an LFU counter is a permanent record: a key that was hot during
+// startup would outrank everything forever. Every lfu-decay-time minutes of
+// idleness costs the counter one point.
+func (s *Store) lfuDecay(v *Value) uint8 {
+	decayTime := s.lfuDecayTime.Load()
+	if decayTime == 0 {
+		return v.lfu
+	}
+	now := s.lfuMinutes()
+	if now &lt;= v.lfuDecay {
+		return v.lfu
+	}
+	periods := (now - v.lfuDecay) / decayTime
+	if periods == 0 {
+		return v.lfu
+	}
+	if uint32(v.lfu) &lt;= periods {
+		return 0
+	}
+	return v.lfu - uint8(periods)
+}</code></pre>
+</div>
+
+<p>New keys start at <code>lfuInitVal = 5</code>, not 0, so a key written a millisecond ago is not
+instantly the coldest thing in the store; <code>baseval</code> subtracts that floor, so
+<code>p = 1</code> at the initial value and the first access always counts. A new key that cannot
+leave the floor is a cache that evicts everything it just admitted.</p>
+
+<p>The expected accesses to reach counter <em>c</em> with log factor <em>F</em> is the sum of the
+per-step geometric means, <em>&Sigma;</em>(<em>F&middot;j</em>+1) for <em>j</em> = 0&hellip;<em>c</em>&minus;6
+= <em>F</em>(<em>c</em>&minus;6)(<em>c</em>&minus;5)/2 + (<em>c</em>&minus;5):</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Counter</th><th>Expected accesses, <code>lfu-log-factor 10</code> (default)</th><th>Expected accesses, <code>lfu-log-factor 100</code></th><th>A plain counter would be&hellip;</th></tr></thead>
+<tbody>
+<tr><td>5 (new key)</td><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>6</td><td>1</td><td>1</td><td>1</td></tr>
+<tr><td>10</td><td>105</td><td>1,005</td><td>10</td></tr>
+<tr><td>50</td><td>9,945</td><td>99,045</td><td>50</td></tr>
+<tr><td>105</td><td>49,600</td><td>495,100</td><td>105</td></tr>
+<tr><td>255 (saturated)</td><td>311,500</td><td>3,112,750</td><td><strong>saturated at 255</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The test checks the 50,000-access row lands "roughly 105" through a deliberately wide window, and
+separately that factor 100 grows strictly slower than factor 10 &mdash; an assertion about the
+<em>shape</em> of the curve, which is the property that matters.</p>
+
+<p>Only the read path writes the decay timestamp back &mdash; scoring must not mutate &mdash; so the
+stored byte is stale by design and <code>OBJECT FREQ</code> calls <code>s.lfuDecay(v)</code> rather
+than reading <code>v.lfu</code>.</p>
+
+<h3>The gate, the loop and the bound</h3>
+
+<div class="codewrap">
+<div class="codehead">internal/store/evict.go &mdash; freeing until it fits<span class="lang">go</span></div>
+<pre><code class="lang-go">// maxEvictionsPerCall bounds one EvictIfNeeded call. Without it, a maxmemory
+// set below the size of a single large value would spin forever trying to get
+// under a limit it can never reach.
+const maxEvictionsPerCall = 100_000
+
+func (s *Store) EvictIfNeeded() ([]string, error) {
+	limit := s.MaxMemory()
+	if limit &lt;= 0 || s.MemoryUsed() &lt;= limit {
+		return nil, nil
+	}
+	policy := s.Policy()
+	if policy == PolicyNoEviction {
+		return nil, ErrOOM
+	}
+
+	var evicted []string
+	for i := 0; i &lt; maxEvictionsPerCall &amp;&amp; s.MemoryUsed() &gt; limit; i++ {
+		key, ok := s.evictOne(policy)
+		if !ok {
+			break
+		}
+		evicted = append(evicted, key)
+	}
+	if s.MemoryUsed() &gt; limit {
+		return evicted, ErrOOM
+	}
+	return evicted, nil
+}</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/server/dispatch.go &mdash; evict before the write, and log the DELs<span class="lang">go</span></div>
+<pre><code class="lang-go">	if cmd.IsWrite() {
+		// Free memory before the write, not after: the point of maxmemory is
+		// that the server never exceeds it, so the room has to be made first.
+		evicted, err := d.store.EvictIfNeeded()
+		d.propagateEvictions(evicted)
+		if err != nil &amp;&amp; cmd.Flags&amp;commands.FlagDenyOOM != 0 {
+			// Commands that only free memory (DEL, LPOP, EXPIRE) are still
+			// allowed when we are over the limit -- refusing them would leave
+			// the client no way out of the situation.
+			d.totalErrors.Add(1)
+			out.WriteError(store.ErrOOM.Error())
+			return
+		}
+	}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Evictions <em>must</em> be propagated; expiries need not be</span>
+  <p><code>propagateEvictions</code> appends an explicit <code>DEL key</code> per evicted key. Not
+  tidiness: eviction is a decision the <em>server</em> made under memory pressure that nothing in the
+  client's command stream implies. Replay without those <code>DEL</code>s and every evicted key
+  returns, putting the restored dataset instantly over <code>maxmemory</code>. Expiry needs no such
+  record &mdash; an absolute <code>PEXPIREAT</code> replays to the same instant.
+  <strong>Expiry is derivable; eviction is a decision.</strong> (Real Redis propagates expiry
+  <code>DEL</code>s anyway, because a replica may never expire a key on its own initiative.)</p>
+</div>
+
+<h2>The append-only file</h2>
+
+<p>The AOF is a RESP command stream, byte for byte what a client would have sent &mdash; no second
+serialisation format to keep in sync with the protocol, and
+<code>redis-cli --pipe &lt; appendonly.aof</code> replays one into any real Redis:</p>
+
+<div class="codewrap">
+<div class="codehead">what <code>SET foo bar</code> looks like on disk<span class="lang">text</span></div>
+<pre><code class="lang-text">const want = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+
+*3        array of 3 arguments
+$3 SET    length-prefixed bulk string, so it is binary safe:
+$3 foo    a value containing \r\n or a NUL byte round-trips verbatim,
+$3 bar    which the same test checks with "line1\r\nline2\x00end".</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/persist/aof.go &mdash; append, and where the bytes actually go<span class="lang">go</span></div>
+<pre><code class="lang-go">func (a *AOF) Append(args [][]byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed || a.f == nil {
+		return errors.New("aof: closed")
+	}
+
+	if err := a.w.WriteCommand(args); err != nil {
+		return err
+	}
+	// Always push the bytes to the OS. Keeping them in a user-space buffer
+	// would mean a clean process kill (not even a crash) could lose commands
+	// the client was told had succeeded.
+	if err := a.w.Flush(); err != nil {
+		return err
+	}
+	a.needsFsync = true
+
+	if a.policy == FsyncAlways {
+		if err := a.f.Sync(); err != nil {
+			return err
+		}
+		a.needsFsync = false
+	}
+	return nil
+}</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 290" role="img" aria-label="Data flow of one write command from the handler through the store, the propagation gate, the user-space buffer, the kernel page cache and finally the disk, showing where each fsync policy places its durability boundary">
+  <text class="lbl-b" x="14" y="20">One write command, from handler to platter &mdash; and where each policy draws the line</text>
+
+  <rect class="node"   x="14"  y="34" width="118" height="48" rx="7"/>
+  <text class="lbl-b" x="73"  y="54" text-anchor="middle">handler</text>
+  <text class="lbl-s" x="73"  y="70" text-anchor="middle">MarkDirty(n)</text>
+
+  <rect class="node-o" x="150" y="34" width="126" height="48" rx="7"/>
+  <text class="lbl-b" x="213" y="54" text-anchor="middle">shard, in RAM</text>
+  <text class="lbl-s" x="213" y="70" text-anchor="middle">client sees OK here</text>
+
+  <rect class="node-i" x="294" y="34" width="140" height="48" rx="7"/>
+  <text class="lbl-b" x="364" y="54" text-anchor="middle">Dirty &gt; 0 ?</text>
+  <text class="mono"  x="364" y="70" text-anchor="middle">Propagated()</text>
+
+  <rect class="node-a" x="452" y="34" width="150" height="48" rx="7"/>
+  <text class="lbl-b" x="527" y="54" text-anchor="middle">resp.Writer buffer</text>
+  <text class="lbl-s" x="527" y="70" text-anchor="middle">user space</text>
+
+  <rect class="node-w" x="620" y="34" width="186" height="48" rx="7"/>
+  <text class="lbl-b" x="713" y="54" text-anchor="middle">page cache (kernel)</text>
+  <text class="mono"  x="713" y="70" text-anchor="middle">w.Flush() = write(2)</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="134" y1="58" x2="146" y2="58" marker-end="url(#p41-ar10)"/>
+    <line class="edge" x1="278" y1="58" x2="290" y2="58" marker-end="url(#p41-ar11)"/>
+    <line class="edge" x1="436" y1="58" x2="448" y2="58" marker-end="url(#p41-ar12)"/>
+    <line class="edge" x1="604" y1="58" x2="616" y2="58" marker-end="url(#p41-ar13)"/>
+  </g>
+
+  <rect class="node-o" x="620" y="164" width="186" height="48" rx="7"/>
+  <text class="lbl-b" x="713" y="184" text-anchor="middle">the disk</text>
+  <text class="mono"  x="713" y="200" text-anchor="middle">f.Sync() = fsync(2)</text>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="713" y1="86" x2="713" y2="160" marker-end="url(#p41-ar14)"/>
+  </g>
+
+  <rect class="node-d" x="14"  y="110" width="248" height="46" rx="6"/>
+  <text class="lbl-b" x="138" y="128" text-anchor="middle">crash BEFORE the write(2)</text>
+  <text class="lbl-s" x="138" y="144" text-anchor="middle">command lost though the client saw +OK</text>
+
+  <rect class="node-w" x="14"  y="166" width="248" height="46" rx="6"/>
+  <text class="lbl-b" x="138" y="184" text-anchor="middle">kill -9 AFTER the write(2)</text>
+  <text class="lbl-s" x="138" y="200" text-anchor="middle">SAFE &mdash; the kernel still holds the pages</text>
+
+  <rect class="node-d" x="14"  y="222" width="248" height="46" rx="6"/>
+  <text class="lbl-b" x="138" y="240" text-anchor="middle">power cut BEFORE the fsync(2)</text>
+  <text class="lbl-s" x="138" y="256" text-anchor="middle">everything still only in page cache is gone</text>
+
+  <text class="lbl-b" x="300" y="126">always</text>
+  <text class="lbl-s" x="368" y="126">fsync inside Append, before the reply. Loss window = the in-flight command.</text>
+  <text class="lbl-b" x="300" y="152">everysec</text>
+  <text class="lbl-s" x="368" y="152">a 1 s ticker goroutine calls syncLocked(). Loss window = up to 1 second.</text>
+  <text class="lbl-b" x="300" y="178">no</text>
+  <text class="lbl-s" x="368" y="178">no explicit fsync ever. Loss window = the kernel's writeback interval, ~30 s.</text>
+  <text class="lbl-s" x="300" y="206">All three do the write(2) on every command, so all three survive kill -9 identically.</text>
+  <text class="lbl-s" x="300" y="228">The dial is ONLY about power cuts and kernel panics &mdash; that is the sentence to</text>
+  <text class="lbl-s" x="300" y="244">remember when someone says "everysec loses data".</text>
+
+  <defs>
+    <marker id="p41-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p41-ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The reply goes out at box two. Everything to the right of it is a bet about how much of
+that reply you are willing to have been a lie.</figcaption>
+</figure>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>appendfsync</code></th><th>Per-command syscalls</th><th><code>kill -9</code> / panic in the process</th><th>Power cut or kernel panic</th><th>What it actually costs</th></tr></thead>
+<tbody>
+<tr><td><code>always</code></td><td><code>write</code> + <code>fsync</code></td><td>Nothing lost</td><td><strong>At most the in-flight command</strong></td><td>A disk flush per write. On a consumer NVMe that is tens of microseconds; on network-attached storage it is milliseconds and it is your throughput ceiling.</td></tr>
+<tr><td><code>everysec</code> (default)</td><td><code>write</code>, plus one <code>fsync</code> per second from <code>everySecLoop</code></td><td>Nothing lost</td><td><strong>Up to one second of writes</strong></td><td>One syscall per write command. This is Redis's default and the only setting most deployments should consider.</td></tr>
+<tr><td><code>no</code></td><td><code>write</code> only</td><td>Nothing lost</td><td><strong>Whatever the page cache held</strong> &mdash; typically up to ~30&nbsp;s on Linux (<code>dirty_expire_centisecs</code>)</td><td>Cheapest. And the fsync it does skip is not free elsewhere: when the kernel finally flushes, it flushes a lot at once.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">"Nothing lost on <code>kill -9</code>" is a property of <code>Append</code>, not of the policy</span>
+  <p>Every policy flushes the user-space <code>resp.Writer</code> to the OS on every command,
+  <code>no</code> included. Delete that <code>a.w.Flush()</code> to "make <code>no</code> faster" and
+  you break all three at once: a clean <code>SIGKILL</code> drops every command still in the buffer
+  &mdash; commands the client was told had succeeded. Safe buffering is the kernel's, because the
+  kernel outlives your process.</p>
+</div>
+
+<h2>Rewrite: compacting the log</h2>
+
+<p>A log of everything that ever happened is enormous and mostly redundant: a counter
+<code>INCR</code>ed a million times is a million commands one <code>SET</code> replaces. The rewrite
+walks the current dataset and emits the shortest sequence that rebuilds it:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/persist/aof.go &mdash; rebuild, then swap atomically<span class="lang">go</span></div>
+<pre><code class="lang-go">	tmpPath := a.path + ".rewrite"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	// ... write every entry, then Flush, Flush, Sync, Close ...
+
+	// The live file has to be closed before the rename: on Windows you cannot
+	// replace a file that is still open. Closing first also means a crash
+	// between the two steps leaves either the old file or the new one intact,
+	// never a half-written mixture.
+	if err := a.w.Flush(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := a.f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, a.path); err != nil {
+		// Try to get back to a working state before reporting the failure.
+		if f, rerr := os.OpenFile(a.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); rerr == nil {
+			a.f = f
+			a.w = resp.NewWriter(f)
+		}
+		return fmt.Errorf("aof rewrite: rename: %w", err)
+	}</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/persist/aof.go &mdash; one entry, chunked, with its deadline preserved<span class="lang">go</span></div>
+<pre><code class="lang-go">// rewriteChunk bounds how many elements go into one generated command. A list
+// with a million elements must not become a single million-argument RPUSH: the
+// reader would have to allocate the whole thing at once, and the multibulk
+// limit would reject it.
+const rewriteChunk = 64
+
+	case store.TypeList:
+		for i := 0; i &lt; len(e.List); i += rewriteChunk {
+			end := min(i+rewriteChunk, len(e.List))
+			args := make([][]byte, 0, end-i+2)
+			args = append(args, []byte("RPUSH"), []byte(e.Key))
+			args = append(args, e.List[i:end]...)
+			if err := w.WriteCommand(args); err != nil {
+				return err
+			}
+		}
+
+	// The TTL is restored as an absolute deadline, so a rewritten AOF preserves
+	// the original expiry instead of restarting the clock.
+	if e.ExpireAt != 0 {
+		if err := w.WriteCommand([][]byte{
+			[]byte("PEXPIREAT"), []byte(e.Key),
+			[]byte(strconv.FormatInt(e.ExpireAt, 10)),
+		}); err != nil {
+			return err
+		}
+	}</code></pre>
+</div>
+
+<p>Note <code>min</code> &mdash; the builtin since Go 1.21, no helper and no generics ceremony. And note
+the third place absolute time pays off: whatever the client sent, the compacted file holds
+<code>PEXPIREAT key &lt;absolute-ms&gt;</code>. Rewrite ten times and the key still dies at the instant
+it was always going to.</p>
+
+<div class="box gotcha">
+  <span class="bt">The rewrite blocks every write, and the reason is that Go has no <code>fork</code></span>
+  <p>Real Redis forks a child and gets a copy-on-write heap snapshot free. Go cannot fork &mdash; a
+  forked Go process inherits one thread and a runtime full of locks held by threads that no longer
+  exist. So <code>server.RewriteAOF</code> takes the dispatcher's propagation lock for <em>writing</em>
+  across the whole rewrite, stopping a command being applied to the store but not yet logged while
+  the rewriter reads the keyspace. The cost: <strong>every write stalls for the length of the
+  rewrite</strong> (the <code>everysec</code> flusher too, so the one-second guarantee is suspended),
+  and <code>auto-aof-rewrite-percentage 100</code> makes that happen unannounced whenever the log
+  doubles. The fork-free version is the README's headline exercise.</p>
+</div>
+
+<div class="box note">
+  <span class="bt">Propagation is driven by a dirty counter, not by the command name</span>
+  <p><code>Context.Dirty</code> decides what reaches the log: a <code>SET</code> that <code>NX</code>
+  vetoed, a <code>DEL</code> of a missing key, an <code>SREM</code> that removed nothing &mdash; all
+  stay out. <code>PropagateAs</code> then rewrites two classes: non-deterministic (<code>SPOP</code>
+  &rarr; explicit <code>SREM key member&hellip;</code>) and relative-time
+  (<code>EXPIRE key 60</code> &rarr; <code>PEXPIREAT key &lt;ms&gt;</code>). Skip the second and a key
+  gains a fresh minute of life on every restart.</p>
+</div>
+
+<h2>Replay, snapshots and the durability table</h2>
+
+<div class="codewrap">
+<div class="codehead">internal/persist/aof.go &mdash; a truncated tail is expected, not exceptional<span class="lang">go</span></div>
+<pre><code class="lang-go">	r := resp.NewReaderSize(f, 256*1024)
+	applied := 0
+	for {
+		args, err := r.ReadCommand()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return applied, nil
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) || resp.IsProtocolError(err) {
+				// The process died mid-write. Everything up to here is intact.
+				return applied, ErrTruncated
+			}
+			return applied, err
+		}
+		if len(args) == 0 {
+			continue
+		}
+		if err := exec(args); err != nil {
+			return applied, fmt.Errorf("aof replay: %q: %w", args.String(), err)
+		}
+		applied++
+	}</code></pre>
+</div>
+
+<p>A file ending mid-command is what a crash during a write looks like &mdash; everything before the
+truncation point was acknowledged, so the server warns and carries on. A command that
+<em>parses</em> but fails to execute is different: the log disagrees with the code, and that is
+fatal. Replay goes through <code>Dispatcher.Replay</code>, bypassing eviction, the OOM gate and
+propagation &mdash; evicting during a load would silently drop data, and re-propagating would append
+every command back to the file it came from.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/persist/snapshot.go &mdash; the whole format, from the package comment<span class="lang">text</span></div>
+<pre><code class="lang-text">"MINIRDB1"                       8 byte magic
+repeated entries:
+  1 byte   type tag (1 string, 2 list, 3 hash, 4 set, 5 zset)
+  uvarint  key length, then the key bytes
+  varint   absolute expiry in Unix ms (0 = none)
+  payload, depending on the tag
+0xFF                             end of entries marker
+8 bytes  little-endian CRC-64 (ECMA) of everything above
+
+Lengths are varints because most of them are small: a 12 byte key costs one
+length byte, not eight. The trailing checksum is what makes a truncated or
+corrupted file detectable instead of silently loading half a database.</code></pre>
+</div>
+
+<p>Three decisions worth copying. Scores go out as raw IEEE-754 bits, not decimal: a
+formatted-then-parsed float is not guaranteed to be the same float, and a score off by one ULP
+reorders the skip list. <code>readUvarint</code> is hand-written to decode a byte at a time so every
+consumed byte lands in the running CRC. And <code>maxBlobLen</code> plus <code>minCap</code> mean a
+corrupt length field fails on the checksum rather than on an OOM.
+<code>TestSnapshotAndAOFRewriteAgree</code> then runs one dataset through both paths &mdash; two
+independent encoders, so a bug in either shows up as a disagreement.</p>
+
+<div class="box gotcha">
+  <span class="bt">On startup it is the AOF <strong>or</strong> the snapshot, never both</span>
+  <p>With <code>-appendonly</code> set, <code>loadFromDisk</code> replays the AOF and never touches
+  the snapshot. The reason is arithmetic: the AOF is strictly more recent, and applying both
+  double-applies every command the snapshot contains &mdash; harmless for <code>SET</code>, and it
+  doubles your lists for <code>RPUSH</code>. So enabling the AOF on a snapshot-only server silently
+  ignores <code>dump.mrdb</code> and starts empty.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Configuration</th><th>Steady-state cost per write</th><th>Lost on <code>kill -9</code></th><th>Lost on power cut</th><th>Restart cost</th><th>Reach for it when</th></tr></thead>
+<tbody>
+<tr><td>Nothing (<code>-appendonly=false</code>, <code>-save 0</code>)</td><td>zero</td><td>everything</td><td>everything</td><td>none &mdash; empty keyspace</td><td>A pure cache in front of a source of truth, where a cold start is a latency problem and not a correctness one.</td></tr>
+<tr><td>Snapshot only (<code>-save 5m</code>)</td><td>zero, plus a full keyspace walk every 5&nbsp;min</td><td>up to 5 minutes</td><td>up to 5 minutes</td><td><strong>Fastest</strong> &mdash; no parsing, no re-execution, one <code>LoadEntry</code> per key</td><td>Large datasets that can tolerate losing minutes. <code>BenchmarkPersistenceLoad</code> is the measurement.</td></tr>
+<tr><td>AOF <code>no</code></td><td>1 <code>write</code> syscall</td><td>nothing</td><td>~30&nbsp;s</td><td>Replay: parse + execute every command</td><td>You want crash-safety but the storage is slow and you have a replica or a rebuild path.</td></tr>
+<tr><td><strong>AOF <code>everysec</code></strong></td><td>1 <code>write</code> + 1 <code>fsync</code>/second</td><td>nothing</td><td>&le; 1&nbsp;s</td><td>Replay</td><td><strong>The default answer.</strong> Two to three orders of magnitude cheaper than <code>always</code> &mdash; <code>BenchmarkAOFAppend</code> prices the gap.</td></tr>
+<tr><td>AOF <code>always</code></td><td>1 <code>write</code> + 1 <code>fsync</code> per command</td><td>nothing</td><td>the in-flight command</td><td>Replay</td><td>You are using Redis as a system of record. Measure it on <em>your</em> disk before promising it &mdash; on network storage this is a 10&ndash;100&times; throughput cut.</td></tr>
+<tr><td>AOF <code>everysec</code> + periodic <code>-save</code></td><td>as <code>everysec</code>, plus the walk</td><td>nothing</td><td>&le; 1&nbsp;s</td><td>Replay (the snapshot is the backup artefact, not the load path)</td><td>Production. The snapshot is what you copy off the box; the AOF is what makes the restart correct.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box ok">
+  <span class="bt">Assert the invariant, not the bytes</span>
+  <p>Eviction rests entirely on the memory accounting, so the tests call
+  <code>Store.VerifyMemoryAccounting()</code> after randomised workloads: it recomputes every entry
+  from scratch and names the first drifted shard. Incremental accounting rots silently, and a
+  drifting counter makes eviction either never fire or never stop.</p>
+</div>
+
+<details><summary>Watching all three mechanisms actually run</summary>
+<div class="dbody">
+<div class="codewrap"><pre><code class="lang-bash"># Eviction: fill past 4MB and watch keys disappear, with the decisions logged.
+go run ./cmd/miniredis -addr 127.0.0.1:6380 \
+    -maxmemory 4mb -maxmemory-policy allkeys-lru -loglevel debug
+redis-benchmark -p 6380 -t set -n 200000 -d 100 -r 100000
+redis-cli -p 6380 INFO memory      # used_memory tracks just under maxmemory
+redis-cli -p 6380 INFO stats       # evicted_keys climbing
+
+# Expiry: -hz 1 makes the cycle slow enough to watch the reclaim lag.
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -hz 1 -loglevel debug
+redis-cli -p 6380 SET k v EX 1
+redis-cli -p 6380 GET k            # (nil) instantly - passive expiry
+redis-cli -p 6380 INFO keyspace    # the key may still be counted for a moment
+
+# Persistence: write, Ctrl-C, restart, and the data is there.
+go run ./cmd/miniredis -addr 127.0.0.1:6380 -dir ./data -appendonly -appendfsync everysec
+xxd ./data/appendonly.aof | head   # it is just RESP
+redis-cli -p 6380 BGREWRITEAOF     # watch the file shrink
+
+# Price the dial yourself. Expect 2-3 orders of magnitude across these.
+go test ./bench -bench AOFAppend -benchmem
+go test ./bench -bench 'ActiveExpireCycle|Eviction' -benchmem</code></pre></div>
+</div>
+</details>
+
+<p>For the same mechanisms as real Redis presents them, see
+<span class="xref">expiry &amp; eviction</span> and
+<span class="xref">persistence</span> in module 07. And note
+<code>MemoryUsed</code> is the dataset, not the process:
+<span class="xref">the Go garbage collector</span> explains why RSS
+sits well above it, and eviction can act only on the first number.</p>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li><strong>Passive expiry is the correctness guarantee; the active cycle is the memory
+  guarantee.</strong> One <code>int64</code> comparison in <code>lookup</code> makes an expired key
+  permanently invisible; the sampling cycle exists only so a key nobody reads again does not occupy
+  memory forever. Neither alone is sufficient.</li>
+  <li><strong>The 25&nbsp;% threshold bounds wasted memory, not latency.</strong> Nothing promises a
+  key is reclaimed within any particular time. It promises that when the cycle stops, its estimate of
+  the dead-but-resident fraction of the volatile set is under a quarter &mdash; the number
+  <code>maxmemory</code> has to be sized against. A 20-key sample reads that density to only
+  &plusmn;10 points; the fix is re-deciding 10&times; a second, not sampling more per round.</li>
+  <li><strong>True LRU is rejected for what it costs on <em>reads</em>, not on evictions.</strong> A
+  list means two pointer writes, a cache miss and a global lock on every <code>GET</code>. Sampling
+  moves the whole cost to eviction time, and the best of k draws lands at expected age rank N/(k+1)
+  &mdash; the oldest sixth at the default <code>maxmemory-samples 5</code>, with harmonically
+  diminishing returns after that.</li>
+  <li><strong>The LFU byte is a logarithm with a half-life.</strong> Increment probability
+  <code>1/(baseval*factor+1)</code> makes 250&rarr;251 cost ~2,500&times; what 5&rarr;6 costs, so one
+  byte spans five orders of magnitude; the per-minute decay stops a key that was hot at startup being
+  immortal. Switching <code>maxmemory-policy</code> at runtime leaves every counter stale and the
+  first eviction wave pays for it.</li>
+  <li><strong>Absolute deadlines, everywhere.</strong> <code>expireAt</code> is a Unix-millisecond
+  timestamp; <code>EXPIRE</code> propagates as <code>PEXPIREAT</code>, <code>SET &hellip; EX</code> as
+  <code>SET &hellip; PXAT</code>; the rewrite re-emits <code>PEXPIREAT</code>; the snapshot stores the
+  same integer. That invariant is why replay is idempotent over time and why expired keys need no
+  <code>DEL</code> in the log.</li>
+  <li><strong>Evicted keys must be logged as explicit <code>DEL</code>s.</strong> Eviction is a
+  server-side decision no client command implies, so a replay without them resurrects every evicted
+  key and puts the restored dataset instantly over its limit.</li>
+  <li><strong>The fsync dial only trades against power cuts.</strong> All three policies
+  <code>write(2)</code> per command, so all three survive <code>kill -9</code> identically; what
+  <code>always</code>, <code>everysec</code> and <code>no</code> change is the window a power failure
+  can take &mdash; one command, one second, or one kernel writeback interval.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="01-design.html"><span class="lb">Previous</span>Design &amp; the RESP protocol</a>
+  <a href="03-running.html"><span class="lb">Next</span>Running, testing &amp; exercises</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

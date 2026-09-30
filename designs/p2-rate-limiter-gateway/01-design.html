@@ -1,0 +1,850 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Design &amp; algorithms &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <a href="index.html">Distributed Rate Limiter &amp; API Gateway</a></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Design &amp; algorithms</h1>
+<p class="lede">Why the limit decision lives inside Redis as Lua rather than in Go, why the token
+bucket is the default of the four candidate algorithms, how three tiers cost one round trip, and
+where the two genuinely unresolved decisions in this system are &mdash; fail-open versus fail-closed,
+and the middleware ordering.</p>
+
+<div class="meta">
+  <span class="tag v">Go 1.24</span>
+  <span class="tag v">Redis 8</span>
+  <span class="tag">rate limiting</span>
+</div>
+
+<h2>Requirements, and the numbers they imply</h2>
+
+<p>Six requirements drive every decision on this page. Each one eliminates something.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Requirement</th><th>What it rules out</th></tr></thead>
+<tbody>
+<tr><td><strong>The limit is global across gateway replicas.</strong> Three copies of the binary behind a load balancer must still enforce 5&nbsp;req/s, not 15.</td><td>Any in-process limiter &mdash; <code>golang.org/x/time/rate</code>, a local map of buckets. State must be shared.</td></tr>
+<tr><td><strong>The decision is exact under concurrency.</strong> N goroutines on M replicas hitting a 100-token bucket admit exactly 100.</td><td>Read-modify-write from Go, in any form. See the race below.</td></tr>
+<tr><td><strong>One request costs one round trip</strong>, whatever the tier count.</td><td>Per-tier calls; <code>WATCH</code>/<code>MULTI</code> optimistic retry loops, which cost 2&ndash;3 round trips and more under contention.</td></tr>
+<tr><td><strong>Rejection must be cheaper than admission.</strong> A 429 is the response you serve most of during an incident.</td><td>Anything that writes on a rejection, or that stores one entry per attempt.</td></tr>
+<tr><td><strong>Memory is bounded by</strong> <em>active</em> <strong>tenants, not by tenants ever seen.</strong></td><td>Un-expiring keys; per-request timestamps that accumulate under attack.</td></tr>
+<tr><td><strong>A Redis outage must be a deliberate, observable choice</strong>, not an accident of whichever branch was written first.</td><td>A hard-coded default buried in the limiter.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Now size it. Take 20&nbsp;000&nbsp;req/s peak across the fleet, 100&nbsp;000 tenants of whom
+maybe 10&nbsp;% are active in any minute, and the shipped defaults from
+<code>internal/config/config.go</code>. The arithmetic decides the shape of the storage, and it is
+the reason this project runs against a single Redis rather than a cluster.</p>
+
+<div class="codewrap">
+<div class="codehead">capacity arithmetic, from the shipped defaults<span class="lang">text</span></div>
+<pre><code class="lang-text">REDIS OPS
+  1 request  = 1 EVALSHA
+  script body, 3 tiers = 3 HMGET, then on an ALLOW 3 HSET + 3 PEXPIRE
+                       = 3 commands on a reject, 9 on an allow
+  20 000 req/s x ~9    = ~180k command executions/s inside ONE Lua invocation each
+  Redis 8 is single-threaded for command execution: a small script like this
+  benchmarks in the tens of microseconds, so 20k evals/s is a fraction of one
+  core. The limiter is nowhere near the bottleneck. The NETWORK round trip is.
+
+MEMORY
+  keys per tenant      = 2 (burst + sustained), plus 1 shared global key
+  a 2-field hash, listpack-encoded, with key + expiry overhead   ~120 B
+  10 000 active tenants x 2 keys x 120 B                         ~2.4 MB
+  100 000 active tenants                                         ~24 MB
+  -&gt; a limiter's working set is TINY. This is why "just shard it onto a
+     cluster" is almost always the wrong instinct: you would be sharding
+     24 MB and buying the CROSSSLOT problem in exchange.
+
+LATENCY BUDGET (added to EVERY request, which is the whole design constraint)
+  same-AZ Redis RTT                       0.2 - 0.5 ms typical
+  GATEWAY_REDIS_READ_TIMEOUT              200ms   (transport-level)
+  GATEWAY_LIMITER_TIMEOUT                 150ms   (policy-level, tighter)
+  past 150ms we would rather GUESS than keep the client waiting.</code></pre>
+</div>
+
+<div class="box iv">
+  <span class="bt">The mental model that matters</span>
+  <p>A rate limiter is not a counter. It is a <strong>compare-and-swap on shared state that sits in
+  front of every single request</strong>. That sentence contains both hard parts: the
+  compare-and-swap must be atomic across processes (so it cannot live in your process), and it is on
+  the hot path of everything (so it gets exactly one round trip and a tight deadline). Every design
+  choice below falls out of those two facts.</p>
+</div>
+
+<h2>Four algorithms</h2>
+
+<h3>Fixed window, and its boundary burst</h3>
+
+<p><code>INCR key</code>, <code>EXPIRE key window</code>, reject above the limit. Two commands, O(1)
+memory, trivially correct-looking &mdash; and wrong at the seam. Windows are aligned to wall-clock
+boundaries, so a client that spends its whole allowance at the end of one window and its whole
+allowance at the start of the next has served <strong>2&times; the limit inside a couple of
+milliseconds</strong>, without ever breaking a rule.</p>
+
+<figure>
+<svg viewBox="0 0 820 250" role="img" aria-label="Timeline showing a client sending its full allowance at the end of one fixed window and again at the start of the next, producing double the limit within milliseconds">
+  <text class="lbl-b" x="14" y="20">Limit: 5 per second. Fixed windows aligned to the clock.</text>
+
+  <rect class="node-i" x="60"  y="34" width="330" height="40" rx="6"/>
+  <rect class="node-i" x="394" y="34" width="330" height="40" rx="6"/>
+  <text class="lbl-b" x="225" y="52" text-anchor="middle">window N</text>
+  <text class="lbl-s" x="225" y="68" text-anchor="middle">00:00.000 &rarr; 00:00.999 &nbsp;&middot;&nbsp; counter 5/5</text>
+  <text class="lbl-b" x="559" y="52" text-anchor="middle">window N+1</text>
+  <text class="lbl-s" x="559" y="68" text-anchor="middle">00:01.000 &rarr; 00:01.999 &nbsp;&middot;&nbsp; counter 5/5</text>
+
+  <line class="dash" x1="392" y1="28" x2="392" y2="196"/>
+  <text class="lbl-s" x="392" y="212" text-anchor="middle">counter resets here &mdash; atomically, invisibly, on schedule</text>
+
+  <line class="edge-a" x1="352" y1="86" x2="352" y2="112"/>
+  <line class="edge-a" x1="360" y1="86" x2="360" y2="112"/>
+  <line class="edge-a" x1="368" y1="86" x2="368" y2="112"/>
+  <line class="edge-a" x1="376" y1="86" x2="376" y2="112"/>
+  <line class="edge-a" x1="384" y1="86" x2="384" y2="112"/>
+  <line class="edge-a" x1="400" y1="86" x2="400" y2="112"/>
+  <line class="edge-a" x1="408" y1="86" x2="408" y2="112"/>
+  <line class="edge-a" x1="416" y1="86" x2="416" y2="112"/>
+  <line class="edge-a" x1="424" y1="86" x2="424" y2="112"/>
+  <line class="edge-a" x1="432" y1="86" x2="432" y2="112"/>
+  <text class="lbl-s" x="300" y="104" text-anchor="end">5 requests at t=0.999s &nbsp;&rarr;</text>
+  <text class="lbl-s" x="452" y="104">&larr; 5 more at t=1.001s</text>
+
+  <rect class="node-d" x="286" y="126" width="212" height="46" rx="6"/>
+  <text class="lbl-b" x="392" y="145" text-anchor="middle">10 requests in 2 ms</text>
+  <text class="lbl-s" x="392" y="162" text-anchor="middle">every rule was obeyed</text>
+
+  <text class="lbl-s" x="14" y="236">The upstream does not experience "windows". It experiences 10 concurrent connections, which is what the limit existed to prevent.</text>
+  <defs>
+    <marker id="p20-ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The boundary burst is not an edge case you can test away &mdash; it is what an adaptive
+client naturally discovers, because retrying just after a rejection lands it exactly here.</figcaption>
+</figure>
+
+<h3>Sliding log, sliding counter, token bucket</h3>
+
+<p>A <strong>sliding log</strong> stores a timestamp per request in a sorted set and trims with
+<code>ZREMRANGEBYSCORE</code>. It is exact, and its memory and CPU scale with the request rate &mdash;
+precisely the thing you are trying to survive. A client sending 50&nbsp;000 rejected requests per
+second makes you store and sort 50&nbsp;000 entries per second on its behalf.</p>
+
+<p>The <strong>sliding window counter</strong> keeps the current and previous fixed-window counts and
+interpolates. O(1) state, no boundary burst, approximate under bursty traffic:</p>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/slidingwindow.lua &mdash; the estimate, and its honest error bound<span class="lang">lua</span></div>
+<pre><code class="lang-lua">--     estimate = prev_count * (1 - elapsed/window) + current_count
+--
+--   Cost is O(1) in memory and time regardless of rate. The estimate assumes the
+--   previous window's requests were spread evenly through it, so it can be off by
+--   a bounded amount when traffic was bursty -- roughly the size of one window's
+--   worth of clustering. In exchange it kills the fixed-window boundary problem,
+--   where a client sends `limit` requests at 0.999s and `limit` more at 1.001s
+--   and gets 2x its limit in 2ms.</code></pre>
+</div>
+
+<p>The <strong>token bucket</strong> stores a fractional token level and a timestamp, refills lazily
+from elapsed time, and charges the request. Two fields, O(1), exact, and &mdash; uniquely among the
+four &mdash; it has an explicit burst parameter separate from the rate.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Algorithm</th><th>State per key</th><th>Cost vs. rate</th><th>Boundary burst</th><th>Burst control</th><th>Verdict here</th></tr></thead>
+<tbody>
+<tr><td>Fixed window</td><td>1 integer</td><td>O(1)</td><td><strong>Yes &mdash; 2&times; the limit</strong></td><td>None; burst = the whole limit</td><td>Rejected. The failure is silent and an adaptive client finds it.</td></tr>
+<tr><td>Sliding log</td><td>1 entry <em>per request</em></td><td><strong>O(rate)</strong></td><td>No</td><td>None</td><td>Rejected. Its cost scales with the attack.</td></tr>
+<tr><td>Sliding window counter</td><td>3 fields (<code>w</code>, <code>c</code>, <code>p</code>)</td><td>O(1)</td><td>No</td><td>None &mdash; no credit accrues</td><td>Shipped as the alternative. Correct choice for a fragile downstream.</td></tr>
+<tr><td><strong>Token bucket</strong></td><td>2 fields (<code>t</code>, <code>ts</code>)</td><td>O(1)</td><td>No</td><td><strong>Explicit</strong>: capacity is the burst, capacity/window the rate</td><td><strong>Default.</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box ok">
+  <span class="bt">Why token bucket is the default for a public API</span>
+  <p>Real clients are bursty and it is usually harmless: a page load fires twenty parallel
+  requests, a batch job wakes up every minute. The token bucket <em>banks</em> idle capacity, so a
+  quiet client is rewarded with a burst the system can trivially absorb; the sliding counter banks
+  nothing. As <code>slidingwindow.go</code> puts it, <em>"refusing a burst that the system can
+  trivially absorb is a worse experience for no benefit"</em>. Flip
+  <code>GATEWAY_LIMITER_ALGORITHM=sliding_window</code> when the thing behind the gateway genuinely
+  cannot take a spike.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/tokenbucket.lua &mdash; lazy refill, pass 1<span class="lang">lua</span></div>
+<pre><code class="lang-lua">  -- One HMGET per bucket. Reading both fields together keeps this at N reads
+  -- for N tiers rather than 2N.
+  local state = redis.call('HMGET', KEYS[i], 't', 'ts')
+  local level = tonumber(state[1])
+  local ts    = tonumber(state[2])
+
+  if level == nil or ts == nil then
+    -- Missing key means either a brand-new client or an expired bucket. Both
+    -- start full: a bucket that expired has necessarily been idle for at least
+    -- one full window, which is exactly how long it takes to refill anyway.
+    level = capacity
+    ts    = now
+  end
+
+  -- Lazy refill. elapsed can go negative if this replica's clock is behind the
+  -- replica that last wrote; clamping to 0 makes a slow clock harmless (it just
+  -- refills nothing) instead of destroying tokens.
+  local elapsed = now - ts
+  if elapsed &lt; 0 then
+    elapsed = 0
+  end
+  if elapsed &gt; 0 then
+    -- capacity/window is the refill rate in tokens per millisecond. Doing the
+    -- multiplication before the division keeps precision for small windows.
+    level = level + (elapsed * capacity / window)
+    if level &gt; capacity then
+      level = capacity
+    end
+  end</code></pre>
+</div>
+
+<p>There is no refill job, no timer, no cron. Tokens are a <em>function</em> of the stored timestamp,
+so an idle tenant costs one hash and zero CPU, and a tenant who never comes back costs nothing at all
+once the key expires.</p>
+
+<div class="box gotcha">
+  <span class="bt">Store fractional tokens, or your limit quietly drifts</span>
+  <p>The level is written as <code>string.format('%.6f', level)</code>, not as an integer. Round to
+  a whole token on every call and each request leaks or destroys up to one token; at 500&nbsp;req/s
+  that is a systematic error of the same order as the limit itself &mdash; <em>"at high rates drifts
+  the effective limit by a noticeable percentage"</em>, as the script says. It never shows up in a
+  unit test at 10&nbsp;req/s, and it is unattributable in production.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">The clock comes from the gateway, not from Redis</span>
+  <p><code>ARGV[1]</code> is <code>time.Now().UnixMilli()</code> on the calling replica. That makes
+  the script deterministic and lets tests travel through time without sleeping &mdash; but replicas
+  must then agree on the time, and one running fast refills buckets faster than it should. The
+  alternative, <code>redis.call('TIME')</code>, removes skew entirely at the cost of determinism and
+  replayability. The project chose testability and says "run NTP"; see
+  <span class="xref">time &amp; clocks</span> for how bad that
+  assumption can get.</p>
+</div>
+
+<h2>Why the check and the update must be one operation</h2>
+
+<p>This is the requirement that decides the whole architecture, and it is worth demonstrating rather
+than asserting. Consider the obvious Go implementation: read the bucket, compute the new level,
+write it back.</p>
+
+<div class="codewrap">
+<div class="codehead">the version that passes every sequential test &mdash; do NOT write this<span class="lang">go</span></div>
+<pre><code class="lang-go">// A read-modify-write limiter. Every single-threaded test in the file passes.
+func (b *broken) Allow(ctx context.Context, rules []Rule) (Decision, error) {
+    state, err := b.rdb.HGetAll(ctx, key).Result()   // 1. READ
+    if err != nil {
+        return Decision{}, err
+    }
+    level := refill(state, time.Now())               // 2. COMPUTE, in this process
+    if level &lt; 1 {
+        return Decision{Allowed: false}, nil
+    }
+    b.rdb.HSet(ctx, key, "t", level-1, "ts", now)    // 3. WRITE
+    return Decision{Allowed: true}, nil
+}</code></pre>
+</div>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="Sequence diagram contrasting a non-atomic read-modify-write across two gateway replicas, which admits two requests from a one-token bucket, with a single EVALSHA that Redis executes to completion">
+  <text class="lbl-b" x="14" y="18">NON-ATOMIC: read &rarr; compute in Go &rarr; write</text>
+
+  <rect class="node"   x="14"  y="30" width="110" height="30" rx="5"/>
+  <rect class="node"   x="140" y="30" width="110" height="30" rx="5"/>
+  <rect class="node-i" x="266" y="30" width="110" height="30" rx="5"/>
+  <text class="lbl-b" x="69"  y="50" text-anchor="middle">gateway A</text>
+  <text class="lbl-b" x="195" y="50" text-anchor="middle">gateway B</text>
+  <text class="lbl-b" x="321" y="50" text-anchor="middle">Redis</text>
+  <line class="dash" x1="69"  y1="62" x2="69"  y2="238"/>
+  <line class="dash" x1="195" y1="62" x2="195" y2="238"/>
+  <line class="dash" x1="321" y1="62" x2="321" y2="238"/>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="69"  y1="80"  x2="315" y2="80"  marker-end="url(#p20-ar2)"/>
+    <line class="edge" x1="321" y1="102" x2="75"  y2="102" marker-end="url(#p20-ar2)"/>
+    <line class="edge" x1="195" y1="124" x2="315" y2="124" marker-end="url(#p20-ar2)"/>
+    <line class="edge" x1="321" y1="146" x2="201" y2="146" marker-end="url(#p20-ar2)"/>
+  </g>
+  <g color="var(--dang)">
+    <line class="edge-d" x1="69"  y1="180" x2="315" y2="180" marker-end="url(#p20-ar3)"/>
+    <line class="edge-d" x1="195" y1="204" x2="315" y2="204" marker-end="url(#p20-ar3)"/>
+  </g>
+  <text class="lbl-s" x="192" y="76"  text-anchor="middle">HGETALL</text>
+  <text class="lbl-s" x="192" y="98"  text-anchor="middle">t = 1.0</text>
+  <text class="lbl-s" x="258" y="120" text-anchor="middle">HGETALL</text>
+  <text class="lbl-s" x="258" y="142" text-anchor="middle">t = 1.0 &nbsp;(still!)</text>
+  <text class="lbl-s" x="60"  y="168" text-anchor="end">both decide</text>
+  <text class="lbl-s" x="60"  y="182" text-anchor="end">ALLOW</text>
+  <text class="lbl-s" x="192" y="176" text-anchor="middle">HSET t = 0.0</text>
+  <text class="lbl-s" x="258" y="200" text-anchor="middle">HSET t = 0.0</text>
+
+  <rect class="node-d" x="14" y="248" width="362" height="40" rx="6"/>
+  <text class="lbl-b" x="195" y="266" text-anchor="middle">2 admitted from a 1-token bucket</text>
+  <text class="lbl-s" x="195" y="282" text-anchor="middle">and the more replicas you add, the worse it gets</text>
+
+  <text class="lbl-b" x="430" y="18">ATOMIC: one EVALSHA</text>
+  <rect class="node"   x="430" y="30" width="110" height="30" rx="5"/>
+  <rect class="node"   x="556" y="30" width="110" height="30" rx="5"/>
+  <rect class="node-o" x="682" y="30" width="120" height="30" rx="5"/>
+  <text class="lbl-b" x="485" y="50" text-anchor="middle">gateway A</text>
+  <text class="lbl-b" x="611" y="50" text-anchor="middle">gateway B</text>
+  <text class="lbl-b" x="742" y="50" text-anchor="middle">Redis</text>
+  <line class="dash" x1="485" y1="62" x2="485" y2="238"/>
+  <line class="dash" x1="611" y1="62" x2="611" y2="238"/>
+  <line class="dash" x1="742" y1="62" x2="742" y2="238"/>
+
+  <g color="var(--accent)">
+    <line class="edge-a" x1="485" y1="80"  x2="736" y2="80"  marker-end="url(#p20-ar4)"/>
+    <line class="edge-a" x1="611" y1="96"  x2="736" y2="96"  marker-end="url(#p20-ar4)"/>
+    <line class="edge-a" x1="742" y1="152" x2="491" y2="152" marker-end="url(#p20-ar4)"/>
+    <line class="edge-a" x1="742" y1="176" x2="617" y2="176" marker-end="url(#p20-ar4)"/>
+  </g>
+  <rect class="node-a" x="712" y="106" width="96" height="38" rx="5"/>
+  <text class="lbl-s" x="760" y="122" text-anchor="middle">script runs to</text>
+  <text class="lbl-s" x="760" y="136" text-anchor="middle">completion, then</text>
+  <text class="lbl-s" x="608" y="76"  text-anchor="middle">EVALSHA</text>
+  <text class="lbl-s" x="672" y="92"  text-anchor="middle">EVALSHA (queued)</text>
+  <text class="lbl-s" x="608" y="148" text-anchor="middle">allowed = 1</text>
+  <text class="lbl-s" x="676" y="172" text-anchor="middle">allowed = 0</text>
+
+  <rect class="node-o" x="430" y="248" width="372" height="40" rx="6"/>
+  <text class="lbl-b" x="616" y="266" text-anchor="middle">exactly 1 admitted, at any replica count</text>
+  <text class="lbl-s" x="616" y="282" text-anchor="middle">Redis executes commands one at a time; a script is one command</text>
+  <defs>
+    <marker id="p20-ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>The window between the read and the write is where the limit is lost. Moving the
+decision into the script closes it, because Redis's single-threaded execution model makes a script
+one indivisible command.</figcaption>
+</figure>
+
+<div class="box gotcha">
+  <span class="bt">The race is invisible until the exact moment you need the limiter</span>
+  <p>The broken version is <em>correct at low concurrency</em>, so every sequential test passes. It
+  fails only when callers overlap &mdash; precisely when a rate limiter matters. In production it
+  presents as <em>"our 100/s limit somehow lets through 140/s, but only when we're busy"</em>, and
+  nobody blames the limiter, because its own dashboard says it is rejecting people.</p>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/tokenbucket_test.go &mdash; the test that justifies the design<span class="lang">go</span></div>
+<pre><code class="lang-go">const (
+    capacity          = 100
+    goroutines        = 50
+    attemptsPerWorker = 10 // 500 attempts for 100 tokens
+)
+// ... 50 goroutines all released from one channel, so the calls genuinely overlap
+if got := allowed.Load(); got != capacity {
+    t.Fatalf("granted %d requests out of %d attempts, want exactly %d; "+
+        "a count above the capacity means the check-and-consume was not atomic",
+        got, goroutines*attemptsPerWorker, capacity)
+}</code></pre>
+</div>
+
+<div class="box note">
+  <span class="bt">Why not <code>WATCH</code>/<code>MULTI</code>?</span>
+  <p>Optimistic concurrency <em>is</em> correct here &mdash; <code>WATCH</code>, read, compute,
+  <code>MULTI</code>/<code>EXEC</code>, retry on abort. It costs at least two round trips, and its
+  retry count rises with contention, so its latency is worst exactly when the tenant is hottest. A
+  Lua script is a pessimistic lock that happens to be free: one round trip, no aborts, regardless of
+  load. See <span class="xref">transactions &amp;
+  scripting</span>.</p>
+</div>
+
+<h2>Keys, TTLs and the cluster problem</h2>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/tiers.go &mdash; every key carries a hash tag<span class="lang">go</span></div>
+<pre><code class="lang-go">// BuildKey constructs a Redis key suffix with a cluster hash tag.
+//
+// The tag is the substring between '{' and '}'. Redis Cluster hashes ONLY that
+// substring to pick a slot, so every key sharing a tag is guaranteed to live on
+// one node -- which is the precondition for evaluating them in one Lua script.
+// Tagging by tenant is the natural choice: a tenant's tiers are always evaluated
+// together, and different tenants never need to be atomic with each other.
+func BuildKey(tag, rule string) string {
+	return "{" + tag + "}:" + rule
+}</code></pre>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Rule</th><th>Full key</th><th>Fields</th><th>TTL written on commit</th><th>Why that TTL</th></tr></thead>
+<tbody>
+<tr><td><code>burst</code></td><td><code>rl:{t:acme-pro}:burst</code></td><td><code>t</code>, <code>ts</code></td><td><code>window + ttl_slack</code> = 1s + 1s</td><td>A bucket is fully refilled at most one window after the write, so older state carries no information.</td></tr>
+<tr><td><code>sustained</code></td><td><code>rl:{t:acme-pro}:sustained</code></td><td><code>t</code>, <code>ts</code></td><td>60s + 1s</td><td>Same rule, longer window.</td></tr>
+<tr><td><code>global</code></td><td><code>rl:{g}:global</code></td><td><code>t</code>, <code>ts</code></td><td>1s + 1s</td><td>Shared by every tenant &mdash; which is what makes it global, and why it cannot carry a tenant tag.</td></tr>
+<tr><td>sliding window variant</td><td>same keys</td><td><code>w</code>, <code>c</code>, <code>p</code></td><td><code>2 &times; window + slack</code></td><td>The previous window stays relevant for one more full window.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The TTL is the memory bound: expiry turns "every tenant that ever called us" into "every tenant
+active in the last window or two", which is what makes the 24&nbsp;MB estimate hold. The slack absorbs
+clock skew &mdash; without it a replica running slightly ahead expires a bucket early and hands a
+client a free full one.</p>
+
+<div class="box gotcha">
+  <span class="bt">Adding a global tier breaks Redis Cluster, and the error is <code>CROSSSLOT</code></span>
+  <p>A Lua script may only touch keys in one hash slot. The per-tenant keys share
+  <code>{t:&lt;tenant&gt;}</code> and are fine; the global key is <code>{g}</code>, a different slot, so on
+  a real cluster this exact <code>EVAL</code> is rejected. It works here only because the project
+  assumes a single non-clustered Redis &mdash; and the estimate above is why that is reasonable.
+  <code>tokenbucket.go</code> documents three ways out, in the order to consider them: (1) give the
+  limiter its own unclustered Redis; (2) evaluate the global tier in a second, pipelined call and
+  accept that a coarse safety net can overshoot; (3) shard it into K counters
+  <code>{g:0}</code>&hellip;<code>{g:K-1}</code> with <code>limit/K</code> each &mdash; exact totals,
+  but a bursty client can drain one shard while the others idle. See
+  <span class="xref">clustering</span>.</p>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Nothing is written on a rejection &mdash; and that is load-bearing</span>
+  <p>Pass 2 does not run when any tier denied. State is always recomputed from <code>(t, ts)</code>,
+  so skipping the write loses nothing, and a client hammering a drained bucket generates <em>pure
+  reads</em>: 3 <code>HMGET</code> instead of 9 commands. Invert this &mdash; write on every attempt,
+  as naive implementations do &mdash; and the harder you are attacked, the more write load your
+  limiter puts on the datastore it shares with everything else.</p>
+</div>
+
+<h2>Composing tiers</h2>
+
+<p>A single limit cannot say what an API wants. "1000 per minute" as one bucket lets a client fire
+all 1000 in the first millisecond. "17 per second" forbids the harmless burst of a page loading
+twenty resources. Two per-tenant tiers say both things at once, and a third, fleet-wide tier says
+what neither can: <em>a thousand free tenants each perfectly within 5&nbsp;rps is still
+5000&nbsp;rps arriving at a service sized for 2000.</em></p>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/tiers.go &mdash; the rate card<span class="lang">go</span></div>
+<pre><code class="lang-go">// The burst allowance is deliberately a small multiple of the sustained rate
+// (roughly 5-10 seconds' worth), not a large one. A burst bucket sized at a
+// whole minute of traffic is not a burst allowance, it is a second sustained
+// limit that happens to drain quickly.
+var plans = map[Plan]PlanLimits{
+	PlanFree: {
+		Burst:     Tier{Limit: 5, Window: time.Second},
+		Sustained: Tier{Limit: 60, Window: time.Minute},
+	},
+	PlanPro: {
+		Burst:     Tier{Limit: 50, Window: time.Second},
+		Sustained: Tier{Limit: 3000, Window: time.Minute},
+	},
+	PlanEnterprise: {
+		Burst:     Tier{Limit: 500, Window: time.Second},
+		Sustained: Tier{Limit: 30000, Window: time.Minute},
+	},
+}</code></pre>
+</div>
+
+<p>Order matters, and it is a deliberate UX decision. Rules travel narrowest-first, and the script
+reports the <em>first</em> rule that rejects &mdash; so a client that is both bursting and over its
+monthly volume is told about the burst, the constraint that clears in a second, and gets a short,
+actionable <code>Retry-After</code> instead of a multi-second one.</p>
+
+<div class="codewrap">
+<div class="codehead">internal/limiter/tokenbucket.lua &mdash; all-or-nothing commit, pass 2<span class="lang">lua</span></div>
+<pre><code class="lang-lua">if denied_index == 0 then
+  for i = 1, n do
+    local level = tokens[i] - costs[i]
+    tokens[i] = level
+    redis.call('HSET', KEYS[i], 't', string.format('%.6f', level), 'ts', tostring(now))
+    redis.call('PEXPIRE', KEYS[i], math.ceil(windows[i]) + ttl_slack_ms)
+  end
+end</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Single-pass evaluation permanently strands a client at its sustained limit</span>
+  <p>Check-and-consume tier by tier and a request rejected by the <em>sustained</em> tier has
+  already burned a <em>burst</em> token. A client pinned at its sustained limit finds its burst
+  allowance drained by requests that never succeeded &mdash; and the harder it retries, the longer it
+  stays broken. Exercise 4 has you move the <code>HSET</code> into pass 1 and watch
+  <code>TestRejectedRequestConsumesFromNoTier</code> fail.</p>
+</div>
+
+<p>On an allow, the script still has to choose which tier to report. It picks the rule with the
+smallest remaining <strong>fraction</strong> of its own capacity, not the smallest raw count &mdash;
+otherwise a global tier of 2000 always looks roomier than a burst tier of 5, even when the burst tier
+is about to reject the next request. Headers that lie are worse than no headers: a client told it has
+2900 remaining while its burst bucket is empty retries immediately and is rejected again.</p>
+
+<h2>Fail open or fail closed</h2>
+
+<p>Redis is now on the critical path of every request. When it is unreachable the gateway must
+choose between availability and correctness, and there is no universally right answer &mdash; which
+is exactly why it is a configuration flag and not a default buried in code.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>GATEWAY_LIMITER_FAIL_OPEN=true</code> (default)</th><th><code>=false</code></th></tr></thead>
+<tbody>
+<tr><td>The request</td><td>Forwarded, unlimited</td><td><code>503 limiter_unavailable</code>, not forwarded</td></tr>
+<tr><td><code>/readyz</code></td><td><code>200 ready (degraded)</code></td><td><code>503 not ready</code> &mdash; taken out of rotation</td></tr>
+<tr><td>On startup with Redis down</td><td>Boots with a warning</td><td><strong>Refuses to boot</strong></td></tr>
+<tr><td>Log</td><td colspan="2"><code>ERROR limiter unavailable mode=&hellip;</code> &mdash; error level in <em>both</em> modes</td></tr>
+<tr><td>Metric</td><td><code>gateway_ratelimit_errors_total{mode="fail_open"}</code></td><td><code>{mode="fail_closed"}</code></td></tr>
+<tr><td>Choose when</td><td>A public API where a Redis outage must not become a full outage</td><td>The limiter protects something that cannot absorb unbounded load &mdash; a metered third-party API, a fragile legacy system</td></tr>
+<tr><td>The risk you accept</td><td>An attacker who can knock over Redis has also removed your rate limit</td><td>A Redis outage is a full outage</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap">
+<div class="codehead">internal/middleware/ratelimit.go &mdash; the policy, applied in one place<span class="lang">go</span></div>
+<pre><code class="lang-go">	// Always at error level, in both modes. Fail-open is the dangerous one
+	// precisely because it is invisible from the outside: traffic keeps flowing,
+	// nothing 500s, and the only evidence that your rate limits stopped existing
+	// is this log line and its metric. Alert on them.
+	opts.Logger.LogAttrs(r.Context(), slog.LevelError, "limiter unavailable",
+		slog.String("request_id", RequestIDFromContext(r.Context())),
+		slog.String("tenant", tenant.ID),
+		slog.String("mode", mode),
+		slog.String("error", err.Error()),
+	)
+
+	if opts.FailOpen {
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	// 503, not 429: the client did nothing wrong, and Retry-After tells it this
+	// is a transient condition on our side.
+	w.Header().Set(HeaderRetryAfter, "1")
+	WriteJSONError(w, r, http.StatusServiceUnavailable, "limiter_unavailable",
+		"Rate limiting is temporarily unavailable; the request was not forwarded.")</code></pre>
+</div>
+
+<p>Two details make the choice deliberate rather than accidental. First, the policy applies only to
+<em>errors</em> &mdash; a rejection is a <code>Decision</code> with <code>Allowed=false</code>, never
+an error, so fail-open can never turn a legitimate 429 into a 200. Second, the same flag governs
+startup:</p>
+
+<div class="codewrap">
+<div class="codehead">cmd/gateway/main.go &mdash; one policy, two moments<span class="lang">go</span></div>
+<pre><code class="lang-go">	// Connectivity is checked at startup rather than discovered on the first
+	// request. Which way a failure here is fatal depends on the SAME policy the
+	// limiter uses at runtime -- it would be incoherent to refuse to boot when
+	// Redis is down and then fail open once running, or vice versa.
+	switch {
+	case pingErr != nil &amp;&amp; !cfg.Limiter.FailOpen:
+		return fmt.Errorf("redis unreachable at %s and the limiter is configured fail-closed: %w",
+			cfg.Redis.Addr, pingErr)
+	case pingErr != nil:
+		logger.Warn("redis unreachable at startup; the limiter will fail open until it recovers",
+			slog.String("addr", cfg.Redis.Addr),
+			slog.String("error", pingErr.Error()),
+		)</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Liveness must not check Redis; readiness must</span>
+  <p><code>/healthz</code> answers "is this process alive?" and deliberately checks nothing. A
+  liveness probe that fails when Redis is down makes the orchestrator restart <em>every</em> replica
+  during a Redis blip &mdash; a fleet-wide crash loop, and restarting a gateway does not fix Redis.
+  <code>/readyz</code> answers "should this replica take traffic?", and there the dependency matters:
+  fail-open it stays ready (degraded), fail-closed it leaves rotation.</p>
+</div>
+
+<h2>The circuit breaker</h2>
+
+<p>The limiter protects upstreams from clients. The breaker protects the gateway from upstreams.
+When an upstream is failing, each doomed request holds a connection, a goroutine and a client's
+patience for the full 5-second timeout before failing &mdash; so one sick upstream becomes an
+exhausted gateway and the outage spreads. The breaker converts slow failure into fast failure.</p>
+
+<figure>
+<svg viewBox="0 0 820 290" role="img" aria-label="Circuit breaker state machine showing closed, open and half-open states with the thresholds that drive each transition">
+  <rect class="node-o" x="30"  y="60" width="180" height="66" rx="8"/>
+  <text class="lbl-b" x="120" y="84"  text-anchor="middle">CLOSED</text>
+  <text class="lbl-s" x="120" y="102" text-anchor="middle">traffic flows,</text>
+  <text class="lbl-s" x="120" y="116" text-anchor="middle">outcomes counted</text>
+
+  <rect class="node-d" x="580" y="60" width="180" height="66" rx="8"/>
+  <text class="lbl-b" x="670" y="84"  text-anchor="middle">OPEN</text>
+  <text class="lbl-s" x="670" y="102" text-anchor="middle">reject instantly,</text>
+  <text class="lbl-s" x="670" y="116" text-anchor="middle">ErrOpen, no call made</text>
+
+  <rect class="node-w" x="305" y="196" width="200" height="66" rx="8"/>
+  <text class="lbl-b" x="405" y="220" text-anchor="middle">HALF-OPEN</text>
+  <text class="lbl-s" x="405" y="238" text-anchor="middle">at most 5 concurrent probes;</text>
+  <text class="lbl-s" x="405" y="252" text-anchor="middle">no deadline, ends on outcomes</text>
+
+  <g color="var(--dang)">
+    <line class="edge" x1="212" y1="80" x2="574" y2="80" marker-end="url(#p20-ar5)"/>
+  </g>
+  <text class="lbl-b" x="393" y="44" text-anchor="middle">requests &ge; 20 AND failures/requests &ge; 0.5</text>
+  <text class="lbl-s" x="393" y="30" text-anchor="middle">volume threshold FIRST, then the ratio &mdash; one failure in a quiet minute is a 100% ratio</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="670" y1="130" x2="505" y2="212" marker-end="url(#p20-ar6)"/>
+  </g>
+  <text class="lbl-s" x="608" y="164" text-anchor="middle">reset timeout</text>
+  <text class="lbl-s" x="608" y="178" text-anchor="middle">10s elapsed</text>
+
+  <g color="var(--ok)">
+    <line class="edge" x1="305" y1="212" x2="130" y2="132" marker-end="url(#p20-ar7)"/>
+  </g>
+  <text class="lbl-s" x="196" y="164" text-anchor="middle">3 consecutive</text>
+  <text class="lbl-s" x="196" y="178" text-anchor="middle">probe successes</text>
+
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 505 226 C 590 234 660 190 670 132" marker-end="url(#p20-ar8)"/>
+  </g>
+  <text class="lbl-s" x="600" y="248" text-anchor="middle">ANY probe fails &rarr; full 10s again</text>
+
+  <rect class="node" x="30" y="196" width="255" height="66" rx="8"/>
+  <text class="lbl-b" x="157" y="216" text-anchor="middle">rolling window: 30s</text>
+  <text class="lbl-s" x="157" y="234" text-anchor="middle">closed-state counters reset, so 03:00's</text>
+  <text class="lbl-s" x="157" y="248" text-anchor="middle">failures do not drag the ratio at noon</text>
+  <defs>
+    <marker id="p20-ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Every threshold on this diagram is a shipped default from <code>config.go</code>. The
+volume threshold is the one people omit, and it is what makes the ratio mean anything.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/breaker/breaker.go &mdash; volume first, then ratio<span class="lang">go</span></div>
+<pre><code class="lang-go">// readyToTrip applies the volume threshold first, then the ratio.
+func (b *Breaker) readyToTrip() bool {
+	if b.counts.Requests &lt; uint64(b.settings.VolumeThreshold) {
+		return false
+	}
+	ratio := float64(b.counts.TotalFailures) / float64(b.counts.Requests)
+	return ratio &gt;= b.settings.FailureRatio
+}</code></pre>
+</div>
+
+<p>A <em>ratio</em>, because "20 failures" means something completely different at 10&nbsp;rps and at
+10&nbsp;000&nbsp;rps. A <em>volume threshold</em> first, because without it the first request of a quiet
+minute failing is a 100&nbsp;% failure ratio. A <em>rolling window</em>, because cumulative counts let
+a long-lived healthy process bank so many successes that a real outage can never move the ratio.</p>
+
+<div class="box gotcha">
+  <span class="bt">The generation counter, and the stale result that closes a breaker it does not belong to</span>
+  <p>A request issued while <code>CLOSED</code> can return long after the breaker has opened
+  <em>and</em> half-opened. Counted naively, that late success looks like a probe success and closes
+  the circuit on an upstream nobody has actually re-tested. Every state change and every rolling-window
+  reset bumps <code>generation</code>; <code>afterRequest</code> drops any result whose generation no
+  longer matches. Without it, a breaker under load flaps between open and closed and you will spend a
+  day convinced the state machine is wrong.</p>
+</div>
+
+<div class="box warn">
+  <span class="bt">The breaker sits OUTSIDE the retry loop</span>
+  <p>The transport stack is <code>breakerTransport &rarr; retryTransport &rarr; http.Transport</code>.
+  One client request must be one sample. Put the breaker inside and a single failing request with
+  three attempts registers as three failures: the breaker trips three times faster than its threshold
+  claims, and <code>VolumeThreshold: 20</code> silently means seven. The observable symptom is
+  <code>gateway_upstream_retries_total</code> still climbing while the breaker is open, which is
+  impossible if the ordering is right.</p>
+</div>
+
+<div class="box note">
+  <span class="bt">A 5xx is a breaker failure but not a client-visible error</span>
+  <p><code>breakerTransport</code> counts any response <code>&ge; 500</code> as a failure via
+  <code>errUpstreamServerError</code>, then returns it anyway. A breaker that only counts connection
+  errors happily keeps hammering an upstream returning 503 to everything &mdash; and the client gets
+  the upstream's own answer, more useful than a synthetic 502.</p>
+</div>
+
+<h2>The request pipeline</h2>
+
+<figure>
+<svg viewBox="0 0 820 300" role="img" aria-label="The gateway middleware chain in order from RequestID through to the proxy, with the reason each stage sits where it does and the early exits each can produce">
+  <text class="lbl-b" x="14" y="18">Chain(h, A, B, C) == A(B(C(h))) &mdash; the list reads outermost first, which is the order requests travel</text>
+
+  <rect class="node"   x="14"  y="34" width="104" height="44" rx="6"/>
+  <rect class="node-i" x="128" y="34" width="104" height="44" rx="6"/>
+  <rect class="node-i" x="242" y="34" width="104" height="44" rx="6"/>
+  <rect class="node-w" x="356" y="34" width="104" height="44" rx="6"/>
+  <rect class="node-a" x="470" y="34" width="104" height="44" rx="6"/>
+  <rect class="node-a" x="584" y="34" width="118" height="44" rx="6"/>
+  <rect class="node-o" x="712" y="34" width="94"  height="44" rx="6"/>
+
+  <text class="lbl-b" x="66"  y="52" text-anchor="middle">RequestID</text>
+  <text class="lbl-b" x="180" y="52" text-anchor="middle">Metrics</text>
+  <text class="lbl-b" x="294" y="52" text-anchor="middle">Logging</text>
+  <text class="lbl-b" x="408" y="52" text-anchor="middle">Recover</text>
+  <text class="lbl-b" x="522" y="52" text-anchor="middle">Auth</text>
+  <text class="lbl-b" x="643" y="52" text-anchor="middle">RateLimit</text>
+  <text class="lbl-b" x="759" y="52" text-anchor="middle">proxy</text>
+  <text class="lbl-s" x="66"  y="70" text-anchor="middle">correlation id</text>
+  <text class="lbl-s" x="180" y="70" text-anchor="middle">counters</text>
+  <text class="lbl-s" x="294" y="70" text-anchor="middle">access log</text>
+  <text class="lbl-s" x="408" y="70" text-anchor="middle">panic net</text>
+  <text class="lbl-s" x="522" y="70" text-anchor="middle">key &rarr; tenant</text>
+  <text class="lbl-s" x="643" y="70" text-anchor="middle">1 EVALSHA</text>
+  <text class="lbl-s" x="759" y="70" text-anchor="middle">breaker+retry</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="118" y1="56" x2="126" y2="56" marker-end="url(#p20-ar9)"/>
+    <line class="edge" x1="232" y1="56" x2="240" y2="56" marker-end="url(#p20-ar9)"/>
+    <line class="edge" x1="346" y1="56" x2="354" y2="56" marker-end="url(#p20-ar9)"/>
+    <line class="edge" x1="460" y1="56" x2="468" y2="56" marker-end="url(#p20-ar9)"/>
+    <line class="edge" x1="574" y1="56" x2="582" y2="56" marker-end="url(#p20-ar9)"/>
+    <line class="edge" x1="702" y1="56" x2="710" y2="56" marker-end="url(#p20-ar9)"/>
+  </g>
+
+  <g color="var(--dang)">
+    <line class="edge-d" x1="522" y1="80" x2="522" y2="112" marker-end="url(#p20-ar10)"/>
+    <line class="edge-d" x1="643" y1="80" x2="643" y2="112" marker-end="url(#p20-ar10)"/>
+  </g>
+  <rect class="node-d" x="470" y="114" width="104" height="30" rx="5"/>
+  <rect class="node-d" x="584" y="114" width="118" height="30" rx="5"/>
+  <text class="lbl-s" x="522" y="133" text-anchor="middle">401 unauthorized</text>
+  <text class="lbl-s" x="643" y="133" text-anchor="middle">429 / 503</text>
+
+  <text class="lbl-b" x="14" y="176">Why this order, stage by stage</text>
+  <text class="lbl-s" x="14" y="196">RequestID first &mdash; everything downstream, including the panic handler, needs the correlation id to put in its output.</text>
+  <text class="lbl-s" x="14" y="214">Metrics + Logging OUTSIDE Recover &mdash; a panic must appear as a 500 in both. If Recover sat outside them it would write its</text>
+  <text class="lbl-s" x="14" y="228">500 to the raw ResponseWriter and both observers would record the request as a success. This is the subtle one.</text>
+  <text class="lbl-s" x="14" y="248">Recover before Auth &mdash; everything with real logic in it (key lookup, the limiter, the proxy) runs inside the panic net.</text>
+  <text class="lbl-s" x="14" y="268">Auth before RateLimit &mdash; limits are per tenant, so identity must exist before keys can be built. It also means unauthenticated</text>
+  <text class="lbl-s" x="14" y="282">junk is rejected without spending a Redis round trip on it, which is what keeps a credential-stuffing flood cheap.</text>
+  <defs>
+    <marker id="p20-ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+    <marker id="p20-ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Middleware order is a design decision with observable consequences, not a formality.
+Three of the five positions here fix a specific class of bug.</figcaption>
+</figure>
+
+<div class="codewrap">
+<div class="codehead">internal/middleware/chain.go &mdash; build backwards so the list reads forwards<span class="lang">go</span></div>
+<pre><code class="lang-go">// Chain composes middleware around a handler.
+//
+// The list reads OUTERMOST FIRST, which is the order requests actually travel:
+//
+//	Chain(h, A, B, C)  ==  A(B(C(h)))
+//
+// Building it by iterating backwards is what produces that reading order. The
+// naive forward loop gives you A innermost, which reads backwards from how
+// anyone describes a request path and is a reliable source of ordering bugs.
+func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
+	for i := len(middlewares) - 1; i &gt;= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">Rate-limited requests are attributed to <code>route="unmatched"</code></span>
+  <p>Rate limiting deliberately runs <em>before</em> routing, so a throttled tenant costs no routing
+  work. The price is that 429s carry no route label. If you want them attributed, move
+  <code>SetRoute</code> into a lightweight matcher ahead of the limiter and accept that every
+  rejected request now pays for a prefix match.</p>
+</div>
+
+<details><summary>Where the headers are set, and why before <code>next.ServeHTTP</code></summary>
+<div class="dbody">
+<div class="codewrap"><pre><code class="lang-go">			// Headers are set for allowed requests too. A client that can see it
+			// has 3 of 50 burst tokens left can slow down BEFORE being rejected,
+			// which is the entire point of publishing them. Set them before
+			// calling next: once the proxy starts streaming the upstream's
+			// response, the header map is already on the wire.
+			setRateLimitHeaders(w, decision)</code></pre></div>
+<p>The <code>X-RateLimit-*</code> trio is the de-facto standard GitHub and Stripe popularised; the newer
+IETF draft (<code>RateLimit-Limit</code>, <code>RateLimit-Policy</code>) is not what client libraries
+understand today. <code>X-RateLimit-Rule</code> is the project's own addition and the one that earns
+its keep: burst pressure and an exhausted monthly quota need completely different client responses,
+and one undifferentiated 429 hides which is happening.</p>
+</div>
+</details>
+
+<h2>What to take away</h2>
+
+<ol>
+  <li>The check and the consume must be <strong>one operation</strong>. A Go-side
+  read&ndash;compute&ndash;write passes every sequential test and over-admits under exactly the
+  concurrency the limiter exists to handle. Redis executes a Lua script as one indivisible command;
+  that is the entire reason the algorithm lives in <code>.lua</code> and not in <code>.go</code>.</li>
+  <li><strong>Token bucket by default</strong>, sliding window counter as the alternative. Fixed
+  window loses on the 2&times;-limit boundary burst; sliding log loses because its cost scales with the
+  request rate you are trying to survive. The token bucket is the only one of the four with a burst
+  parameter independent of the rate.</li>
+  <li><strong>Two passes, one round trip.</strong> Check every tier before consuming from any, or a
+  request rejected by the sustained tier permanently drains the burst allowance of the client that
+  needs it most. All tiers travel in one <code>EVALSHA</code>, which is why three tiers cost
+  ~15&ndash;20&nbsp;% more than one rather than 3&times;.</li>
+  <li><strong>Write nothing on a rejection.</strong> State is recomputed from <code>(t, ts)</code>, so
+  a drained client generates pure reads. Invert this and your limiter's load grows with the attack.</li>
+  <li><strong>Hash-tag every key by tenant</strong> (<code>{t:&lt;tenant&gt;}</code>) so a tenant's tiers
+  share a cluster slot &mdash; and know that the fleet-wide <code>{g}</code> tier cannot join them, so
+  a real cluster returns <code>CROSSSLOT</code>. A limiter's working set is tens of megabytes; the
+  first answer is usually "don't shard it".</li>
+  <li><strong>Fail-open is dangerous because it is invisible.</strong> Traffic keeps flowing, nothing
+  500s, and your only evidence is one error log line and one counter. Alert on both. Keep the same
+  policy at startup and at runtime, keep liveness free of dependencies, and let readiness carry the
+  degradation.</li>
+  <li><strong>Order is design.</strong> Breaker outside retry so one request is one sample;
+  Metrics/Logging outside Recover so a panic is recorded as a 500; Auth before RateLimit so
+  unauthenticated junk never costs a Redis round trip.</li>
+</ol>
+
+<div class="nav-bottom">
+  <a href="index.html"><span class="lb">Previous</span>Distributed Rate Limiter &amp; API Gateway</a>
+  <a href="02-implementation.html"><span class="lb">Next</span>Implementation walkthrough</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

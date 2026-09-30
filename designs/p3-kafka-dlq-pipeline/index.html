@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ &mdash; Nakshatra Garg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Serif+Display:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="crumb"><a href="../../index.html">Nakshatra Garg</a> / <a href="../../index.html#work">Projects</a> / <strong>Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</strong></span>
+  <span class="spacer"></span>
+  <button class="btn" id="themeBtn" type="button">theme</button>
+  <button class="btn" id="printBtn" type="button">print</button>
+</div>
+
+<div class="wrap">
+<nav class="toc"></nav>
+<main>
+
+<h1>Resilient Kafka Pipeline: Outbox, CDC &amp; DLQ</h1>
+<p class="lede">An order service that writes its business row and its event row in one local
+PostgreSQL transaction, Debezium relaying that outbox to Kafka by reading the write-ahead log, and a
+consumer that applies each event once, classifies its failures, walks a ladder of non-blocking retry
+topics, and parks what it cannot handle in a dead letter topic carrying enough context to actually
+diagnose and replay it. Every mechanism in the repository exists because a specific failure mode
+makes the naive version wrong.</p>
+
+<div class="meta">
+  <span class="tag v">Java 17</span>
+  <span class="tag v">Spring Boot 3.4.1</span>
+  <span class="tag v">Kafka 4</span>
+  <span class="tag v">PostgreSQL 16</span>
+  <span class="tag v">Debezium</span>
+  <span class="tag">project 3</span>
+  <span class="tag">3 documents</span>
+</div>
+
+<div class="box iv">
+  <span class="bt">The one hard problem this project exists to teach</span>
+  <p><strong>You cannot atomically change a database and publish a message.</strong> They are two
+  independent commit points with no coordinator between them, and there is no ordering of the two
+  that is correct.</p>
+  <p>Database first, broker second: the process dies after <code>COMMIT</code> and the event is gone
+  forever &mdash; an order that exists and that nothing downstream will ever hear about. Broker
+  first, database second: the insert hits a constraint and rolls back, and downstream systems ship
+  and invoice an order that does not exist. Wrap <code>send()</code> in a retry loop and you have
+  duplicates instead, with no dedup key you control, and the process can still die mid-loop. XA
+  would solve it; Kafka does not implement XA.</p>
+  <p>The transactional outbox does not coordinate the two commits &mdash; it <em>deletes one of
+  them</em>. The event becomes a row in the same database, written by the same transaction as the
+  business change, and publishing becomes an at-least-once delivery problem for a CDC connector
+  rather than a correctness problem for the service.</p>
+  <p>That is the trade you are actually learning, because it produces the rest of the project: once
+  delivery is at-least-once, <strong>every effect downstream must be idempotent</strong>, every
+  failure must be classified as retryable or not, retries must not block the partition they are on,
+  and whatever survives all of that has to land somewhere a human can query, understand and replay.
+  The outbox is one file. The consequences are the other twenty.</p>
+</div>
+
+<h2>What you will build</h2>
+
+<p>Three Maven modules and a Compose stack. The <strong>producer</strong> on <code>:38081</code>
+exposes <code>POST /api/orders</code> and does exactly one interesting thing: inserts into
+<code>orders</code> and into <code>outbox</code> inside a single <code>@Transactional</code> method.
+Its <code>pom.xml</code> has no Kafka dependency at all &mdash; it is structurally incapable of
+dual-writing.</p>
+
+<p><strong>Debezium 3.1</strong> in Kafka Connect tails the outbox through a <code>pgoutput</code>
+logical replication slot and applies the <code>EventRouter</code> SMT, which turns
+<code>aggregate_type</code> into the topic name, <code>aggregate_id</code> into the record key and
+the <code>payload</code> jsonb column into the record value. Nothing in the producer chose a topic.
+The <strong>consumer</strong> on <code>:38082</code> deserialises defensively, applies each event
+under an idempotency ledger, and routes failures down a 5s &rarr; 30s &rarr; 180s ladder of delay
+topics before dead-lettering them. A <strong>CLI</strong> reads the dead letter topic at byte level
+and replays it, dry-run by default.</p>
+
+<figure>
+<svg viewBox="0 0 820 470" role="img" aria-label="An order service writing orders and outbox rows in one Postgres transaction, Debezium reading the write-ahead log into a Kafka topic, a consumer with defensive deserialisation, an idempotency ledger and non-blocking retry topics at five, thirty and one hundred and eighty seconds, and a dead letter topic feeding an archive table and a replay CLI">
+  <text class="lbl-b" x="8" y="18">One local transaction &rarr; the WAL &rarr; Kafka &rarr; a ladder that ends somewhere you can query</text>
+
+  <rect class="node"   x="8" y="34" width="150" height="76" rx="7"/>
+  <text class="lbl-b"  x="83" y="58" text-anchor="middle">producer :38081</text>
+  <text class="lbl-s"  x="83" y="77" text-anchor="middle">no Kafka client</text>
+  <text class="lbl-s"  x="83" y="96" text-anchor="middle">on its classpath</text>
+
+  <rect class="node"   x="196" y="34" width="178" height="76" rx="7"/>
+  <text class="lbl-b"  x="285" y="54" text-anchor="middle">PostgreSQL 16 &middot; ordersdb</text>
+  <rect class="node"   x="206" y="60" width="76" height="28" rx="5"/>
+  <text class="lbl-s"  x="244" y="79" text-anchor="middle">orders</text>
+  <rect class="node-a" x="290" y="60" width="76" height="28" rx="5"/>
+  <text class="lbl-s"  x="328" y="79" text-anchor="middle">outbox</text>
+  <text class="lbl-s"  x="285" y="103" text-anchor="middle">one BEGIN, one COMMIT</text>
+
+  <rect class="node-i" x="412" y="34" width="178" height="76" rx="7"/>
+  <text class="lbl-b"  x="501" y="58" text-anchor="middle">Debezium 3.1 &middot; :38083</text>
+  <text class="mono"   x="501" y="77" text-anchor="middle">pgoutput / outbox_slot</text>
+  <text class="lbl-s"  x="501" y="96" text-anchor="middle">EventRouter SMT</text>
+
+  <rect class="node-i" x="628" y="34" width="184" height="76" rx="7"/>
+  <text class="lbl-b"  x="720" y="58" text-anchor="middle">Kafka 4 &middot; KRaft</text>
+  <text class="mono"   x="720" y="77" text-anchor="middle">orders.events</text>
+  <text class="lbl-s"  x="720" y="96" text-anchor="middle">3 partitions, key = order id</text>
+
+  <text class="lbl-s" x="8" y="132">the service inserts both rows and commits &mdash; it has nothing to dual-write with</text>
+  <text class="lbl-s" x="440" y="132">reads the WAL, not the table</text>
+  <text class="lbl-s" x="730" y="140">at-least-once</text>
+
+  <rect class="node"   x="196" y="158" width="616" height="132" rx="8"/>
+  <text class="lbl-b"  x="210" y="180">consumer :38082 &mdash; group order-consumer</text>
+
+  <rect class="node-w" x="210" y="190" width="190" height="48" rx="5"/>
+  <text class="lbl-s"  x="305" y="210" text-anchor="middle">ErrorHandlingDeserializer</text>
+  <text class="lbl-s"  x="305" y="228" text-anchor="middle">poison pill &rarr; routable record</text>
+
+  <rect class="node-o" x="412" y="190" width="190" height="48" rx="5"/>
+  <text class="lbl-s"  x="507" y="210" text-anchor="middle">IdempotentProcessor</text>
+  <text class="lbl-s"  x="507" y="228" text-anchor="middle">marker + effect, one txn</text>
+
+  <rect class="node-a" x="614" y="190" width="190" height="48" rx="5"/>
+  <text class="lbl-s"  x="709" y="210" text-anchor="middle">@RetryableTopic</text>
+  <text class="lbl-s"  x="709" y="228" text-anchor="middle">4 attempts, non-blocking</text>
+
+  <text class="lbl-s" x="210" y="260">the partition is never blocked &mdash; a failing record is forwarded, not re-polled in place</text>
+  <text class="lbl-s" x="210" y="278">ack-mode RECORD &middot; max.poll.interval.ms 900000 &gt; the longest backoff</text>
+
+  <rect class="node-o" x="8" y="190" width="140" height="76" rx="7"/>
+  <text class="lbl-b"  x="78" y="214" text-anchor="middle">consumerdb</text>
+  <text class="mono"   x="78" y="233" text-anchor="middle">order_projection</text>
+  <text class="mono"   x="78" y="252" text-anchor="middle">processed_message</text>
+  <text class="lbl-s"  x="173" y="220" text-anchor="middle">success</text>
+
+  <rect class="node-w" x="196" y="320" width="155" height="46" rx="6"/>
+  <text class="mono"   x="273" y="340" text-anchor="middle">-retry-5000</text>
+  <text class="lbl-s"  x="273" y="357" text-anchor="middle">attempt 2, after 5s</text>
+
+  <rect class="node-w" x="375" y="320" width="155" height="46" rx="6"/>
+  <text class="mono"   x="452" y="340" text-anchor="middle">-retry-30000</text>
+  <text class="lbl-s"  x="452" y="357" text-anchor="middle">attempt 3, after 30s</text>
+
+  <rect class="node-w" x="554" y="320" width="155" height="46" rx="6"/>
+  <text class="mono"   x="631" y="340" text-anchor="middle">-retry-180000</text>
+  <text class="lbl-s"  x="631" y="357" text-anchor="middle">attempt 4, after 180s</text>
+
+  <text class="lbl-s" x="282" y="310">RetryableException</text>
+  <text class="lbl-s" x="550" y="310">no retry topic</text>
+  <text class="lbl-s" x="196" y="388">fatal and poison records skip the ladder entirely</text>
+
+  <rect class="node-d" x="380" y="396" width="280" height="56" rx="7"/>
+  <text class="lbl-b"  x="520" y="418" text-anchor="middle">orders.events-dlt</text>
+  <text class="lbl-s"  x="520" y="437" text-anchor="middle">origin coords &middot; exception &middot; attempts &middot; payload</text>
+
+  <rect class="node"   x="8" y="396" width="160" height="56" rx="7"/>
+  <text class="lbl-b"  x="88" y="418" text-anchor="middle">dlq_record</text>
+  <text class="lbl-s"  x="88" y="437" text-anchor="middle">@DltHandler archive</text>
+
+  <rect class="node"   x="690" y="396" width="122" height="56" rx="7"/>
+  <text class="lbl-b"  x="751" y="418" text-anchor="middle">DlqInspector</text>
+  <text class="lbl-s"  x="751" y="437" text-anchor="middle">list / replay</text>
+
+  <g color="var(--border-strong)">
+    <line class="edge" x1="160" y1="72" x2="192" y2="72" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="194" y1="220" x2="152" y2="220" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="273" y1="292" x2="273" y2="316" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="351" y1="343" x2="371" y2="343" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="530" y1="343" x2="550" y2="343" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="631" y1="368" x2="631" y2="392" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="376" y1="424" x2="172" y2="424" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge" x1="664" y1="424" x2="686" y2="424" marker-end="url(#p3ix-ar1)"/>
+  </g>
+  <g color="var(--accent)">
+    <line class="edge-a" x1="376" y1="72" x2="408" y2="72" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge-a" x1="592" y1="72" x2="624" y2="72" marker-end="url(#p3ix-ar1)"/>
+    <line class="edge-a" x1="720" y1="112" x2="720" y2="154" marker-end="url(#p3ix-ar1)"/>
+  </g>
+  <g color="var(--dang)">
+    <path class="edge-d" d="M 542 292 L 542 392" fill="none" marker-end="url(#p3ix-ar1)"/>
+  </g>
+
+  <defs>
+    <marker id="p3ix-ar1" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>There is exactly one commit point on the left-hand side of this diagram. Everything to
+the right of the WAL &mdash; the connector, the topic, the ladder, the dead letter topic &mdash; is
+machinery for making at-least-once delivery survivable, which is the price you pay for having
+removed the second commit.</figcaption>
+</figure>
+
+<h2>The mechanisms</h2>
+
+<p>Each row is a piece of the repository that exists to make one idea concrete. The right-hand
+column is where that idea was explained in the abstract &mdash; read the module page first if a
+mechanism does not land, or read the file first and use the module page to check that you
+understood why it is written that way.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Lives in</th><th>The concept it demonstrates</th><th>Where it was taught</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>Transactional outbox</strong></td>
+  <td><code>producer/&hellip;/service/OrderService.java</code></td>
+  <td>Business row and event row in one local commit, so there is only ever one thing that can fail</td>
+  <td><span class="xref">08 &middot; Distributed transactions &amp; sagas</span></td>
+</tr>
+<tr>
+  <td><strong>The outbox table as a public contract</strong></td>
+  <td><code>producer/&hellip;/db/migration/V1__schema.sql</code></td>
+  <td>Six column names that the connector JSON depends on: rename one and the task dies with <code>errors.tolerance=none</code></td>
+  <td><span class="xref">05 &middot; Schema migrations</span></td>
+</tr>
+<tr>
+  <td><strong>Log-based CDC instead of polling</strong></td>
+  <td><code>connectors/outbox-connector.json</code></td>
+  <td><code>pgoutput</code> decoding plus the <code>EventRouter</code> SMT &mdash; routing is data (<code>aggregate_type</code>), not configuration</td>
+  <td><span class="xref">06 &middot; Kafka Connect &amp; CDC</span></td>
+</tr>
+<tr>
+  <td><strong><code>wal_level=logical</code> and the replication slot</strong></td>
+  <td><code>docker-compose.yml</code></td>
+  <td>What a slot actually is, and why an abandoned one pins WAL until the disk fills</td>
+  <td><span class="xref">05 &middot; Replication &amp; high availability</span></td>
+</tr>
+<tr>
+  <td><strong>Key &rarr; partition &rarr; order</strong></td>
+  <td><code>aggregate_id</code> &rarr; the Kafka record key</td>
+  <td>Per-aggregate ordering is a consequence of the key you chose, not a broker feature you enable</td>
+  <td><span class="xref">06 &middot; The log, partitions &amp; offsets</span></td>
+</tr>
+<tr>
+  <td><strong>At-least-once, not exactly-once</strong></td>
+  <td><code>consumer/&hellip;/model/OrderEvent.java</code> (<code>eventId</code>)</td>
+  <td>Debezium can re-emit a row after a restart whose offsets were not flushed &mdash; so every event carries an identity</td>
+  <td><span class="xref">06 &middot; Delivery semantics &amp; exactly-once</span></td>
+</tr>
+<tr>
+  <td><strong>Idempotency ledger on a unique key</strong></td>
+  <td><code>consumer/&hellip;/service/IdempotentProcessor.java</code></td>
+  <td><code>INSERT &hellip; ON CONFLICT DO NOTHING</code> as the deduplication primitive, evaluated by the database rather than by a cache</td>
+  <td><span class="xref">05 &middot; Postgres concurrency patterns</span></td>
+</tr>
+<tr>
+  <td><strong>Marker and effect in the same transaction</strong></td>
+  <td><code>consumer/&hellip;/service/IdempotentProcessor.java</code></td>
+  <td>Why <code>REQUIRES_NEW</code> on the marker turns a retryable failure into silent, permanent data loss</td>
+  <td><span class="xref">04 &middot; @Transactional in depth</span></td>
+</tr>
+<tr>
+  <td><strong>Explicit failure classification</strong></td>
+  <td><code>consumer/&hellip;/error/{Retryable,NonRetryable}Exception.java</code></td>
+  <td>Whether to retry is a property of the failure, not of the message &mdash; and the default of &ldquo;retry everything&rdquo; is wrong in both directions</td>
+  <td><span class="xref">08 &middot; Resilience patterns</span></td>
+</tr>
+<tr>
+  <td><strong>Non-blocking tiered retry topics</strong></td>
+  <td><code>consumer/&hellip;/listener/OrderEventListener.java</code></td>
+  <td><code>@RetryableTopic</code>, delay topics named after their backoff, and the per-key ordering you trade away to get them</td>
+  <td><span class="xref">06 &middot; Retries, DLQs &amp; poison pills</span></td>
+</tr>
+<tr>
+  <td><strong>Backoff against <code>max.poll.interval.ms</code></strong></td>
+  <td><code>consumer/src/main/resources/application.yml</code></td>
+  <td>A backoff longer than the poll interval turns one slow record into a permanent rebalance loop</td>
+  <td><span class="xref">06 &middot; Consumer internals &amp; rebalancing</span></td>
+</tr>
+<tr>
+  <td><strong><code>ErrorHandlingDeserializer</code></strong></td>
+  <td><code>consumer/&hellip;/config/KafkaConfig.java</code></td>
+  <td>Deserialisation happens inside <code>poll()</code>, before any error handler exists &mdash; one bad byte otherwise stops a partition forever</td>
+  <td><span class="xref">04 &middot; Messaging with Spring</span></td>
+</tr>
+<tr>
+  <td><strong>DLT headers and byte-faithful replay</strong></td>
+  <td><code>tools/&hellip;/DlqInspector.java</code></td>
+  <td>A dead letter is only useful if it carries origin, cause, attempt count and the original bytes &mdash; and replay must be safe to run twice</td>
+  <td><span class="xref">08 &middot; Messaging &amp; delivery guarantees</span></td>
+</tr>
+<tr>
+  <td><strong>Behavioural spec on a real broker</strong></td>
+  <td><code>consumer/src/test/&hellip;/RetryAndDltTest.java</code></td>
+  <td>Testcontainers with a compressed retry clock: same topology, 100ms tiers instead of 5s</td>
+  <td><span class="xref">04 &middot; Testing Spring Boot</span></td>
+</tr>
+<tr>
+  <td><strong>Single-node KRaft broker</strong></td>
+  <td><code>docker-compose.yml</code></td>
+  <td>No ZooKeeper anywhere: one process is both broker and controller, with three listeners that people routinely misconfigure</td>
+  <td><span class="xref">06 &middot; KRaft &amp; cluster metadata</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="bt">Kafka 4 broker, 3.8 client &mdash; on purpose</span>
+  <p>The broker image is <code>apache/kafka:4.0.0</code>, but <code>kafka-clients</code> stays at the
+  version Spring Boot 3.4.1 manages &mdash; <code>3.8.1</code>, which you can confirm with
+  <code>mvn help:evaluate -Dexpression=kafka.version</code>. Kafka&rsquo;s client/broker protocol is
+  bidirectionally compatible and Spring Kafka 3.3.1 is certified against the 3.8 clients it ships
+  with; forcing 4.0 clients into the reactor compiles fine and can then fail at runtime on APIs
+  Kafka 4 removed. Debezium 3.1 is used because it is the first line built against Kafka 4.</p>
+</div>
+
+<h2>Repository layout</h2>
+
+<p>Everything lives under <code>code/</code>: a Maven reactor inheriting
+<code>spring-boot-starter-parent:3.4.1</code>, with three modules and no version pinned by hand
+except the shade plugin. Build output under each module&rsquo;s <code>target/</code> is omitted
+below.</p>
+
+<div class="codewrap">
+<div class="codehead">10-projects/p3-kafka-dlq-pipeline/code<span class="lang">text</span></div>
+<pre><code class="lang-text">code/
+├── pom.xml                          reactor: producer, consumer, tools -- Java 17, Boot 3.4.1
+├── docker-compose.yml               kafka 4 (KRaft), postgres 16 (wal_level=logical), connect, kafka-ui
+├── Makefile                         up / connector / build / order / fail-* / dlq-* / replay
+├── README.md                        the tour: seven mechanisms, each with the failure it prevents
+├── connectors/
+│   └── outbox-connector.json        pgoutput + EventRouter SMT; aggregate_type -&gt; topic
+├── docker/
+│   └── postgres/init/
+│       └── 01-create-consumer-db.sql   consumerdb, deliberately NOT the producer's database
+│
+├── producer/                        :38081 -- writes orders + outbox, no Kafka dependency
+│   ├── pom.xml
+│   └── src/main/
+│       ├── java/com/acme/producer/
+│       │   ├── ProducerApplication.java
+│       │   ├── api/
+│       │   │   ├── CreateOrderRequest.java
+│       │   │   └── OrderController.java        POST /api/orders, /api/orders/demo/rollback
+│       │   ├── domain/
+│       │   │   ├── Order.java
+│       │   │   └── OutboxEvent.java
+│       │   ├── repo/
+│       │   │   ├── OrderRepository.java
+│       │   │   └── OutboxEventRepository.java
+│       │   └── service/
+│       │       ├── OrderCreatedPayload.java
+│       │       └── OrderService.java           THE one transaction; dual-write analysis in its javadoc
+│       └── resources/
+│           ├── application.yml
+│           └── db/migration/V1__schema.sql     orders + outbox; column names are the SMT contract
+│
+├── consumer/                        :38082 -- idempotency, retry ladder, DLT
+│   ├── pom.xml
+│   └── src/
+│       ├── main/
+│       │   ├── java/com/acme/consumer/
+│       │   │   ├── ConsumerApplication.java
+│       │   │   ├── config/KafkaConfig.java     ErrorHandlingDeserializer, byte-passthrough serializer,
+│       │   │   │                               DefaultErrorHandler, DLT header enricher
+│       │   │   ├── error/
+│       │   │   │   ├── NonRetryableException.java
+│       │   │   │   └── RetryableException.java
+│       │   │   ├── listener/OrderEventListener.java   @RetryableTopic + @DltHandler
+│       │   │   ├── model/OrderEvent.java
+│       │   │   └── service/IdempotentProcessor.java   marker + effect, one transaction
+│       │   └── resources/
+│       │       ├── application.yml             retry ladder, ack-mode, max.poll.interval.ms
+│       │       └── db/migration/V1__schema.sql processed_message, order_projection, dlq_record
+│       └── test/java/com/acme/consumer/
+│           ├── AbstractIntegrationTest.java    Testcontainers: real Kafka + real Postgres
+│           ├── IdempotencyTest.java            same event twice, apply_count stays at 1
+│           └── RetryAndDltTest.java            the behavioural spec for the whole error path
+│
+└── tools/                           the DLQ CLI, shaded into an executable jar
+    ├── pom.xml
+    └── src/main/
+        ├── java/com/acme/tools/DlqInspector.java   list / describe / replay, dry-run by default
+        └── resources/simplelogger.properties</code></pre>
+</div>
+
+<h2>Quick start</h2>
+
+<p>JDK 17 (exactly &mdash; no Java 21 syntax is used), Maven 3.9+, and Docker with Compose v2 and
+<code>--wait</code>. Roughly 4&nbsp;GB of free memory for the containers. Host ports used:
+<strong>35432</strong> postgres, <strong>38080</strong> kafka-ui, <strong>38081</strong> producer,
+<strong>38082</strong> consumer, <strong>38083</strong> Connect, <strong>39092</strong> Kafka.
+Inside the Compose network the containers still talk to <code>postgres:5432</code>,
+<code>connect:8083</code> and <code>kafka:19092</code> &mdash; only the published host side moves,
+so this project can run alongside the other projects and a natively installed database.</p>
+
+<div class="codewrap">
+<div class="codehead">bring the pipeline up<span class="lang">bash</span></div>
+<pre><code class="lang-bash">cd 10-projects/p3-kafka-dlq-pipeline/code
+
+# 1. infrastructure. --wait blocks until every healthcheck passes.
+make up
+
+# 2. register the Debezium connector -- this creates the replication slot
+#    and the publication, so it must come after postgres is healthy.
+make connector
+make connector-status      # expect state RUNNING for both connector and task
+
+# 3. build all three modules (the DLQ inspector fat jar comes out of this too)
+make build</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">two more terminals, then traffic<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make run-consumer          # :38082 -- leave it running, watch the retry decisions
+make run-producer          # :38081 -- leave it running
+
+make order                 # a normal order, end to end
+make outbox                # the row Debezium will pick up
+make projection            # it landed in the consumer's read model, apply_count = 1</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">the three failure paths, and triage<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make fail-retryable        # walks 5s -&gt; 30s -&gt; 180s, then dead-letters (~3.5 min)
+make fail-fatal            # NonRetryableException: straight to the DLT, no retry topic touched
+make poison                # malformed bytes published directly to orders.events
+make topics                # the retry tiers appear, named after their delay in ms
+
+make dlq-list              # summary and breakdown by exception class
+make dlq-describe          # every header, the payload, the stack trace
+make replay                # DRY RUN -- shows what would be sent, sends nothing
+make replay-execute        # actually republish to the resolved original topic</code></pre>
+</div>
+
+<div class="codewrap">
+<div class="codehead">tests, and the same thing without make<span class="lang">bash</span></div>
+<pre><code class="lang-bash">make test                  # mvn verify -- Testcontainers, so Docker must be running
+
+docker compose up -d --wait
+curl -X POST -H 'Content-Type: application/json' \
+     --data @connectors/outbox-connector.json http://localhost:38083/connectors
+mvn clean package -DskipTests
+mvn -pl consumer -am spring-boot:run
+mvn -pl producer -am spring-boot:run
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"customerId":"CUST-001","amountCents":4999,"status":"CREATED"}' \
+     http://localhost:38081/api/orders</code></pre>
+</div>
+
+<div class="box gotcha">
+  <span class="bt">The retry ladder takes real wall-clock time</span>
+  <p><code>make fail-retryable</code> does not produce a dead letter you can inspect straight away.
+  The delays are 5s, 30s and 180s, so the record reaches <code>orders.events-dlt</code> roughly
+  three and a half minutes later &mdash; and while it waits, the consumer keeps processing the main
+  topic normally, which is the entire point. Running <code>make dlq-list</code> immediately and
+  seeing nothing means the ladder is working, not that it is broken. The integration tests override
+  the tiers to 100ms/300ms/900ms so the topology is unchanged and only the clock is compressed;
+  <code>make fail-fatal</code> and <code>make poison</code> reach the DLT within milliseconds
+  because neither one touches a retry topic.</p>
+</div>
+
+<h2>Documentation</h2>
+
+<p>Read them in order. The design document is worth finishing before you open the code &mdash; the
+error-handling walkthrough assumes you already accept why publishing had to become a database
+write.</p>
+
+<div class="grid">
+  <a class="card" href="01-design.html"><span class="n">01</span>
+    <div class="t">The dual-write problem &amp; outbox</div>
+    <p class="d">Why no ordering of &ldquo;commit then publish&rdquo; is correct, the outbox table
+    and the one transaction that writes it, logical decoding and the <code>EventRouter</code> SMT,
+    and the coupling the pattern really has between a column name and a connector.</p></a>
+
+  <a class="card" href="02-errors-dlq.html"><span class="n">02</span>
+    <div class="t">Retries, DLQ &amp; poison pills</div>
+    <p class="d">Classifying failures, blocking versus non-blocking retries and the per-key ordering
+    they cost, the poison pill that <code>ErrorHandlingDeserializer</code> exists for, every DLT
+    header and where it comes from, and idempotency as the thing that makes replay safe.</p></a>
+
+  <a class="card" href="03-running.html"><span class="n">03</span>
+    <div class="t">Running, testing &amp; exercises</div>
+    <p class="d">The full run book, the Testcontainers suite and its compressed clock, reading the
+    DLQ with the inspector, a troubleshooting table for the ways the connector fails, and ten
+    exercises from breaking the outbox contract to abandoning a replication slot.</p></a>
+</div>
+
+<div class="nav-bottom">
+  <a href="../../index.html#work"><span class="lb">Back to</span>Portfolio &middot; Projects</a>
+  <a href="01-design.html"><span class="lb">Next</span>The dual-write problem &amp; outbox</a>
+</div>
+
+</main>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>
